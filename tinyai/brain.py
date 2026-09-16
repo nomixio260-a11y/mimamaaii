@@ -35,6 +35,7 @@ from .brain_types import question_type, _rerank_bonus  # noqa: F401
 from .evolution import Evolution, Params
 from .facts import FactStore, attr_synonyms, extract_facts, parse_question
 from .knowledge import KnowledgeBase, Doc
+from .agent import Agent, apply_format, strip_format
 from .dialog import DialogStore
 from .lm import NGramLM, CacheLM, EOS
 from .memory import MemoryGuard, MB
@@ -131,6 +132,7 @@ class Brain:
         self.cache_lm = CacheLM()                 # 会話キャッシュ LM
         self.reranker = Reranker()                # 👍/👎 から学ぶリランカー
         self.dialogs = DialogStore()              # 会話データ (自分の会話 + 公開データ)
+        self.agent = Agent(self)                  # 道具 (計算・日付・換算・比較・列挙・要約・調査・プロファイル)
         self.neural = NeuralLM(self.cfg.data_dir, size=self.cfg.neural_size, seed=self.cfg.seed or 0)  # numpy があれば Transformer LM
         self._neural_pending_text: deque = deque(maxlen=5000)
         self._neural_pending_dialog: deque = deque(maxlen=2000)   # (発話, 応答, 文脈, 重み)
@@ -308,6 +310,18 @@ class Brain:
                 rebuilt = True
             self.stats["semantic_docs"] += n
             return {"semantic_docs": n, "sketches": sk, "suffix_rebuilt": rebuilt}
+
+    def _cite(self, reply: Reply) -> str:
+        """Web 由来の答えには出典 (ホスト名) を添える (cfg.cite)。"""
+        if not self.cfg.cite or reply.mode not in ("recall", "summary", "neural", "fact"):
+            return reply.text
+        hosts = []
+        for src in reply.sources:
+            if isinstance(src, str) and src.startswith("http"):
+                h = src.split("/")[2]
+                if h not in hosts:
+                    hosts.append(h)
+        return f"{reply.text}（出典: {', '.join(hosts[:2])}）" if hosts else reply.text
 
     def _neural_reply(self, text: str, hits, fallback: Reply) -> Reply | None:
         """検索した文を文脈にして Transformer で応答を生成 (RAG)。知識に接地していない候補は捨てる。"""
@@ -643,6 +657,18 @@ class Brain:
                 self.history.append(("ai", cmd.text))
                 return cmd
             self.history.append(("user", text))
+            # 道具で正確に答えられるものは道具で (計算・日付・換算・比較・列挙・要約・調査・プロファイル)
+            fmt_instruction = text
+            text = strip_format(text)
+            tool = self.agent.handle(text, ja)
+            if tool is not None:
+                tool.text = apply_format(tool.text, fmt_instruction)
+                self.stats["tool_" + tool.mode.split(":")[-1]] += 1
+                self.last_docs = tool.doc_ids
+                self.last_mode = tool.mode
+                self.last_question = text
+                self.history.append(("ai", tool.text))
+                return tool
 
             toks = tokenize(text)
             if toks:
@@ -687,6 +713,9 @@ class Brain:
                     if neural_reply is not None:
                         reply = neural_reply
             reply = self._attach_notices(reply, topics, ja)
+            reply.text = self._cite(reply)
+            if reply.confidence >= 0.3:  # 「まだ知りません」のような短い定型には書式指示を適用しない
+                reply.text = apply_format(reply.text, fmt_instruction)
             for t in topics:
                 if reply.confidence < 0.7 and (not t.isascii() or len(t) >= 4):
                     self.add_gap(t)
@@ -1145,6 +1174,8 @@ class Brain:
                 return self._teach(text[len(prefix):].strip(), ja)
         for prefix in ("調べて:", "調べて：", "search:", "lookup:"):
             if low.startswith(prefix):
+                if self.cfg.web_enabled:
+                    return None  # オンラインならエージェントがその場で調べて答える
                 topic = text[len(prefix):].strip()
                 self.gaps.appendleft(topic)
                 self._topic_strategy[topic] = "gap"
@@ -1180,9 +1211,12 @@ class Brain:
                 self.lm.learn(tokenize(s))
                 n += 1
                 first = first or d
+        # 直前の質問への「答え」として教えられた時だけ結び付ける (👎 の直後、または話題語が重なる時)
         if first is not None and self.last_question:
-            self.kb.associate(first.id, self.last_question)
-            self.qa_log.append((self.last_question, first.id, +1))
+            related = self.last_mode == "corrected" or bool(set(phrases(self.last_question)) & set(phrases(body)))
+            if related:
+                self.kb.associate(first.id, self.last_question)
+                self.qa_log.append((self.last_question, first.id, +1))
         self.stats["taught"] += n
         return Reply(f"覚えました ({n} 文)。" if ja else f"Got it ({n} sentences).", 1.0, "command", [], [], [])
 
@@ -1319,6 +1353,7 @@ class Brain:
                 "semantic": self.semantic.state(),
                 "reranker": self.reranker.state(),
                 "dialogs": self.dialogs.state(),
+                "agent": self.agent.state(),
                 "params": asdict(self.params),
                 "generation": self.generation,
                 "sigma": self.sigma,
@@ -1381,6 +1416,7 @@ class Brain:
             self.semantic = SemanticSpace.from_state(state["semantic"]) if "semantic" in state else SemanticSpace()
             self.reranker = Reranker.from_state(state.get("reranker", {}))
             self.dialogs = DialogStore.from_state(state.get("dialogs", []))
+            self.agent.load_state(state.get("agent", {}))
             self._semantic_queue = deque(maxlen=50000)
             if not self.semantic.vec:
                 self._semantic_queue.extend(self.kb.docs.keys())
@@ -1422,6 +1458,7 @@ class Brain:
                 "suffix": self.suffix.stats(),
                 "reranker": {"samples": self.reranker.samples, "w": {k: round(v, 2) for k, v in self.reranker.w.items()}},
                 "dialogs": {"pairs": len(self.dialogs), "by_source": self.dialogs.by_source()},
+                "profile": dict(self.agent.profile),
                 "neural": (self.neural.ensure_model({}) and self.neural.stats()) if (self.neural.available and self.neural.model is None and self.neural.path.exists()) else self.neural.stats(),
                 "interest": sorted(self.interest.items(), key=lambda x: -x[1])[:8],
                 "admission": round(self.admission, 2),

@@ -836,5 +836,36 @@ class NeuralTest(unittest.TestCase):
             self.assertGreaterEqual(b2.neural.model.step, b.neural.model.step + 1)
 
 
+class AgentTest(unittest.TestCase):
+    def test_tools(self):
+        from tinyai.agent import calculate, answer_datetime, convert_units, apply_format, extract_items
+        self.assertEqual(calculate("12×34は？")[1], 408)
+        self.assertEqual(calculate("1000円の10%は？")[1], 100)
+        self.assertEqual(calculate("2の10乗")[1], 1024)
+        self.assertIsNone(calculate("2024年は何年"))
+        self.assertIn("曜", answer_datetime("今日は何曜日？"))
+        self.assertIn("3.1", convert_units("5kmはマイルで何？"))
+        self.assertIn("212", convert_units("100℃は°Fで？"))
+        self.assertEqual(apply_format("一つ目。二つ目。", "箇条書きで"), "・一つ目。\n・二つ目。")
+        self.assertEqual(extract_items(["手法には決定木、SVM、ニューラルネットワークなどがある。"], "手法", 3), ["決定木", "SVM", "ニューラルネットワーク"])
+
+    def test_agent_in_brain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            self.assertEqual(b.reply("12×34は？").mode, "tool:calc")
+            b.reply("私の名前は太郎です")
+            self.assertIn("太郎", b.reply("私の名前は？").text)
+            b.learn_text("東京タワーの高さは 333 メートルである。スカイツリーの高さは 634 メートルである。", "https://ja.wikipedia.org/wiki/t")
+            r = b.reply("東京タワーとスカイツリーはどちらが高い？")
+            self.assertIn("スカイツリーの方が高い", r.text)
+            r = b.reply("東京タワーの高さを一言で")
+            self.assertIn("333", r.text)
+            self.assertIn("出典", b.reply("東京タワーの高さは？").text)  # Web 由来には出典
+            path = b.save()
+            b2 = Brain(b.cfg)
+            b2.load(path)
+            self.assertEqual(b2.agent.profile.get("名前"), "太郎")
+
+
 if __name__ == "__main__":
     unittest.main()
