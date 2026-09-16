@@ -170,12 +170,23 @@ def parse_question(text: str) -> tuple[str, str] | None:
     return None
 
 
+def attr_synonyms(attr: str) -> set[str]:
+    """属性名とその同義語 (高さ ↔ 標高 ↔ height など)。"""
+    out = {attr}
+    out |= _SYNONYM_OF.get(attr, frozenset())
+    for r, names in _RELATION_ALIASES.items():
+        if attr in names:
+            out |= set(names)
+    return out
+
+
 class FactStore:
     """subject -> [(relation, object, doc_id)] の小さな記憶。件数上限あり。"""
 
     def __init__(self, max_facts: int = 50000):
         self.by_subject: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
         self.by_doc: dict[int, list[str]] = defaultdict(list)  # doc_id -> subjects (削除用)
+        self.extra_sources: dict[int, set[str]] = {}          # doc_id -> 同じ内容を述べた別の出典 (裏付け)
         self.count = 0
         self.max_facts = max_facts
 
@@ -203,7 +214,13 @@ class FactStore:
                 n += 1
         return n
 
+    def corroborate(self, doc_id: int, source: str) -> None:
+        """別の出典が同じ内容を述べた (近似重複) → その文書の事実の裏付けとして数える。"""
+        if doc_id in self.by_doc:
+            self.extra_sources.setdefault(doc_id, set()).add(source)
+
     def remove_doc(self, doc_id: int) -> int:
+        self.extra_sources.pop(doc_id, None)
         keys = self.by_doc.pop(doc_id, None)
         if not keys:
             return 0
@@ -220,6 +237,32 @@ class FactStore:
                 del self.by_subject[key]
         self.count -= removed
         return removed
+
+    # 出典の数で事実を評価する (多出典投票)。sources(doc_id) -> 出典名 を外から渡す
+    source_of = None  # Callable[[int], str] | None
+
+    def support(self, facts: list[tuple[str, str, int]]) -> list[tuple[tuple[str, str, int], int, int]]:
+        """同じ (関係, 目的語) を主張する事実をまとめ、[(代表事実, 支持出典数, 支持文書数)] を支持の多い順に。
+        目的語の一致は正規化 (空白・句読点除去) して比較する。"""
+        groups: dict[tuple[str, str], list[tuple[str, str, int]]] = {}
+        for f in facts:
+            k = (f[0], re.sub(r"[\s、,。.]", "", f[1]).lower())
+            groups.setdefault(k, []).append(f)
+        out = []
+        for lst in groups.values():
+            srcs = set()
+            for _, _, doc_id in lst:
+                srcs.add(self.source_of(doc_id) if self.source_of else doc_id)
+                srcs |= self.extra_sources.get(doc_id, set())
+            out.append((lst[0], len(srcs), len(lst)))
+        out.sort(key=lambda x: (-x[1], -x[2]))
+        return out
+
+    def conflicts(self, subject: str, relation: str) -> list[tuple[tuple[str, str, int], int, int]]:
+        """同じ関係で目的語が食い違う事実の一覧 (支持順)。長さ 2 以上なら矛盾あり。"""
+        facts = self.lookup(subject, relation)
+        groups = self.support(facts)
+        return groups if len(groups) >= 2 else []
 
     def lookup(self, subject: str, relation: str | None = None) -> list[tuple[str, str, int]]:
         key = self._key(subject)
@@ -282,11 +325,17 @@ class FactStore:
             return " ".join(parts), facts[0][2]
         if not facts:
             return None
-        relation, obj, doc_id = facts[0]
+        groups = self.support(facts)
+        (relation, obj, doc_id), n_src, _ = groups[0]
         # 質問の言語と保存した関係名の言語が違えば、質問側の語で表現する (creator ↔ 作者)
         if relation not in ("definition", "is", "location", "event") and relation.isascii() != rel.isascii():
             relation = rel
-        return self._render(subj, relation, obj, ja), doc_id
+        text = self._render(subj, relation, obj, ja)
+        if len(groups) >= 2 and groups[1][1] >= 1 and groups[1][0][1] != obj:
+            # 出典によって食い違う: 最有力を答え、別説を添える (矛盾の可視化)
+            alt = groups[1][0][1]
+            text += f" (別の出典では「{alt}」ともあります)" if ja else f" (another source says: {alt})"
+        return text, doc_id
 
     @staticmethod
     def _render(subj: str, relation: str, obj: str, ja: bool) -> str:
@@ -301,7 +350,7 @@ class FactStore:
         return text
 
     def state(self) -> dict:
-        return {"by_subject": dict(self.by_subject), "count": self.count}
+        return {"by_subject": dict(self.by_subject), "count": self.count, "extra_sources": {k: sorted(v) for k, v in self.extra_sources.items()}}
 
     @classmethod
     def from_state(cls, st: dict, max_facts: int = 50000) -> "FactStore":

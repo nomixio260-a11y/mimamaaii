@@ -220,7 +220,7 @@ class Fetcher:
             return data[: (limit or self.max_bytes)]
 
     # ------------------------------------------------------------ 公開 API
-    def get(self, url: str) -> bytes | None:
+    def get(self, url: str, max_bytes: int | None = None) -> bytes | None:
         if not url.startswith(("http://", "https://")):
             return None
         host = urllib.parse.urlsplit(url).netloc
@@ -233,7 +233,7 @@ class Fetcher:
             return None
         self._throttle(host)
         try:
-            data = self._raw_get(url)
+            data = self._raw_get(url, limit=max_bytes)
             self.fetched += 1
             self._backoff.pop(host, None)
             return data

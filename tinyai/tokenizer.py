@@ -167,6 +167,45 @@ def phrases(text: str) -> list[str]:
 _PHRASE_SEQ_RE = re.compile(rf"[{_KANJI}\u30a0-\u30ff]+|[a-z][a-z0-9_'’]*")
 
 
+class SentenceInfo:
+    """1 文の解析結果をまとめて持つ (学習の各段階で同じ正規表現を何度も走らせないため)。"""
+    __slots__ = ("text", "tokens", "terms", "phrases")
+
+    def __init__(self, text: str, tokens: list[str], terms_: list[str], phrases_: list[str]):
+        self.text, self.tokens, self.terms, self.phrases = text, tokens, terms_, phrases_
+
+
+def analyze(text: str) -> SentenceInfo:
+    """正規化済みの 1 文から、LM トークン・検索語・句を 1 回の走査で作る。"""
+    low = text.lower()
+    tokens = _WORD_RE.findall(low)
+    terms_: list[str] = []
+    phrases_: list[str] = []
+    for w in _LATIN_RE.findall(low):
+        if len(w) >= 2:
+            terms_.append(w)
+        if len(w) >= 3 and w not in STOPWORDS_EN and not w.isdigit():
+            phrases_.append(w)
+    for run in _CJK_RUN_RE.findall(low):
+        if len(run) == 1:
+            if run not in STOPWORDS_KANA:
+                terms_.append(run)
+            continue
+        for i in range(len(run) - 1):
+            bg = run[i : i + 2]
+            if bg[0] in STOPWORDS_KANA and bg[1] in STOPWORDS_KANA:
+                continue
+            terms_.append(bg)
+    for run in _KANJI_KATA_RUN_RE.findall(low):
+        n = len(run)
+        if 2 <= n <= 12:
+            terms_.append(run)
+            phrases_.append(run)
+    if not terms_:
+        terms_ = [ch for ch in low if ch.isalnum()]
+    return SentenceInfo(text, tokens, terms_, phrases_)
+
+
 def keywords(text: str, limit: int = 6) -> list[str]:
     """人間に見せたり検索クエリに使う「話題語」。漢字/カタカナ連続語とラテン語を優先。"""
     text = normalize(text)

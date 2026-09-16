@@ -17,7 +17,9 @@ tinyai/
   evolution.py    進化するパラメータ (Params) と自己評価・変異・採用の判定
   brain.py        中核: 学習パイプライン、会話パイプライン、関心・通知、整理、メモリ制御、保存
   web.py          取得器 (robots.txt、ホスト間隔、429 バックオフ)、HTML/フィード解析、Wikipedia API
-  collector.py    収集システム (ソース健全性、フロンティア、フィード、ランダム記事、先読みワーカー)
+  collector.py    収集システム (ソースのプラグイン登録、健全性 = 成功率 × 収穫 × 新規性、フロンティア、フィード、供給源、先読みワーカー)
+  dumps.py        大量データのストリーミング取り込み (Wikipedia XML ダンプ、書庫、ディレクトリ)
+  wikitext.py     ウィキテキスト → 平文
   evolve.py       自律学習スレッド (イベント駆動、調査キュー優先、進化・整理・保存の周期)
   cli.py          chat / ask / learn / evolve / stats / serve
 tools/
@@ -49,8 +51,11 @@ docs/
 整理時 (2,000 文)、応答の合間 (8 文、スケッチ更新なし) に意味ベクトルへ取り込む。接尾辞配列は文書が 10% 増えるごとに再構築
 (5 万トークンで 0.1 秒)。会話の即時応答経路はこれらを待たない。
 
+段階ごとの所要時間は `Brain.timers` に累積され `/stats` の `timers_ms` で見える (analyze / facts+quality / kb / lm / semantic)。
+909 文の内訳の例: analyze 22ms, facts+quality 9ms, kb 48ms, lm 63ms。
+
 不変条件:
-* 知識ベースに入らなかった文は LM にも事実にも入らない (学習の重複コストがゼロ)。
+* 知識ベースに入らなかった文は LM にも事実にも入らない (学習の重複コストがゼロ)。近似重複で弾いた文の出典は、元の文の裏付け (`facts.extra_sources`) として数える。
 * 文書を消すと `kb.on_remove` で事実も消える。転置索引に消えた文書は残らない (`_post_remove`)。
 * LM の `cont_total == sum(cont.values())` は剪定後も保たれる。
 
@@ -59,7 +64,9 @@ docs/
 ```
 発話 ─ コマンド (覚えて/調べて/👍/👎/もっと詳しく)
      ─ 話題語抽出 → 関心プロファイル更新 → 話題語が無ければ前の話題を補う
-     ─ facts.answer  (XのYは? / Xとは? / Xはいつ? / AのBのCは?) → fact
+     ─ 「X について教えて」 → 要約 (事実 + 出典の異なる文、summary)
+     ─ facts.answer  (XのYは? / Xとは? / Xはいつ? / AのBのCは?) → 多出典投票で最有力を即答、食い違いは併記 (fact)
+     ─ 未知ガード: 主語を知らない / 属性を含む文が無い → 確信度を抑え「まだ知りません」と正直に答える
      ─ kb.search (+ 低確信なら PMI 関連語で拡張) → 質問タイプ別リランク + 意味類似 + 学習型リランカー → recall / guess
      ─ generate: 接尾辞配列の最長一致分布 × suffix_weight + n-gram/キャッシュ LM の補間、候補 4 本から最良 (generate)
      ─ 裏で調べ終えた話題 (notices) を一言添える
@@ -70,8 +77,11 @@ docs/
 
 ```
 Collector (先読みワーカー × N, 既定 2)
-   ワーカー 0: 話題検索 (健全なソース順: wikimedia > wikipedia > wikidata > duckduckgo) / 5 回に 1 回フィード / 7 回に 1 回ランダム記事
+   話題ソース (言語ごと): wikimedia / wikipedia / wiktionary / wikidata / wikinews / wikibooks / duckduckgo を健全性 × 重み の順に
+   供給源 (話題に依らない): random (Wikipedia ランダム記事) / aozora (青空文庫) / gutenberg を健全性 × 重み で抽選
+   ワーカー 0: 話題検索 / 5 回に 1 回フィード / 4 回に 1 回供給源
    ワーカー 1: フロンティア (アンカー文字列の関心 + 新規性 − 深さ) 優先
+   Collector.register(Source) で独自ソースを追加できる
    → ready キュー (最大 prefetch_depth)
 
 Evolver (1 スレッド)
@@ -79,7 +89,7 @@ Evolver (1 スレッド)
    → brain.learn_batch (学習 + リンクをフロンティアへ + ソースへ収穫報告)
    → evolve_every サイクルごとに evolution.step、その 5 倍ごとに consolidate
    → enforce_memory → save_every ごとに保存
-   → 調査キューが空なら interval 待つ (on_gap で即起床)
+   → 調査キューが空なら適応的な間隔だけ待つ (直近の収穫が多ければ 1/4、ゼロが続けば 4 倍; on_gap で即起床)
 ```
 
 ## メモリ制御

@@ -24,7 +24,12 @@ python -m tinyai            # 対話 (裏で自動学習が回る)
 | 質問理解 | 「とは / いつ / どこ / いくつ / 誰 / なぜ」の質問タイプを判定し、型に合う文 (年号・地名・数値・人物) をリランク |
 | 文脈 | 「それはいつ？」「もっと詳しく」のような話題語の無い発話は、直前の話題や答えた文の続きで応える |
 | 自動学習 | 文章・ファイル・URL・`inbox/` フォルダに置いたファイルを文単位で取り込み。重複文・ジャンク文 (表の断片、記号/数字だらけ) は最初から捨てる |
-| 収集システム | ソース (Wikimedia Core API / Wikipedia Action API / Wikidata の説明文 / DuckDuckGo / RSS・Atom フィード / Wikipedia ランダム記事 / `sources.txt` のサイト) ごとに成功率・収穫量・遅延を記録し、健全なソースから使う。読んだページのリンクをアンカー文字列付きで「フロンティア」に積み、関心と新規性で優先度を付けて次に読む (検索 1 回分の通信を節約)。URL 重複排除、robots.txt と 429 バックオフ。先読みワーカー (既定 2、`TINYAI_WORKERS`) がネットワーク待ちを学習と並列化 |
+| 収集システム | ソースはプラグイン登録制。Wikipedia (Core API / Action API)、Wiktionary (語義)、Wikinews (鮮度)、Wikibooks、Wikidata (説明文)、DuckDuckGo、青空文庫 (日本語文学 1 万作品超)、Project Gutenberg (英語文学)、RSS/Atom フィード、Wikipedia ランダム記事、`sources.txt` のサイト、リンクのフロンティア。ソースごとに成功率・文の収穫・**新しい語の収穫 (新規性)**・遅延を記録し、健全な順に使う。URL 重複排除、robots.txt と 429 バックオフ、先読みワーカー (`TINYAI_WORKERS`) |
+| 大量データ | Wikipedia の XML ダンプ (.xml.bz2、数 GB) をページ単位でストリーミング学習 (メモリ一定)。zip/gz/bz2/xz の書庫、ディレクトリ、`inbox/` に置いたダンプや書庫も自動取り込み |
+| 知らないと言う | 主語を知らない・属性を知らない質問には「まだ知りません。調べておきます」と答え、別の属性で誤魔化さない (知っている事実があれば添える) |
+| 多出典投票 | 同じ事実を複数の出典が述べていれば支持が増え、食い違えば「別の出典では…」と矛盾を可視化。近似重複で弾いた別出典の文も裏付けとして数える |
+| 要約回答 | 「X について教えて」には、事実 + 出典の異なる関連文を句の重なりで重複除去して 2〜3 文にまとめる |
+| コスト適応 | 自律ループは収穫が続けば間隔を 1/4 に縮め、空振りが続けば 4 倍まで伸ばす。学習パイプラインは段階ごとの所要時間を記録 (`/stats` の `timers_ms`) |
 | 探索戦略 | 調査キュー > 関心 / 好奇心 / 知識の薄い語 / 種 を UCB1 で選択 (収穫の多い戦略を優先) |
 | 進化 | 自己評価 (取り置き文のパープレキシティ + 検索の自己テスト + 👍/👎 の再現率) を適応度とし、パラメータを変異させて改善した時だけ採用。変異幅は成功で広がり失敗で狭まる (適応) |
 | フィードバック | `👍` で「その聞き方 → その答え」を索引に結び付け、`👎` の直後に書いた平叙文は正しい答えとして直前の質問に結び付ける。知識の信頼度と回答しきい値も調整 |
@@ -45,6 +50,10 @@ python -m tinyai ask 日本の首都は？
 
 # 学習: ファイル / ディレクトリ / URL / 話題
 python -m tinyai learn notes.txt docs/ https://example.com/page topic:量子コンピュータ
+
+# 大量データ: Wikipedia ダンプ (bz2 のまま、ページ単位でストリーミング) / 書庫
+python -m tinyai learn dump:jawiki-latest-pages-articles.xml.bz2 --max-pages 20000
+python -m tinyai learn corpus.zip texts.tar.gz   # zip/gz/bz2/xz の中のテキスト
 
 # 自律学習ループだけを前面で回す (Ctrl+C で停止、10 サイクル or 1 時間で自動停止)
 python -m tinyai evolve --cycles 10
@@ -142,6 +151,21 @@ HTTPS プロキシ環境では `SSL_CERT_FILE` に CA バンドルを指定す�
 
 「より高度な LLM」化 (意味ベクトル・接尾辞配列生成・キャッシュ LM・学習型リランカー・self-consistency) 後: 学習 約 5,700 文/秒、応答 0.9ms/問 (意味類似とリランカーの分だけ増加)、自問自答の的中 0.834 → 0.875、会話評価 21/21。生成の例: 「宇宙は膨張しない可能性もある。」「機械学習とは、機械学習のうちデータの確率的な生成規則を学習するものを指す。」
 
+### 総合評価 (tools/eval.py、現在)
+
+| 指標 | 値 |
+|---|---|
+| 会話評価 (9 カテゴリ 69 問、言い換え込み) | 69/69 |
+| 応答遅延 p50 / p95 | 0.14ms / 0.74ms |
+| 検索 MRR / Recall@3 (疑似クエリ 200 問) | 0.931 / 0.959 |
+| 取り置き文のパープレキシティ | 28.3 |
+| 生成の distinct-2 / 4-gram 接地率 / 繰り返し率 | 0.80 / 0.90 / 0.05 |
+| 学習速度 / 実メモリ増分 (909 文) | 約 5,400 文/秒 / 8.5MB |
+
+評価の結果は `eval/results.jsonl` に追記され、`--compare` で前回との差分が出ます。
+評価セットの刷新で見つかった不具合 (英語文がジャンク扱いで落ちていた、短い文が近似重複で落ちていた、
+別の属性で答えていた、👍👎 が数件の段階でリランカーが効いていた) はすべて修正済みです。
+
 実 Web での 5 サイクル (Wikipedia、間隔 1 秒) では 2,000 文と 21 件の事実を学習し、RSS 31MB → 45MB でした。
 
 ```bash
@@ -155,8 +179,9 @@ python tools/bench.py corpus.txt --memory 256
 ## テスト・評価・実験
 
 ```bash
-python -m unittest discover -s tests -v      # 単体テスト (44 件)
-python tools/eval.py --verbose               # 会話品質の評価セット (data/eval_ja.tsv、21 問)
+python -m unittest discover -s tests -v      # 単体テスト (57 件)
+python tools/eval.py --paraphrase --compare  # 会話評価 (data/eval/*.tsv、カテゴリ別・言い換え・否定条件・未知への正直さ) + 遅延、前回比較
+python tools/eval.py --corpus corpus.txt     # + 検索 (MRR / Recall@3)、LM (ppl)、生成 (多様性・接地率・繰り返し)、学習速度、メモリ
 python tools/bench.py corpus.txt             # 学習速度・メモリ・応答速度
 python tools/experiment.py corpus.txt        # 研究実験 (次数、Count-Min Sketch LM、接尾辞配列、純 Python ニューラル LM)
 ```

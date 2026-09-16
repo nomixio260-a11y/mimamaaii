@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .brain import Brain
 from .collector import Collector
+from .dumps import iter_archive_texts, learn_wiki_dump
 from .web import Fetcher
 
 log = logging.getLogger("tinyai.evolve")
@@ -42,6 +43,7 @@ class Evolver(threading.Thread):
         self.started_at = 0.0
         self.errors = 0
         self._site_index = 0
+        self._recent_gain: list[int] = []   # 直近サイクルの収穫 (適応的な間隔に使う)
         brain.on_gap = self._on_gap
 
     # ------------------------------------------------------------ 制御
@@ -77,9 +79,10 @@ class Evolver(threading.Thread):
                 break
             if self.max_seconds is not None and time.time() - self.started_at >= self.max_seconds:
                 break
-            # 調査キューに話題があれば休まない。無ければ interval 待つが、会話で起こされたら即再開
+            # 調査キューに話題があれば休まない。無ければ interval 待つが、会話で起こされたら即再開。
+            # 収穫が続けば間隔を縮め (最短 1/4)、空振りが続けば伸ばす (最長 4 倍) = 処理コストの適応
             if not self.brain.gaps:
-                self.wake.wait(self.interval)
+                self.wake.wait(self.adaptive_interval())
             self.wake.clear()
         self.collector.stop()
         try:
@@ -87,6 +90,19 @@ class Evolver(threading.Thread):
         except Exception as e:
             log.warning("保存失敗: %s", e)
         log.info("自律学習を終了 (cycles=%d)", self.cycles)
+
+    def adaptive_interval(self) -> float:
+        if not self._recent_gain:
+            return self.interval
+        recent = self._recent_gain[-5:]
+        avg = sum(recent) / len(recent)
+        if avg >= 100:
+            return self.interval * 0.25
+        if avg >= 20:
+            return self.interval * 0.5
+        if avg == 0:
+            return min(self.interval * 4, 600.0)
+        return self.interval
 
     # ------------------------------------------------------------ 1 サイクル
     def cycle(self) -> dict:
@@ -116,6 +132,9 @@ class Evolver(threading.Thread):
                 topic = batch.topic
                 learned += brain.learn_batch(batch, col)
         self.last_topic, self.last_learned = topic, learned
+        self._recent_gain.append(learned)
+        if len(self._recent_gain) > 50:
+            del self._recent_gain[:25]
         brain.background_step(budget_docs=400)  # 意味ベクトル・接尾辞配列 (後回しの学習)
         evolved = None
         if self.cycles % cfg.evolve_every == 0 and len(brain.kb) >= 20:
@@ -136,10 +155,18 @@ class Evolver(threading.Thread):
         done = inbox.parent / "learned"
         total = 0
         for p in sorted(inbox.iterdir()):
-            if not p.is_file() or p.suffix.lower() not in (".txt", ".md", ".html", ".htm", ".json", ".csv"):
+            name = p.name.lower()
+            if not p.is_file():
                 continue
             try:
-                n = self.brain.learn_file(p)
+                if name.endswith((".xml", ".xml.bz2", ".xml.gz")) and "wiki" in name:
+                    _, n = learn_wiki_dump(self.brain, p)
+                elif name.endswith((".zip", ".gz", ".bz2", ".xz")):
+                    n = sum(self.brain.learn_text(text, source=f"file:{nm}") for nm, text in iter_archive_texts(p))
+                elif p.suffix.lower() in (".txt", ".md", ".html", ".htm", ".json", ".csv"):
+                    n = self.brain.learn_file(p)
+                else:
+                    continue
                 total += n
                 done.mkdir(parents=True, exist_ok=True)
                 p.rename(done / p.name)
@@ -155,6 +182,7 @@ class Evolver(threading.Thread):
             "last_topic": self.last_topic,
             "last_learned": self.last_learned,
             "errors": self.errors,
+            "interval": round(self.adaptive_interval(), 1),
             "fetched": getattr(self.collector.fetcher, "fetched", 0),
             "failed": getattr(self.collector.fetcher, "failed", 0),
             "collector": self.collector.describe(),

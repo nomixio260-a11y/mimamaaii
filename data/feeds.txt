@@ -1,3 +1,6 @@
 # 自動で読む RSS/Atom フィード (1 行 1 URL)。~/.tinyai/feeds.txt にも追加できる。
+# 30 分ごとに新着を取り込む。関心の高い記事は本文まで読む。
 https://ja.wikipedia.org/w/api.php?action=featuredfeed&feed=featured&feedformat=atom
 https://en.wikipedia.org/w/api.php?action=featuredfeed&feed=featured&feedformat=atom
+https://ja.wikinews.org/w/index.php?title=Special:NewPages&feed=atom&namespace=0
+https://en.wikinews.org/w/index.php?title=Special:NewPages&feed=atom&namespace=0

@@ -116,6 +116,10 @@ def cmd_ask(args) -> int:
 
 
 # ---------------------------------------------------------------- learn
+def n_fmt(n: int) -> str:
+    return f"{n:,}"
+
+
 def cmd_learn(args) -> int:
     cfg = _build_config(args)
     _setup_logging(cfg, args.verbose)
@@ -131,6 +135,16 @@ def cmd_learn(args) -> int:
             n = brain.learn_text(res[0], source=src) if res else 0
         elif src.startswith("topic:"):
             n = brain.learn_from_web(src[6:], fetcher) if fetcher else 0
+        elif src.startswith("dump:") or src.lower().endswith((".xml.bz2", ".xml.gz")) or (src.lower().endswith(".xml") and "wiki" in src.lower()):
+            from .dumps import learn_wiki_dump
+
+            path = src[5:] if src.startswith("dump:") else src
+            pages, n = learn_wiki_dump(brain, path, max_pages=args.max_pages, progress=lambda pg, sn: print(f"  {pg} ページ / {n_fmt(sn)} 文  mem={brain.guard.describe()['rss_mb']}MB"))
+            print(f"  ダンプ {pages} ページ")
+        elif src.lower().endswith((".zip", ".gz", ".bz2", ".xz")):
+            from .dumps import iter_archive_texts
+
+            n = sum(brain.learn_text(text, source=f"file:{nm}") for nm, text in iter_archive_texts(Path(src)))
         else:
             p = Path(src)
             if p.is_dir():
@@ -269,8 +283,9 @@ def main(argv=None) -> int:
     p.add_argument("text", nargs="+")
     p.set_defaults(func=cmd_ask)
 
-    p = sub.add_parser("learn", help="ファイル/ディレクトリ/URL/topic:話題 から学習")
+    p = sub.add_parser("learn", help="ファイル/ディレクトリ/URL/topic:話題/dump:ウィキダンプ(.xml.bz2)/書庫(.zip .gz) から学習")
     p.add_argument("sources", nargs="+")
+    p.add_argument("--max-pages", type=int, default=None, help="ダンプから読む最大ページ数")
     p.set_defaults(func=cmd_learn)
 
     p = sub.add_parser("evolve", help="自律学習ループを前面で実行")

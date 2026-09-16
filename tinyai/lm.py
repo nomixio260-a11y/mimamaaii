@@ -163,20 +163,23 @@ class NGramLM:
         return keys
 
     def _prob_keys(self, keys: list[int], n: int, tok: int) -> float:
-        if n == 0:
-            return (self.cont.get(tok, 0) + 1.0) / (self.cont_total + self.vocab_size)
-        d = self.ctx.get(keys[n])
-        lower = self._prob_keys(keys, n - 1, tok)
-        if d is None:
-            return lower
+        """低次から高次へ反復で補間する (再帰より速い)。"""
+        p = (self.cont.get(tok, 0) + 1.0) / (self.cont_total + self.vocab_size)
+        ctx = self.ctx
         disc = self.discount
-        if type(d) is int:
-            total = d >> TOKEN_BITS
-            c = total if (d & TOKEN_MASK) == tok else 0
-            return max(c - disc, 0.0) / total + disc / total * lower
-        total = d[-1]
-        c = d.get(tok, 0)
-        return max(c - disc, 0.0) / total + disc * (len(d) - 1) / total * lower
+        for i in range(1, n + 1):
+            d = ctx.get(keys[i])
+            if d is None:
+                continue
+            if type(d) is int:
+                total = d >> TOKEN_BITS
+                c = total if (d & TOKEN_MASK) == tok else 0
+                p = max(c - disc, 0.0) / total + disc / total * p
+            else:
+                total = d[-1]
+                c = d.get(tok, 0)
+                p = max(c - disc, 0.0) / total + disc * (len(d) - 1) / total * p
+        return p
 
     def prob(self, context: Sequence[str], token: str) -> float:
         hist = self.ids(context)

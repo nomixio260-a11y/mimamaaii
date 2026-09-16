@@ -1,0 +1,14 @@
+# 文脈引き継ぎ・続き・訂正・フィードバック
+@reset			context
+ベータ理論とは？	架空	ベータ理論とは、架空の理論である。ベータ理論は 2001 年に鈴木花子によって提唱された。ベータ理論の応用先は暗号である。	context
+もっと詳しく	鈴木|2001|暗号		context
+ベータ理論は誰が提唱した？	鈴木		context
+それはいつ？	2001		context
+もっと詳しく	暗号|知りません|調べて		context
+@reset			correction
+ガンマ星の色は？	!緑		correction
+👎	覚えます|Sorry		correction
+ガンマ星は緑色に輝く架空の恒星です。	覚えました		correction
+ガンマ星の色は？	緑		correction
+👍	ありがとう		correction
+光の速さは？	30 万|30万|300,000		context

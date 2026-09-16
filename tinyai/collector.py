@@ -1,30 +1,36 @@
-"""学習データの自動収集システム。
+"""学習データの自動収集システム (プラグイン登録制)。
 
-* ソース (Wikimedia Core API / Wikipedia Action API / DuckDuckGo / フィード / 登録サイト) ごとに
-  成功率・収穫量・遅延を記録し、健全なソースから順に使う
-* 読んだページのリンク (アンカー文字列付き) を「フロンティア」に積み、
-  会話の関心・知識の薄さに応じた優先度で次に読むページを選ぶ (検索 1 回分の通信を節約)
-* RSS/Atom フィードから新着記事を取り込む (鮮度のある知識)
-* URL の重複取得を避ける
-* 先読みスレッドがネットワーク待ちを学習と並列化し、学習側は取得済みのページを即座に消費できる
+* ソースは `Source` (名前・言語・search(topic, n) -> pages) として登録し、
+  成功率 × 新規性収穫 で健全性スコアを持つ。健全な順に試し、足りたら止める
+* 広く多様に: Wikipedia (Core API / Action API)、Wiktionary (定義)、Wikinews (鮮度)、Wikibooks、
+  Wikidata (説明文)、DuckDuckGo (一般 Web)、青空文庫 (文学)、Project Gutenberg (英語文学)、
+  RSS/Atom フィード、Wikipedia ランダム記事、登録サイトの巡回、フロンティア (リンク追跡)
+* 収穫は文数だけでなく「新しく覚えた語の数」(新規性) で測る → 既知の話題ばかり読まない
+* URL 重複排除、robots.txt と 429 バックオフ、先読みワーカーで通信と学習を並列化
 """
 from __future__ import annotations
 
+import csv
 import hashlib
 import heapq
+import io
 import logging
 import queue
+import random
+import re
 import threading
 import time
 import urllib.parse
+import zipfile
 from pathlib import Path
 from typing import Callable, Iterable
 
-from .web import Fetcher, Page
+from .web import Fetcher, Page, html_to_text
 
 log = logging.getLogger("tinyai.collector")
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+Pages = list  # [(source_url, text, anchors)]
 
 
 class Batch:
@@ -36,12 +42,13 @@ class Batch:
 
 
 class SourceHealth:
-    __slots__ = ("tries", "ok", "gain", "latency")
+    __slots__ = ("tries", "ok", "gain", "novelty", "latency")
 
     def __init__(self):
         self.tries = 0
         self.ok = 0
         self.gain = 0.0
+        self.novelty = 0.0
         self.latency = 0.0
 
     def record(self, ok: bool, gain: float, latency: float) -> None:
@@ -53,13 +60,252 @@ class SourceHealth:
 
     @property
     def score(self) -> float:
-        # 成功率 × 平均収穫 (試行が少ないうちは楽観的)
-        return (self.ok + 1) / (self.tries + 2) * (self.gain / max(self.tries, 1) + 0.5)
+        # 成功率 × (文の収穫 + 新規性)。試行が少ないうちは楽観的
+        t = max(self.tries, 1)
+        return (self.ok + 1) / (self.tries + 2) * (self.gain / t + self.novelty / t + 0.5)
 
     def to_dict(self) -> dict:
-        return {"tries": self.tries, "ok": self.ok, "avg_gain": round(self.gain / max(self.tries, 1), 2), "latency": round(self.latency, 2), "score": round(self.score, 3)}
+        t = max(self.tries, 1)
+        return {"tries": self.tries, "ok": self.ok, "avg_gain": round(self.gain / t, 2), "avg_novelty": round(self.novelty / t, 2), "latency": round(self.latency, 2), "score": round(self.score, 3)}
 
 
+class Source:
+    """収集ソースの共通型。search(topic, n) は [(url, text, anchors)] を返す。"""
+
+    name = "base"
+    kind = "topic"       # topic (話題検索) / stream (話題に依らない供給)
+    weight = 1.0         # 供給源としての選ばれやすさ
+
+    def __init__(self, col: "Collector", lang: str = "ja"):
+        self.col = col
+        self.lang = lang
+        self.f = col.fetcher
+
+    def search(self, topic: str, n: int) -> Pages:
+        return []
+
+    def stream(self) -> Pages:
+        """話題に依らず新しいページを供給する (ランダム記事、文学など)。"""
+        return []
+
+
+# ---------------------------------------------------------------- Wikimedia 系
+class WikimediaCore(Source):
+    name = "wikimedia"
+
+    def search(self, topic, n):
+        out = []
+        for key in self.f.wikimedia_search(topic, lang=self.lang, limit=n):
+            url = f"https://{self.lang}.wikipedia.org/wiki/{urllib.parse.quote(key)}"
+            if not self.col.mark_seen(url):
+                continue
+            page = self.f.wikimedia_page(key, lang=self.lang)
+            if page and len(page.text) > 200:
+                out.append((url, page.text, page.anchors))
+            if len(out) >= n:
+                break
+        return out
+
+
+class MediaWikiAction(Source):
+    """Action API を持つ Wikimedia プロジェクト共通 (wikipedia / wiktionary / wikinews / wikibooks)。"""
+    project = "wikipedia"
+    name = "wikipedia"
+    min_chars = 200
+
+    def _host(self) -> str:
+        return f"{self.lang}.{self.project}.org"
+
+    def search(self, topic, n):
+        f = self.f
+        q = urllib.parse.quote(topic)
+        js = f.get_json(f"https://{self._host()}/w/api.php?action=query&list=search&srsearch={q}&format=json&srlimit={n}&utf8=1")
+        out = []
+        for hit in (js or {}).get("query", {}).get("search", []):
+            title = hit["title"]
+            url = f"https://{self._host()}/wiki/{urllib.parse.quote(title)}"
+            if not self.col.mark_seen(url):
+                continue
+            t = urllib.parse.quote(title)
+            js2 = f.get_json(f"https://{self._host()}/w/api.php?action=query&prop=extracts&explaintext=1&titles={t}&format=json&utf8=1&exchars=8000")
+            txt = ""
+            for page in (js2 or {}).get("query", {}).get("pages", {}).values():
+                txt = re.sub(r"\n=+[^=\n]+=+\n", "\n", page.get("extract", ""))
+            if len(txt) >= self.min_chars:
+                out.append((url, txt, []))
+            if len(out) >= n:
+                break
+        return out
+
+
+class Wiktionary(MediaWikiAction):
+    project = "wiktionary"
+    name = "wiktionary"
+    min_chars = 40
+
+    def search(self, topic, n):
+        # 辞書は見出し語そのものを引く。「X: 定義」を「Xとは、定義である。」に整える
+        pages = super().search(topic, min(n, 1))
+        out = []
+        for url, txt, _ in pages:
+            # 発音記号や語形変化の行を除き、語義らしい行だけ残す
+            lines = [ln.strip() for ln in txt.splitlines()
+                     if 6 <= len(ln.strip()) <= 200 and "IPA" not in ln and not ln.strip().startswith(("(", "（", "[", "＊", "*"))]
+            body = "\n".join(lines[:12])
+            # 見出し語の行 (「宇宙 (うちゅう)」) ではなく最初の語義らしい行を定義文にする
+            defs = [ln for ln in lines if len(ln) >= 12 and not ln.startswith(topic) and "語源" not in ln[:3]]
+            if body:
+                head = f"{topic}とは、{defs[0].rstrip('。')}である。\n" if defs and self.lang == "ja" else ""
+                out.append((url, head + body, []))
+        return out
+
+
+class Wikinews(MediaWikiAction):
+    project = "wikinews"
+    name = "wikinews"
+    weight = 0.6
+
+
+class Wikibooks(MediaWikiAction):
+    project = "wikibooks"
+    name = "wikibooks"
+    weight = 0.5
+
+
+class Wikidata(Source):
+    name = "wikidata"
+
+    def search(self, topic, n):
+        q = urllib.parse.quote(topic)
+        js = self.f.get_json(f"https://www.wikidata.org/w/api.php?action=wbsearchentities&search={q}&language={self.lang}&uselang={self.lang}&format=json&limit=5")
+        lines = []
+        for item in (js or {}).get("search", []):
+            label = item.get("label", "").strip()
+            desc = item.get("description", "").strip()
+            if label and len(desc) > 3:
+                lines.append(f"{label}とは、{desc}である。" if self.lang == "ja" else f"{label} is a {desc}.")
+        if not lines:
+            return []
+        url = f"https://www.wikidata.org/wiki/Special:Search?search={q}"
+        return [(url, "\n".join(lines), [])] if self.col.mark_seen(url) else []
+
+
+class DuckDuckGo(Source):
+    name = "duckduckgo"
+    weight = 0.5
+
+    def search(self, topic, n):
+        out = []
+        for url in self.f.duckduckgo_search(topic, limit=n + 2):
+            if not self.col.mark_seen(url):
+                continue
+            page = self.f.get_page(url)
+            if page and len(page.text) > 300:
+                out.append((url, page.text, [(u, a) for u, a in page.anchors if u.startswith(("http", "/"))]))
+            if len(out) >= n:
+                break
+        return out
+
+
+class WikipediaRandom(Source):
+    name = "random"
+    kind = "stream"
+    weight = 0.8
+
+    def stream(self):
+        js = self.f.get_json(f"https://{self.lang}.wikipedia.org/w/api.php?action=query&list=random&rnnamespace=0&rnlimit=1&format=json")
+        titles = [r["title"] for r in (js or {}).get("query", {}).get("random", [])]
+        if not titles:
+            return []
+        url = f"https://{self.lang}.wikipedia.org/wiki/{urllib.parse.quote(titles[0])}"
+        if not self.col.mark_seen(url):
+            return []
+        page = self.f.wikimedia_page(titles[0], lang=self.lang)
+        return [(url, page.text, page.anchors)] if page and len(page.text) > 200 else []
+
+
+# ---------------------------------------------------------------- 文学 (文体の多様性)
+class Aozora(Source):
+    """青空文庫: 著作権切れの日本語文学。索引 (CSV zip) を 1 度だけ取り、ランダムな作品の XHTML を読む。"""
+    name = "aozora"
+    kind = "stream"
+    weight = 0.7
+    INDEX = "https://www.aozora.gr.jp/index_pages/list_person_all_extended_utf8.zip"
+
+    def __init__(self, col, lang="ja"):
+        super().__init__(col, lang)
+        self._works: list[tuple[str, str, str]] | None = None  # (title, author, xhtml url)
+
+    def _load_index(self) -> None:
+        self._works = []
+        data = self.f.get(self.INDEX, max_bytes=12 * 1024 * 1024) if self.f else None
+        if not data:
+            return
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                raw = z.read(z.namelist()[0]).decode("utf-8", "replace")
+        except (zipfile.BadZipFile, IndexError):
+            return
+        rows = csv.reader(io.StringIO(raw))
+        header = next(rows, None)
+        if not header:
+            return
+        idx = {h.lstrip("﻿"): i for i, h in enumerate(header)}
+        try:
+            it, ia, iu, ic, ik = idx["作品名"], idx["姓"], idx["XHTML/HTMLファイルURL"], idx["作品著作権フラグ"], idx["文字遣い種別"]
+        except KeyError:
+            return
+        for r in rows:
+            if len(r) <= iu or r[ic] != "なし" or "新字新仮名" not in r[ik] or not r[iu].startswith("http"):
+                continue
+            self._works.append((r[it], r[ia], r[iu]))
+        log.info("青空文庫の索引: %d 作品", len(self._works))
+
+    def stream(self):
+        if self._works is None:
+            self._load_index()
+        if not self._works:
+            return []
+        title, author, url = random.choice(self._works)
+        if not self.col.mark_seen(url):
+            return []
+        data = self.f.get(url)
+        if not data:
+            return []
+        html = data.decode("cp932", "replace") if b"Shift_JIS" in data[:600] or b"shift_jis" in data[:600] else data.decode("utf-8", "replace")
+        html = re.sub(r"<rt>.*?</rt>|<rp>.*?</rp>", "", html, flags=re.S)  # ルビの読みを除く
+        text = html_to_text(html)[0]
+        if len(text) < 300:
+            return []
+        return [(url, f"『{title}』（{author}）\n" + text[:60000], [])]
+
+
+class Gutenberg(Source):
+    """Project Gutenberg: 英語の公有文学。ランダムな ID の平文を読む (無い ID は飛ばす)。"""
+    name = "gutenberg"
+    kind = "stream"
+    weight = 0.3
+
+    def stream(self):
+        if self.lang != "en":
+            return []
+        for _ in range(3):
+            bid = random.randint(1, 70000)
+            url = f"https://www.gutenberg.org/cache/epub/{bid}/pg{bid}.txt"
+            if not self.col.mark_seen(url):
+                continue
+            data = self.f.get(url)
+            if not data:
+                continue
+            text = data.decode("utf-8", "replace")
+            m = re.search(r"\*\*\* START OF [^\n]*\*\*\*(.*?)\*\*\* END OF", text, re.S)
+            body = (m.group(1) if m else text)[:80000]
+            if len(body) > 1000:
+                return [(url, body, [])]
+        return []
+
+
+# ---------------------------------------------------------------- 収集システム
 class Collector:
     def __init__(self, fetcher: Fetcher | None, data_dir: Path, languages: Iterable[str] = ("ja", "en"), interest: Callable[[str], float] | None = None, prefetch: int = 3, workers: int = 2):
         self.fetcher = fetcher
@@ -67,9 +313,9 @@ class Collector:
         self.languages = tuple(languages)
         self.interest = interest or (lambda text: 0.0)
         self.health: dict[str, SourceHealth] = {}
-        self.frontier: list[tuple[float, int, str, str, int]] = []  # (-priority, seq, link, anchor, depth)
+        self.frontier: list[tuple[float, int, str, str, int]] = []
         self._seq = 0
-        self.seen: set[str] = set()
+        self.seen: set[bytes] = set()
         self.feed_last: dict[str, float] = {}
         self.ready: queue.Queue = queue.Queue(maxsize=max(1, prefetch))
         self.topic_fn: Callable[[], str | None] | None = None
@@ -77,8 +323,22 @@ class Collector:
         self._poke = threading.Event()
         self._threads: list[threading.Thread] = []
         self.workers = workers
-        self.lock = threading.RLock()  # pop_link -> _mark_seen で再入する
-        self.stats = {"batches": 0, "pages": 0, "frontier_reads": 0, "feed_items": 0}
+        self.lock = threading.RLock()  # pop_link -> mark_seen で再入する
+        self.stats = {"batches": 0, "pages": 0, "frontier_reads": 0, "feed_items": 0, "stream_reads": 0}
+        self.sources: dict[str, list[Source]] = {}   # lang -> 話題ソース
+        self.streams: list[Source] = []               # 話題に依らない供給源
+        if fetcher is not None:
+            for lang in self.languages:
+                self.sources[lang] = [WikimediaCore(self, lang), MediaWikiAction(self, lang), Wiktionary(self, lang), Wikidata(self, lang), Wikinews(self, lang), Wikibooks(self, lang), DuckDuckGo(self, lang)]
+                self.streams.append(WikipediaRandom(self, lang))
+                self.streams.append(Aozora(self, lang) if lang == "ja" else Gutenberg(self, lang))
+
+    def register(self, source: Source, lang: str | None = None) -> None:
+        """独自ソースの追加 (kind='stream' なら供給源、それ以外は話題ソース)。"""
+        if source.kind == "stream":
+            self.streams.append(source)
+        else:
+            self.sources.setdefault(lang or source.lang, []).append(source)
 
     # ------------------------------------------------------------ 補助
     def _h(self, name: str) -> SourceHealth:
@@ -87,25 +347,27 @@ class Collector:
             h = self.health[name] = SourceHealth()
         return h
 
-    def _mark_seen(self, url: str) -> bool:
+    def mark_seen(self, url: str) -> bool:
         """初見なら True。"""
         key = hashlib.blake2b(url.encode("utf-8"), digest_size=8).digest()
         with self.lock:
             if key in self.seen:
                 return False
-            if len(self.seen) > 30000:
+            if len(self.seen) > 60000:
                 self.seen.clear()
             self.seen.add(key)
             return True
 
-    def report(self, source: str, learned: int) -> None:
-        """学習側からの収穫報告 (文数)。ソースのスコアに反映する。"""
+    _mark_seen = mark_seen
+
+    def report(self, source: str, learned: int, novelty: int = 0) -> None:
+        """学習側からの収穫報告 (文数と新しい語の数)。"""
         h = self._h(source)
         h.gain += min(learned, 400) / 100.0
+        h.novelty += min(novelty, 2000) / 200.0
 
     # ------------------------------------------------------------ フロンティア
     def push_links(self, anchors: Iterable[tuple[str, str]], depth: int = 1, base_url: str = "") -> int:
-        """ページ内リンクをフロンティアへ。優先度 = 関心 + 新規性 - 深さ。"""
         n = 0
         with self.lock:
             for link, anchor in anchors:
@@ -123,8 +385,8 @@ class Collector:
                 self._seq += 1
                 heapq.heappush(self.frontier, (-pri, self._seq, target, anchor, depth))
                 n += 1
-            if len(self.frontier) > 600:
-                self.frontier = heapq.nsmallest(400, self.frontier)
+            if len(self.frontier) > 800:
+                self.frontier = heapq.nsmallest(500, self.frontier)
                 heapq.heapify(self.frontier)
         return n
 
@@ -132,115 +394,30 @@ class Collector:
         with self.lock:
             while self.frontier:
                 _, _, target, anchor, depth = heapq.heappop(self.frontier)
-                if self._mark_seen(target):
+                if self.mark_seen(target):
                     return target, anchor, depth
         return None
 
-    # ------------------------------------------------------------ ソース
-    def _wikimedia(self, topic: str, lang: str, max_pages: int) -> list[tuple[str, str, list]]:
-        f = self.fetcher
-        out = []
-        for key in f.wikimedia_search(topic, lang=lang, limit=max_pages):
-            url = f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(key)}"
-            if not self._mark_seen(url):
-                continue
-            page = f.wikimedia_page(key, lang=lang)
-            if page and len(page.text) > 200:
-                out.append((url, page.text, page.anchors))
-            if len(out) >= max_pages:
-                break
-        return out
-
-    def _wikipedia_action(self, topic: str, lang: str, max_pages: int) -> list[tuple[str, str, list]]:
-        f = self.fetcher
-        out = []
-        for title in f.wikipedia_search(topic, lang=lang, limit=max_pages):
-            url = f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(title)}"
-            if not self._mark_seen(url):
-                continue
-            txt = f.wikipedia_extract(title, lang=lang)
-            if txt and len(txt) > 200:
-                out.append((url, txt, []))
-        return out
-
-    def _duckduckgo(self, topic: str, lang: str, max_pages: int) -> list[tuple[str, str, list]]:
-        f = self.fetcher
-        out = []
-        for url in f.duckduckgo_search(topic, limit=max_pages + 2):
-            if not self._mark_seen(url):
-                continue
-            page = f.get_page(url)
-            if page and len(page.text) > 300:
-                out.append((url, page.text, [(u, a) for u, a in page.anchors if u.startswith(("http", "/"))]))
-            if len(out) >= max_pages:
-                break
-        return out
-
-    def _wikidata(self, topic: str, lang: str, max_pages: int) -> list[tuple[str, str, list]]:
-        """Wikidata の検索 API: 項目のラベルと説明文を「X とは、Y である」の定義文にして返す。"""
-        f = self.fetcher
-        q = urllib.parse.quote(topic)
-        js = f.get_json(f"https://www.wikidata.org/w/api.php?action=wbsearchentities&search={q}&language={lang}&uselang={lang}&format=json&limit=5")
-        if not js:
-            return []
-        lines = []
-        for item in js.get("search", []):
-            label = item.get("label", "").strip()
-            desc = item.get("description", "").strip()
-            if label and desc and len(desc) > 3:
-                lines.append(f"{label}とは、{desc}である。" if lang == "ja" else f"{label} is a {desc}.")
-        if not lines:
-            return []
-        url = f"https://www.wikidata.org/wiki/Special:Search?search={q}"
-        return [(url, "\n".join(lines), [])] if self._mark_seen(url) else []
-
-    def random_article(self, lang: str = "ja") -> Batch | None:
-        """Wikipedia のランダム記事 (探索の多様性を上げる)。"""
-        if self.fetcher is None:
-            return None
-        js = self.fetcher.get_json(f"https://{lang}.wikipedia.org/w/api.php?action=query&list=random&rnnamespace=0&rnlimit=1&format=json")
-        if not js:
-            return None
-        titles = [r["title"] for r in js.get("query", {}).get("random", [])]
-        if not titles:
-            return None
-        t0 = time.time()
-        page = self.fetcher.wikimedia_page(titles[0], lang=lang)
-        pages = []
-        if page and len(page.text) > 200:
-            url = f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(titles[0])}"
-            self._mark_seen(url)
-            pages.append((url, page.text, page.anchors))
-        self._h("random").record(bool(pages), 0.0, time.time() - t0)
-        return Batch(titles[0], "random", pages, "random", time.time() - t0)
-
-    def _ordered_sources(self, lang: str) -> list[tuple[str, Callable]]:
-        cands = [
-            (f"wikimedia:{lang}", lambda t, n, lang=lang: self._wikimedia(t, lang, n)),
-            (f"wikipedia:{lang}", lambda t, n, lang=lang: self._wikipedia_action(t, lang, n)),
-            (f"wikidata:{lang}", lambda t, n, lang=lang: self._wikidata(t, lang, n)),
-            ("duckduckgo", lambda t, n: self._duckduckgo(t, lang, n)),
-        ]
-        cands.sort(key=lambda x: -self._h(x[0]).score)
-        return cands
-
+    # ------------------------------------------------------------ 収集
     def collect(self, topic: str, max_pages: int = 3) -> Batch:
         """話題を検索して読む。健全なソースから順に試し、足りた時点で止める。"""
         t0 = time.time()
         if self.fetcher is None:
             return Batch(topic, "topic", [], "", 0.0)
-        langs = [l for l in self.languages if l == "ja"] or list(self.languages)[:1] if not topic.isascii() else list(self.languages)
+        langs = ([l for l in self.languages if l == "ja"] or list(self.languages)[:1]) if not topic.isascii() else list(self.languages)
         pages: list = []
         used = ""
         for lang in langs:
-            for name, fn in self._ordered_sources(lang):
-                if name == "duckduckgo" and pages:
+            srcs = sorted(self.sources.get(lang, []), key=lambda s: -(self._h(f"{s.name}:{lang}").score * s.weight))
+            for src in srcs:
+                if pages and src.name in ("duckduckgo", "wikibooks", "wikinews"):
+                    continue  # 補助ソースは主ソースが空振りした時だけ
+                if src.name in ("wikidata", "wiktionary") and len(pages) >= max_pages - 1:
                     continue
-                if name.startswith("wikidata") and len(pages) >= max_pages - 1:
-                    continue  # Wikidata は定義文の補助。本文が十分ならスキップ
+                name = f"{src.name}:{lang}"
                 st = time.time()
                 try:
-                    got = fn(topic, max_pages - len(pages))
+                    got = src.search(topic, max_pages - len(pages))
                 except Exception as e:  # ソース単位の失敗は記録して次へ
                     log.info("ソース失敗 %s: %s", name, e)
                     got = []
@@ -255,6 +432,31 @@ class Collector:
         self.stats["batches"] += 1
         self.stats["pages"] += len(pages)
         return Batch(topic, "topic", pages, used, time.time() - t0)
+
+    def collect_stream(self) -> Batch | None:
+        """話題に依らない供給源 (ランダム記事・文学) から 1 つ。健全性 × 重み で選ぶ。"""
+        if not self.streams:
+            return None
+        weights = [max(0.05, self._h(f"{s.name}:{s.lang}").score * s.weight) for s in self.streams]
+        src = random.choices(self.streams, weights=weights)[0]
+        name = f"{src.name}:{src.lang}"
+        t0 = time.time()
+        try:
+            pages = src.stream()
+        except Exception as e:
+            log.info("供給源失敗 %s: %s", name, e)
+            pages = []
+        self._h(name).record(bool(pages), 0.0, time.time() - t0)
+        self.stats["stream_reads"] += 1
+        if not pages:
+            return None
+        for url, _, anchors in pages:
+            if anchors:
+                self.push_links(anchors, 1, base_url=url)
+        return Batch(pages[0][0], "stream", pages, name, time.time() - t0)
+
+    def random_article(self, lang: str = "ja") -> Batch | None:  # 互換
+        return self.collect_stream()
 
     def collect_link(self) -> Batch | None:
         """フロンティアから 1 ページ読む (検索なし)。"""
@@ -291,7 +493,6 @@ class Collector:
         return list(dict.fromkeys(out))
 
     def collect_feeds(self, min_interval: float = 1800.0, max_items: int = 5) -> Batch | None:
-        """更新間隔を過ぎたフィードを 1 つ読み、新着記事の要約 (と本文) を返す。"""
         if self.fetcher is None:
             return None
         now = time.time()
@@ -303,13 +504,13 @@ class Collector:
             items = self.fetcher.get_feed(url)
             pages = []
             for title, link, summary in items:
-                if link and not self._mark_seen(link):
+                if link and not self.mark_seen(link):
                     continue
                 text = f"{title}。{summary}" if title and summary and not summary.startswith(title) else (summary or title)
                 if len(text) > 40:
                     pages.append((link or url, text, []))
                 if link and len(pages) <= 2 and self.interest(title) > 0.3:
-                    page = self.fetcher.get_page(link)  # 関心の高い記事は本文も読む
+                    page = self.fetcher.get_page(link)
                     if page and len(page.text) > 300:
                         pages.append((link, page.text, []))
                 if len(pages) >= max_items:
@@ -320,7 +521,6 @@ class Collector:
         return None
 
     def collect_site(self, index: int) -> Batch | None:
-        """sources.txt のサイトを順番に巡回 (リンクはフロンティアへ)。"""
         if self.fetcher is None:
             return None
         sites = self._list_file("sources.txt")
@@ -329,7 +529,7 @@ class Collector:
         url = sites[index % len(sites)]
         t0 = time.time()
         pages = []
-        page = self.fetcher.get_page(url) if self._mark_seen(url) or index % (4 * len(sites)) == 0 else None
+        page = self.fetcher.get_page(url) if self.mark_seen(url) or index % (4 * len(sites)) == 0 else None
         if page and len(page.text) > 200:
             pages.append((url, page.text, []))
             host = urllib.parse.urlsplit(url).netloc
@@ -340,8 +540,6 @@ class Collector:
 
     # ------------------------------------------------------------ 先読み
     def start_prefetch(self, topic_fn: Callable[[], str | None]) -> None:
-        """先読みワーカーを起動。ワーカーごとに役割をずらす (話題検索 / フロンティア / フィード・ランダム)。
-        ホストごとの間隔は Fetcher が守るので、別ホストへの取得が並列になる。"""
         if self.fetcher is None or self._threads:
             return
         self.topic_fn = topic_fn
@@ -367,17 +565,16 @@ class Collector:
                 batch = None
                 if turn % 5 == 0:
                     batch = self.collect_feeds()
-                if batch is None and turn % 7 == 0:
-                    batch = self.random_article(self.languages[0] if self.languages else "ja")
+                if batch is None and turn % 4 == 0:
+                    batch = self.collect_stream()      # ランダム記事・文学 (多様性)
                 if batch is None and (turn % 3 == 0 or worker % 2 == 1):
-                    batch = self.collect_link()  # 奇数ワーカーはフロンティア優先
+                    batch = self.collect_link()        # 奇数ワーカーはフロンティア優先
                 if batch is None and self.topic_fn is not None:
                     topic = self.topic_fn()
                     batch = self.collect(topic) if topic else None
                 if batch is None:
-                    batch = self.collect_link()
+                    batch = self.collect_link() or self.collect_stream()
                 if batch is None or not batch.pages:
-                    # 何も取れなかった: 少し待つ (poke で即再開)
                     self._poke.wait(10.0)
                     self._poke.clear()
                     continue
@@ -401,6 +598,7 @@ class Collector:
     def describe(self) -> dict:
         return {
             "sources": {k: v.to_dict() for k, v in self.health.items()},
+            "registered": [f"{s.name}:{s.lang}" for lst in self.sources.values() for s in lst] + [f"{s.name}:{s.lang}" for s in self.streams],
             "frontier": len(self.frontier),
             "seen": len(self.seen),
             "ready": self.ready.qsize(),

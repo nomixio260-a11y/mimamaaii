@@ -13,7 +13,9 @@ from tinyai.memory import MemoryGuard, rss_bytes
 from tinyai.brain import question_type, sentence_quality
 from tinyai.collector import Batch, Collector
 from tinyai.facts import FactStore, extract_facts, parse_question
+from tinyai.dumps import iter_archive_texts, iter_wiki_pages, learn_wiki_dump
 from tinyai.knowledge import is_junk
+from tinyai.wikitext import wikitext_to_text
 from tinyai.lm import CacheLM
 from tinyai.reranker import Reranker
 from tinyai.semantic import SemanticSpace
@@ -580,6 +582,110 @@ class MemoryGuardTest(unittest.TestCase):
         self.assertGreater(g.budget, 0)
         self.assertLess(g.budget, 64 * 1024 * 1024)
         self.assertGreaterEqual(g.pressure(), 0.0)
+
+
+class DumpTest(unittest.TestCase):
+    def _dump(self, tmp: Path) -> Path:
+        import bz2
+        bold = "'" * 3
+        pages = "".join(
+            f"<page><title>架空記事{i}</title><ns>0</ns><revision><text xml:space=\"preserve\">{bold}架空記事{i}{bold}は[[架空の国]]にある都市である。\n架空記事{i}の人口は約 {1000 + i} 人である。{{{{Infobox|x=y}}}}\n[[Category:架空]]</text></revision></page>\n"
+            for i in range(10, 40)
+        ) + "<page><title>転送</title><ns>0</ns><revision><text>#転送 [[架空記事10]]</text></revision></page><page><title>Wikipedia:方針</title><ns>4</ns><revision><text>方針です。記事ではありません。</text></revision></page>"
+        path = tmp / "testwiki.xml.bz2"
+        with bz2.open(path, "wt", encoding="utf-8") as f:
+            f.write("<mediawiki>\n" + pages + "</mediawiki>\n")
+        return path
+
+    def test_wikitext_cleaner(self):
+        bold = "'" * 3
+        out = wikitext_to_text("{{Infobox|a=b}}" + bold + "東京タワー" + bold + "は[[東京都|東京]]の[[電波塔]]である<ref>x</ref>。\n== 概要 ==\n{| class=\"wikitable\"\n| a || b\n|}\n* 高さは333メートル。")
+        self.assertEqual(out, "東京タワーは東京の電波塔である。\n高さは333メートル。")
+
+    def test_stream_dump_and_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._dump(Path(tmp))
+            pages = list(iter_wiki_pages(path))
+            self.assertEqual(len(pages), 31)  # 名前空間 4 は除外
+            b = make_brain(tmp)
+            n_pages, n_sents = learn_wiki_dump(b, path)
+            self.assertEqual(n_pages, 30)  # 転送は除外
+            self.assertGreaterEqual(n_sents, 55)
+            self.assertIn("1015", b.reply("架空記事15の人口は？").text)
+            import zipfile
+            zp = Path(tmp) / "texts.zip"
+            with zipfile.ZipFile(zp, "w") as z:
+                z.writestr("a.txt", "書庫の中の文章です。二つ目の文もあります。")
+                z.writestr("b.bin", b"\x00\x01")
+            items = list(iter_archive_texts(zp))
+            self.assertEqual(len(items), 1)
+            self.assertIn("書庫", items[0][1])
+
+
+class CollectorRegistryTest(unittest.TestCase):
+    def test_registry_and_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            col = Collector(object(), Path(tmp), languages=("ja",))
+            names = col.describe()["registered"]
+            self.assertIn("wiktionary:ja", names)
+            self.assertIn("aozora:ja", names)
+            col.report("wikimedia:ja", 120, 300)
+            h = col._h("wikimedia:ja")
+            self.assertGreater(h.novelty, 0)
+            self.assertGreater(h.score, col._h("duckduckgo:ja").score)
+
+    def test_ascii_junk_rule(self):
+        self.assertFalse(is_junk("Artificial intelligence is the field of building computer systems that perform tasks."))
+        self.assertTrue(is_junk("aaaaaaaaaaaaaaaaaaaaaaaaaa"))
+
+
+class GuardAndVotingTest(unittest.TestCase):
+    def test_unknown_subject_and_attribute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.learn_text("富士山の標高は 3776 メートルです。", "https://a/f")
+            r = b.reply("富士山の面積は？")
+            self.assertIn("知りません", r.text)  # 別の属性 (標高) で答えない
+            self.assertLess(r.confidence, 0.5)
+            r = b.reply("ゾンビ星の直径は？")
+            self.assertLess(r.confidence, 0.3)
+            r = b.reply("富士山の高さは？")  # 高さ ↔ 標高 は同義
+            self.assertIn("3776", r.text)
+
+    def test_voting_conflict_and_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.learn_text("東京タワーの高さは 333 メートルである。東京タワーは東京都港区にある電波塔である。", "https://ja.wikipedia.org/wiki/t")
+            b.learn_text("東京タワーの高さは 333 メートルだ。東京タワーは 1958 年に完成した。", "https://example.com/t")
+            b.learn_text("東京タワーの高さは 300 メートルである。", "https://bad.example/x")
+            groups = b.facts.support(b.facts.lookup("東京タワー", "高さ"))
+            self.assertEqual(groups[0][0][1], "333 メートル")
+            self.assertEqual(groups[0][1], 2)  # 近似重複の別出典が裏付けとして数えられる
+            r = b.reply("東京タワーの高さは？")
+            self.assertIn("333", r.text)
+            self.assertIn("300", r.text)  # 矛盾を可視化
+            r = b.reply("東京タワーについて教えて")
+            self.assertEqual(r.mode, "summary")
+            self.assertIn("1958", r.text)
+            self.assertGreaterEqual(len(r.sources), 2)
+
+
+class EvalToolTest(unittest.TestCase):
+    def test_parse_and_judge(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("evaltool", Path(__file__).resolve().parent.parent / "tools" / "eval.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        from tinyai.brain import Reply
+        ex = mod.parse_expect("東京|!大阪|mode:fact,recall|conf>=0.5")
+        self.assertEqual(ex["any"], ["東京"])
+        self.assertEqual(ex["not"], ["大阪"])
+        self.assertTrue(mod.judge(Reply("首都は東京です", 0.9, "fact", [], [], []), ex)[0])
+        self.assertFalse(mod.judge(Reply("首都は東京と大阪です", 0.9, "fact", [], [], []), ex)[0])
+        self.assertFalse(mod.judge(Reply("首都は東京です", 0.2, "fact", [], [], []), ex)[0])
+        unknown = mod.parse_expect("")
+        self.assertTrue(mod.judge(Reply("知りません", 0.1, "generate", [], [], []), unknown)[0])
+        self.assertFalse(mod.judge(Reply("何か", 0.8, "recall", [], [], []), unknown)[0])
 
 
 if __name__ == "__main__":

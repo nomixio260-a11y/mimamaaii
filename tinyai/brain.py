@@ -33,7 +33,7 @@ from typing import Iterable
 from .config import Config
 from .brain_types import question_type, _rerank_bonus  # noqa: F401
 from .evolution import Evolution, Params
-from .facts import FactStore, extract_facts
+from .facts import FactStore, attr_synonyms, extract_facts, parse_question
 from .knowledge import KnowledgeBase, Doc
 from .lm import NGramLM, CacheLM, EOS
 from .memory import MemoryGuard, MB
@@ -41,6 +41,7 @@ from .reranker import Reranker
 from .semantic import SemanticSpace
 from .suffix import SuffixIndex
 from .tokenizer import (
+    analyze,
     detokenize,
     is_phrase,
     is_question,
@@ -119,6 +120,7 @@ class Brain:
         self.kb = KnowledgeBase()
         self.facts = FactStore()
         self.kb.on_remove = self.facts.remove_doc
+        self.facts.source_of = self._source_of
         self.semantic = SemanticSpace()           # 意味ベクトル (後回しで学習)
         self._semantic_queue: deque = deque(maxlen=50000)  # 意味ベクトル未学習の文書 ID
         self.suffix = SuffixIndex()               # 最長一致生成用の接尾辞配列 (整理時に再構築)
@@ -126,8 +128,10 @@ class Brain:
         self.cache_lm = CacheLM()                 # 会話キャッシュ LM
         self.reranker = Reranker()                # 👍/👎 から学ぶリランカー
         self._last_features: dict[int, dict] = {}  # 直前の候補 doc_id -> 特徴量 (学習用)
+        self.timers: Counter = Counter()          # 段階ごとの累積秒 (コスト計測)
         self._docvec_cache: dict[int, tuple[int, list[float] | None]] = {}  # doc_id -> (世代, ベクトル)
         self._last_cover: dict[int, float] = {}
+        self._guard_note: tuple[str, str, str] | None = None  # (種類, 主語, 属性) 直前の質問で「知らない」と判定した内容
         self.params = Params(use_order=min(3, self.cfg.max_order))
         self._apply_params()
         self.evolution = Evolution(self)          # 世代・適応度・変異幅はここが持つ
@@ -212,37 +216,54 @@ class Brain:
         return added
 
     def _learn_sentences(self, sentences, source: str) -> int:
+        """学習パイプライン (文単位): 解析 1 回 → 取り込み判定 → 知識ベース → 事実 → LM → 後回しキュー。
+        各段階の所要時間を self.timers に積む。"""
         added = 0
         # 自己評価用の取り置きは、長い Web 文書からだけ (短い入力は 1 文が重要なので全部学ぶ)
         holdout_ok = source.startswith("http") and len(sentences) >= 40
-        kb, lm = self.kb, self.lm
+        kb, lm, timers = self.kb, self.lm, self.timers
+        protected = source in ("user", "chat", "seed")
+        perf = time.perf_counter
         for s in sentences:
             self._holdout_counter += 1
-            if holdout_ok and self._holdout_counter % 40 == 0:
-                toks = tokenize(s)
-                if len(toks) >= 4:
-                    if len(self.holdout) < self.cfg.holdout_size:
-                        self.holdout.append(toks)
-                    else:
-                        self.holdout[self.rng.randrange(len(self.holdout))] = toks
-                    continue
-            # 知識ベースが受け付けた文 (重複でもジャンクでもない) だけ LM に入れる
+            t0 = perf()
+            info = analyze(s)
+            timers["analyze"] += perf() - t0
+            if holdout_ok and self._holdout_counter % 40 == 0 and len(info.tokens) >= 4:
+                if len(self.holdout) < self.cfg.holdout_size:
+                    self.holdout.append(info.tokens)
+                else:
+                    self.holdout[self.rng.randrange(len(self.holdout))] = info.tokens
+                continue
+            t0 = perf()
             facts = extract_facts(s) if len(s) <= 200 else []
             q = sentence_quality(s, bool(facts))
-            if q < self.admission and not facts and source not in ("user", "chat", "seed"):
+            timers["facts+quality"] += perf() - t0
+            if q < self.admission and not facts and not protected:
                 self.stats["skipped_low_quality"] += 1
                 continue
-            doc = kb.add(s, source, quality=q)
+            t0 = perf()
+            doc = kb.add(s, source, tf=Counter(info.terms), quality=q)
+            timers["kb"] += perf() - t0
             if doc is None:
+                dup = kb.last_dup_id
+                if dup is not None:
+                    orig = kb.docs.get(dup)
+                    if orig is not None and orig.source != source:
+                        # 別の出典が同じことを言っている = 裏付け。文書の信頼度と事実の支持数に反映
+                        orig.score = min(20.0, orig.score + 0.5)
+                        self.facts.corroborate(dup, source.split("/")[2] if source.startswith("http") else source)
+                        self.stats["corroborated"] += 1
                 continue
             added += 1
             for subj, rel, obj in facts:
                 if self.facts.add(subj, rel, obj, doc.id):
                     self.stats["facts_learned"] += 1
-            toks = tokenize(s)
-            if len(toks) >= 2:
-                lm.learn(toks)
-            self._semantic_queue.append(doc.id)
+            if len(info.tokens) >= 2:
+                t0 = perf()
+                lm.learn(info.tokens)
+                timers["lm"] += perf() - t0
+            self._semantic_queue.append((doc.id, info.phrases))
             self._suffix_dirty += 1
             if added % 500 == 0:
                 self._maybe_enforce()
@@ -254,12 +275,21 @@ class Brain:
         応答経路からは sketches=False・小さな budget で呼び、数百 µs に抑える。"""
         with self.lock:
             n = 0
+            t0 = time.perf_counter()
             while self._semantic_queue and n < budget_docs:
-                doc = self.kb.docs.get(self._semantic_queue.popleft())
-                if doc is None:
-                    continue
-                self.semantic.learn(phrases(doc.text))
+                item = self._semantic_queue.popleft()
+                if isinstance(item, tuple):
+                    doc_id, phr = item
+                    if doc_id not in self.kb.docs:
+                        continue
+                else:  # 読込直後は ID だけ
+                    doc = self.kb.docs.get(item)
+                    if doc is None:
+                        continue
+                    phr = phrases(doc.text)
+                self.semantic.learn(phr)
                 n += 1
+            self.timers["semantic"] += time.perf_counter() - t0
             sk = self.semantic.refresh_sketches(limit=400) if sketches and (n or self.semantic._dirty) else 0
             rebuilt = False
             if sketches and (self._suffix_dirty >= max(50, len(self.kb) // 10) or (self._suffix_dirty and not len(self.suffix))):
@@ -280,14 +310,18 @@ class Brain:
         self.stats["suffix_rebuilds"] += 1
 
     def learn_batch(self, batch, collector=None) -> int:
-        """収集システムの 1 バッチ (複数ページ) を学習し、リンクをフロンティアへ、収穫を報告する。"""
+        """収集システムの 1 バッチ (複数ページ) を学習し、リンクをフロンティアへ、収穫を報告する。
+        収穫は「文数」ではなく「新しく覚えた語の数」も含めて報告する (新規性駆動)。"""
         total = 0
         best: tuple[int, str, str] | None = None
         for src, text, anchors in batch.pages:
+            before = len(self.kb.index)
             n = self.learn_text(text, source=src)
+            novelty = len(self.kb.index) - before
             total += n
+            self.stats["new_terms"] += novelty
             if collector is not None:
-                collector.report(batch.source or src, n)
+                collector.report(batch.source or src, n, novelty)
                 if anchors:
                     collector.push_links(anchors, depth=1, base_url=src)
             if n and (best is None or n > best[0]):
@@ -509,9 +543,20 @@ class Brain:
                 query = text + " " + " ".join(self.last_topics)
                 topics = topics or list(self.last_topics)
             qtype = question_type(text)
-            reply = self._answer_from_facts(text, ja)
+            reply = None
+            if topics:
+                m = re.match(r"^(.+?)(について|の話を|のこと|に関して)\s*(教えて|話して|説明して|聞かせて|知りたい|まとめて)", text)
+                if m and is_phrase(m.group(1).lower()):
+                    summ = self.summarize(m.group(1), ja=ja)
+                    if summ is not None:
+                        s_text, s_ids, s_srcs = summ
+                        self.stats["summaries"] += 1
+                        reply = Reply(s_text, 0.75, "summary", list(dict.fromkeys(s_srcs)), s_ids, [])
+            if reply is None:
+                reply = self._answer_from_facts(text, ja)
             if reply is None:
                 hits = self._search(query, exclude_id=new_doc.id if new_doc else None, qtype=qtype, subject=topics[0] if topics else None)
+                hits = self._guard_unknown(text, hits, ja)
                 reply = self._compose(text, hits, topics, ja, question, qtype)
             reply = self._attach_notices(reply, topics, ja)
             for t in topics:
@@ -594,12 +639,98 @@ class Brain:
                     sem = self.semantic.cosine(qvec, dvec)
             c2 = c + p.rerank_weight * qb + p.semantic_weight * max(sem, 0.0) * 0.5
             x = Reranker.features(c * 10, cover_map.get(d.id, 0.0), qb, sem, d.quality, d.score, d.source, len(d.text), False, d.id in self.facts.by_doc)
-            if self.reranker.samples >= 5 and p.learned_weight > 0:
-                c2 = (1 - p.learned_weight) * c2 + p.learned_weight * self.reranker.predict(x)
+            if self.reranker.samples >= 20 and p.learned_weight > 0:
+                # 学習サンプルが少ないうちは弱く混ぜる (50 件で満額)
+                lw = p.learned_weight * min(1.0, self.reranker.samples / 50.0)
+                c2 = (1 - lw) * c2 + lw * self.reranker.predict(x)
             self._last_features[d.id] = x
             rescored.append((min(1.0, c2), d))
         rescored.sort(key=lambda x: -x[0])
         return rescored[:k]
+
+    def _source_of(self, doc_id: int) -> str:
+        d = self.kb.docs.get(doc_id)
+        if d is None:
+            return "?"
+        src = d.source
+        if src.startswith("http"):
+            return src.split("/")[2] + "/" + src.rsplit("/", 1)[-1][:40]  # ホスト + ページ
+        return src
+
+    def summarize(self, topic: str, max_sentences: int = 3, ja: bool = True) -> tuple[str, list[int], list[str]] | None:
+        """「X について教えて」向けの抽出的要約: 事実 (定義など) + 出典の異なる関連文を句の重なりで重複除去して並べる。"""
+        parts: list[str] = []
+        ids: list[int] = []
+        srcs: list[str] = []
+        used_phr: set[str] = set()
+        for rel, obj, doc_id in self.facts.lookup(topic)[:2]:
+            if doc_id in self.kb.docs:
+                sent = self.facts._render(topic, rel, obj, ja)
+                parts.append(sent)
+                ids.append(doc_id)
+                srcs.append(self.kb.docs[doc_id].source)
+                used_phr |= set(phrases(sent))
+        hits = self._search(topic, k=8)
+        seen_src = set(srcs)
+        for conf, d in hits:
+            if len(parts) >= max_sentences:
+                break
+            if conf < self.params.answer_threshold * 0.8 or d.id in ids:
+                continue
+            ph = set(phrases(d.text))
+            if used_phr and len(ph & used_phr) / max(len(ph), 1) > 0.6:
+                continue  # 既に言った内容とほぼ同じ
+            if d.source in seen_src and len(parts) >= 2:
+                continue  # 出典の多様性を優先
+            parts.append(d.text)
+            ids.append(d.id)
+            srcs.append(d.source)
+            seen_src.add(d.source)
+            used_phr |= ph
+        if not parts:
+            return None
+        return " ".join(parts), ids, srcs
+
+    def _guard_unknown(self, text: str, hits, ja: bool):
+        """「知らないことは知らないと言う」ための確信度の抑制。
+        (a) 質問の主語 (句) を知識がまったく含まない → 候補の確信度を下げる
+        (b) 「X の Y は?」で X は知っているが属性 Y を含む文が無い → 確信度を下げる (別の属性で答えない)"""
+        parsed = parse_question(text)
+        subj_ok = True
+        attr = None
+        self._guard_note = None
+        subj = ""
+        if parsed:
+            subj, attr = parsed
+            subj_terms = [t for t in terms(subj) if is_phrase(t)] or [t for t in terms(subj) if term_weight(t) >= 1.0]
+            if subj_terms and not any(self.kb.posting_ids(t) for t in subj_terms):
+                subj_ok = False
+        else:
+            ks = [k for k in keywords(text, limit=2) if is_phrase(k)]
+            if ks and not any(self.kb.posting_ids(k) for k in ks):
+                subj_ok = False
+        if not subj_ok:
+            self.stats["unknown_subject"] += 1
+            self._guard_note = ("subject", subj or " ".join(keywords(text, limit=1)), "")
+            return [(min(c, 0.2), d) for c, d in hits]
+        if attr and len(attr) >= 2 and attr not in ("definition", "event", "location", "who"):
+            keys = attr_synonyms(attr)
+            kanji = [ch for ch in attr if "\u4e00" <= ch <= "\u9fff"]
+            out = []
+            kept = 0
+            for c, d in hits:
+                t = d.text
+                # 属性語・同義語を含む、または属性の漢字を含む (高さ ↔ 高い) 文は残す
+                if any(k in t for k in keys) or (kanji and any(ch in t for ch in kanji)):
+                    out.append((c, d))
+                    kept += 1
+                else:
+                    out.append((min(c, self.params.answer_threshold * 0.5), d))  # 属性が無い文は「たぶん」以下に
+            self.stats["attr_guard"] += 1
+            if not kept:
+                self._guard_note = ("attr", subj, attr)
+            return out
+        return hits
 
     def _doc_vector(self, doc: Doc):
         """文書の意味ベクトル (意味空間の世代ごとにキャッシュ)。"""
@@ -635,9 +766,13 @@ class Brain:
             return None
         parts = []
         ids = []
+        anchor = set(phrases(last.text)) | set(self.last_topics)
         for i in range(1, 4):
             nxt = self.kb.docs.get(last.id + i)
             if nxt is None or nxt.source != last.source:
+                break
+            # 隣の文でも話題が違えば続きではない (同じ出典に別の話題が混ざることがある)
+            if anchor and not (anchor & set(phrases(nxt.text))) or nxt.id in self._said:
                 break
             parts.append(nxt.text)
             ids.append(nxt.id)
@@ -665,6 +800,21 @@ class Brain:
             r = self._continuation(ja)
             if r is not None:
                 return r
+        note = self._guard_note
+        if note is not None and not (hits and hits[0][0] >= p.answer_threshold):
+            # 知らないことは知らないと言う (それでも知っていることがあれば添える)
+            kind, subj, attr = note
+            self.stats["honest_unknown"] += 1
+            if kind == "attr":
+                known = self.facts.lookup(subj)[:1]
+                extra = ""
+                if known:
+                    r, o, _ = known[0]
+                    extra = (f" {self.facts._render(subj, r, o, True)}" if ja else f" {self.facts._render(subj, r, o, False)}")
+                msg = f"「{subj}の{attr}」はまだ知りません。調べておきます。{extra}" if ja else f"I don't know the {attr} of {subj} yet. I'll look it up.{extra}"
+            else:
+                msg = f"「{subj}」についてはまだ知りません。調べておきます。" if ja else f"I don't know about '{subj}' yet. I'll look it up."
+            return Reply(msg.strip(), 0.1, "generate", [], [], [])
         if hits and hits[0][0] >= p.answer_threshold:
             conf, doc = hits[0]
             answer = doc.text
@@ -743,6 +893,8 @@ class Brain:
                     break
             for t in ng or ():
                 cands.setdefault(t, 0.0)
+            cands.pop(0, None)  # <unk> と <s> は生成しない
+            cands.pop(1, None)
             if not cands:
                 break
             # 混合: suffix_w × 最長一致分布 (一致が長いほど信頼) + (1-suffix_w) × n-gram + cache_w × キャッシュ
@@ -1066,7 +1218,12 @@ class Brain:
                     new_id = id_map.get(old_id)
                     if new_id is not None:
                         self.facts.add(key, rel, obj, new_id)
+            for old_id, srcs in state.get("facts", {}).get("extra_sources", {}).items():
+                new_id = id_map.get(int(old_id)) if not isinstance(old_id, int) else id_map.get(old_id)
+                if new_id is not None:
+                    self.facts.extra_sources[new_id] = set(srcs)
             self.kb.on_remove = self.facts.remove_doc
+            self.facts.source_of = self._source_of
             self.interest = state.get("interest", {})
             self.semantic = SemanticSpace.from_state(state["semantic"]) if "semantic" in state else SemanticSpace()
             self.reranker = Reranker.from_state(state.get("reranker", {}))
@@ -1119,6 +1276,7 @@ class Brain:
                 "strategies": {k: {"tries": v[0], "avg_gain": round(v[1] / v[0], 2) if v[0] else None} for k, v in self.strategy_stats.items()},
                 "qa_log": len(self.qa_log),
                 "stats": dict(self.stats),
+                "timers_ms": {k: round(v * 1000, 1) for k, v in self.timers.items()},
                 "uptime_h": round((time.time() - self.created) / 3600, 2),
             }
 

@@ -43,8 +43,12 @@ def is_junk(text: str) -> bool:
         return True
     if len(_JUNK_RE.findall(text)) > 2:
         return True
-    # 同じ文字の異常な繰り返し
-    if n >= 12 and len(set(text)) < n / 4:
+    # 同じ文字の異常な繰り返し (英語は文字種が少ないので基準を緩める)
+    distinct = len(set(text))
+    if text.isascii():
+        if n >= 12 and distinct < min(8, n / 6):
+            return True
+    elif n >= 12 and distinct < n / 4:
         return True
     return False
 
@@ -88,7 +92,8 @@ class KnowledgeBase:
         self.docs: dict[int, Doc] = {}
         self.index: dict[str, dict[int, int]] = {}
         self.hashes: set[int] = set()
-        self.content_keys: set[int] = set()  # 近似重複判定用 (情報量の高い語の集合のハッシュ)
+        self.content_keys: dict[int, int] = {}  # 近似重複判定用: 語集合のハッシュ -> 元の文書 ID
+        self.last_dup_id: int | None = None      # 直前の add が近似重複で弾かれた時、その元の文書 ID
         self.assoc: dict[int, list[str]] = {}  # doc_id -> 結び付けた追加の語
         self.next_id = 1
         self.total_len = 0
@@ -106,9 +111,10 @@ class KnowledgeBase:
     @staticmethod
     def _content_key(tf: Counter) -> int | None:
         """情報量の高い語 (句) の集合から作る鍵。語順や助詞が違うだけの文は同じ鍵になる。"""
-        # 句 (漢字/カタカナ語・英単語) と数字・英数字トークンが文の「中身」。かな bigram は無視
-        items = sorted(t for t in tf if is_phrase(t) or (t.isascii() and len(t) >= 2))
-        if len(items) < 3:
+        # 情報量の高い語 (漢字を含む bigram・句・英数字) の集合が文の「中身」。かな bigram と助詞は無視。
+        # 語が少ない短文は鍵を作らない (別の文を同一視しやすいため)
+        items = sorted(t for t in tf if term_weight(t) >= 1.0)
+        if len(items) < 4:
             return None
         return hash(tuple(items))
 
@@ -124,10 +130,13 @@ class KnowledgeBase:
         if not tf:
             return None
         ck = self._content_key(tf)
+        self.last_dup_id = None
         if ck is not None:
-            if ck in self.content_keys:
-                return None  # 近似重複 (同じ句の集合を持つ文が既にある)
-            self.content_keys.add(ck)
+            orig = self.content_keys.get(ck)
+            if orig is not None and orig in self.docs:
+                self.last_dup_id = orig  # 近似重複 (同じ語集合の文が既にある): 元の文書を裏付けとして扱える
+                return None
+            self.content_keys[ck] = self.next_id
         doc = Doc(self.next_id, text, source[:120], time.time(), sum(tf.values()))
         doc.quality = quality
         self.next_id += 1
@@ -181,8 +190,8 @@ class KnowledgeBase:
         self.total_len -= doc.length
         tf = Counter(terms(doc.text))
         ck = self._content_key(tf)
-        if ck is not None:
-            self.content_keys.discard(ck)
+        if ck is not None and self.content_keys.get(ck) == doc_id:
+            del self.content_keys[ck]
         extra = self.assoc.pop(doc_id, ())
         for t in list(tf) + list(extra):
             self._post_remove(t, doc_id)
