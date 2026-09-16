@@ -25,6 +25,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable, Iterable
 
+from .dialog import extract_quote_pairs
 from .web import Fetcher, Page, html_to_text
 
 log = logging.getLogger("tinyai.collector")
@@ -34,11 +35,12 @@ Pages = list  # [(source_url, text, anchors)]
 
 
 class Batch:
-    """1 回の収集結果。pages は [(source_url, text, anchors)]。"""
-    __slots__ = ("topic", "kind", "pages", "source", "elapsed")
+    """1 回の収集結果。pages は [(source_url, text, anchors)]、dialogs は [(発話, 応答)]。"""
+    __slots__ = ("topic", "kind", "pages", "source", "elapsed", "dialogs")
 
-    def __init__(self, topic: str, kind: str, pages: list, source: str, elapsed: float):
+    def __init__(self, topic: str, kind: str, pages: list, source: str, elapsed: float, dialogs: list | None = None):
         self.topic, self.kind, self.pages, self.source, self.elapsed = topic, kind, pages, source, elapsed
+        self.dialogs = dialogs or []
 
 
 class SourceHealth:
@@ -277,7 +279,132 @@ class Aozora(Source):
         text = html_to_text(html)[0]
         if len(text) < 300:
             return []
+        self.last_dialogs = extract_quote_pairs(text)  # 会話文の応酬 (会話データ)
         return [(url, f"『{title}』（{author}）\n" + text[:60000], [])]
+
+
+class HuggingFaceDatasets(Source):
+    """Hugging Face datasets-server (公開データセットの行を JSON で返す API) から対話/指示データを読む。
+    data/datasets.txt に「dataset<TAB>config<TAB>split<TAB>形式」を書く。形式は
+    conversations (from/value の配列) / instruction (instruction, input, output) / qa (question, answer) / text (text)。"""
+    name = "hfdatasets"
+    kind = "stream"
+    weight = 1.0
+    PAGE = 50
+
+    def __init__(self, col, lang="ja"):
+        super().__init__(col, lang)
+        self.offsets: dict[str, int] = {}
+        self.last_dialogs: list = []
+
+    def _specs(self) -> list[tuple[str, str, str, str]]:
+        out = []
+        for line in self.col._list_lines("datasets.txt"):
+            parts = [x.strip() for x in line.split("\t")]
+            if len(parts) >= 4 and not parts[0].startswith("#"):
+                out.append((parts[0], parts[1], parts[2], parts[3]))
+        return out
+
+    @staticmethod
+    def _pairs_from_row(row: dict, fmt: str) -> list[tuple[str, str]]:
+        pairs = []
+        if fmt == "conversations":
+            conv = row.get("conversations") or row.get("messages") or []
+            prev = None
+            for m in conv:
+                role = (m.get("from") or m.get("role") or "").lower()
+                val = (m.get("value") or m.get("content") or "").strip()
+                if role in ("human", "user", "prompter"):
+                    prev = val
+                elif role in ("gpt", "assistant", "bot") and prev:
+                    pairs.append((prev, val))
+                    prev = None
+        elif fmt == "instruction":
+            q = (row.get("instruction") or "").strip()
+            inp = (row.get("input") or "").strip()
+            a = (row.get("output") or row.get("response") or "").strip()
+            if q and a:
+                pairs.append((f"{q}\n{inp}" if inp else q, a))
+        elif fmt == "qa":
+            q = (row.get("question") or row.get("title") or "").strip()
+            a = (row.get("answer") or row.get("answers") or "").strip() if isinstance(row.get("answer") or row.get("answers"), str) else ""
+            if q and a:
+                pairs.append((q, a))
+        return pairs
+
+    def stream(self):
+        specs = self._specs()
+        if not specs:
+            return []
+        ds, cfg, split, fmt = random.choice(specs)
+        key = f"{ds}/{cfg}/{split}"
+        off = self.offsets.get(key, 0)
+        url = (f"https://datasets-server.huggingface.co/rows?dataset={urllib.parse.quote(ds, safe='')}&config={urllib.parse.quote(cfg)}"
+               f"&split={split}&offset={off}&length={self.PAGE}")
+        js = self.f.get_json(url)
+        rows = (js or {}).get("rows", [])
+        if not rows:
+            self.offsets[key] = 0  # 末尾まで来たら最初から
+            return []
+        self.offsets[key] = off + len(rows)
+        pairs = []
+        texts = []
+        for r in rows:
+            row = r.get("row", {})
+            if fmt == "text":
+                t = (row.get("text") or "").strip()
+                if len(t) > 40:
+                    texts.append(t)
+                continue
+            pairs.extend(self._pairs_from_row(row, fmt))
+        self.last_dialogs = pairs
+        # 応答文は知識としても学ぶ (説明文であることが多い)
+        body = "\n".join(texts) + "\n" + "\n".join(a for _, a in pairs if len(a) >= 20)
+        src = f"hf:{ds}#{off}"
+        return [(src, body, [])] if len(body) > 40 else []
+
+
+class StackExchange(Source):
+    """Stack Exchange API: 質問 → 採用回答 のペア (CC BY-SA)。認証なしで 1 日 300 リクエスト。"""
+    name = "stackexchange"
+    kind = "stream"
+    weight = 0.6
+
+    def __init__(self, col, lang="ja"):
+        super().__init__(col, lang)
+        self.page = 1
+        self.last_dialogs: list = []
+
+    def stream(self):
+        site = "ja.stackoverflow" if self.lang == "ja" else "stackoverflow"
+        url = (f"https://api.stackexchange.com/2.3/questions?order=desc&sort=votes&site={site}&pagesize=20&page={self.page}"
+               f"&filter=withbody")
+        js = self.f.get_json(url)
+        items = (js or {}).get("items", [])
+        if not items:
+            self.page = 1
+            return []
+        self.page += 1
+        qs = [q for q in items if q.get("accepted_answer_id")]
+        if not qs:
+            return []
+        ids = ";".join(str(q["accepted_answer_id"]) for q in qs[:10])
+        ans = self.f.get_json(f"https://api.stackexchange.com/2.3/answers/{ids}?site={site}&filter=withbody")
+        body_by_id = {a["answer_id"]: a.get("body", "") for a in (ans or {}).get("items", [])}
+        pairs = []
+        texts = []
+        for q in qs[:10]:
+            a_html = body_by_id.get(q["accepted_answer_id"])
+            if not a_html:
+                continue
+            q_text = html_to_text(q.get("title", "") + "\n" + q.get("body", ""))[0]
+            a_text = html_to_text(a_html)[0]
+            if q_text and a_text:
+                pairs.append((q_text[:300], a_text[:600]))
+                texts.append(a_text)
+        self.last_dialogs = pairs
+        src = f"stackexchange:{site}#p{self.page - 1}"
+        return [(src, "\n".join(texts), [])] if texts else []
 
 
 class Gutenberg(Source):
@@ -332,6 +459,8 @@ class Collector:
                 self.sources[lang] = [WikimediaCore(self, lang), MediaWikiAction(self, lang), Wiktionary(self, lang), Wikidata(self, lang), Wikinews(self, lang), Wikibooks(self, lang), DuckDuckGo(self, lang)]
                 self.streams.append(WikipediaRandom(self, lang))
                 self.streams.append(Aozora(self, lang) if lang == "ja" else Gutenberg(self, lang))
+                self.streams.append(HuggingFaceDatasets(self, lang))
+                self.streams.append(StackExchange(self, lang))
 
     def register(self, source: Source, lang: str | None = None) -> None:
         """独自ソースの追加 (kind='stream' なら供給源、それ以外は話題ソース)。"""
@@ -448,12 +577,16 @@ class Collector:
             pages = []
         self._h(name).record(bool(pages), 0.0, time.time() - t0)
         self.stats["stream_reads"] += 1
-        if not pages:
+        dialogs = getattr(src, "last_dialogs", None) or []
+        if hasattr(src, "last_dialogs"):
+            src.last_dialogs = []
+        if not pages and not dialogs:
             return None
         for url, _, anchors in pages:
             if anchors:
                 self.push_links(anchors, 1, base_url=url)
-        return Batch(pages[0][0], "stream", pages, name, time.time() - t0)
+        self.stats["dialogs"] = self.stats.get("dialogs", 0) + len(dialogs)
+        return Batch(pages[0][0] if pages else name, "stream", pages, name, time.time() - t0, dialogs=dialogs)
 
     def random_article(self, lang: str = "ja") -> Batch | None:  # 互換
         return self.collect_stream()
@@ -483,14 +616,17 @@ class Collector:
         return Batch(anchor, "link", pages, "frontier", time.time() - t0)
 
     # ------------------------------------------------------------ フィード / サイト
-    def _list_file(self, name: str) -> list[str]:
+    def _list_lines(self, name: str) -> list[str]:
         out: list[str] = []
         for p in (DATA_DIR / name, self.data_dir / name):
             try:
-                out += [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip().startswith("http")]
+                out += [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")]
             except OSError:
                 pass
         return list(dict.fromkeys(out))
+
+    def _list_file(self, name: str) -> list[str]:
+        return [ln for ln in self._list_lines(name) if ln.startswith("http")]
 
     def collect_feeds(self, min_interval: float = 1800.0, max_items: int = 5) -> Batch | None:
         if self.fetcher is None:

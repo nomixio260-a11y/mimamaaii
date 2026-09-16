@@ -688,5 +688,105 @@ class EvalToolTest(unittest.TestCase):
         self.assertFalse(mod.judge(Reply("何か", 0.8, "recall", [], [], []), unknown)[0])
 
 
+class DialogTest(unittest.TestCase):
+    def test_store_and_quotes(self):
+        from tinyai.dialog import DialogStore, extract_quote_pairs
+        ds = DialogStore(capacity=5)
+        self.assertTrue(ds.add("こんにちは", "こんにちは！今日はどうしましたか", "chat"))
+        self.assertFalse(ds.add("こんにちは", "こんにちは！今日はどうしましたか", "chat"))  # 重複
+        self.assertFalse(ds.add("連絡先は？", "test@example.com です", "chat"))  # 個人情報らしきもの
+        for i in range(10):
+            ds.add(f"質問{i}", f"答え{i}", "hf")
+        self.assertEqual(len(ds), 5)  # 上限
+        ds2 = DialogStore.from_state(ds.state())
+        self.assertEqual(len(ds2), 5)
+        self.assertEqual(extract_quote_pairs("「行くのか」と聞いた。「行くよ」と答えた。"), [("行くのか", "行くよ")])
+
+    def test_hf_row_parsing(self):
+        from tinyai.collector import HuggingFaceDatasets
+        conv = {"conversations": [{"from": "human", "value": "こんにちは"}, {"from": "gpt", "value": "こんにちは！"}, {"from": "human", "value": "元気？"}, {"from": "gpt", "value": "元気です"}]}
+        self.assertEqual(HuggingFaceDatasets._pairs_from_row(conv, "conversations"), [("こんにちは", "こんにちは！"), ("元気？", "元気です")])
+        inst = {"instruction": "首都は？", "input": "日本", "output": "東京"}
+        self.assertEqual(HuggingFaceDatasets._pairs_from_row(inst, "instruction"), [("首都は？\n日本", "東京")])
+
+
+class NeuralTest(unittest.TestCase):
+    def setUp(self):
+        from tinyai import neural
+        if not neural.available():
+            self.skipTest("numpy なし")
+        self.neural = neural
+
+    def test_gradient_check(self):
+        import numpy as np
+        nn = self.neural
+        m = nn.TinyTransformer(vocab_size=11, d=8, heads=2, layers=2, ctx=5, seed=1, dtype=np.float64)
+        rng = np.random.default_rng(0)
+        x = rng.integers(2, 11, size=(2, 5))
+        y = rng.integers(2, 11, size=(2, 5))
+        y[1, 4] = nn.PAD
+        _, g = m.loss_and_grads(x, y)
+        worst = 0.0
+        for k in ["wte", "wpe", "l0.wqkv", "l0.wo", "l0.w1", "l1.w2", "l1.ln1g", "lnfg", "l0.b1"]:
+            flat = m.p[k].reshape(-1)
+            gk = g[k].reshape(-1)
+            for idx in rng.choice(flat.size, size=min(3, flat.size), replace=False):
+                old = flat[idx]
+                eps = 1e-5
+                flat[idx] = old + eps
+                lp, _ = m.loss_and_grads(x, y)
+                flat[idx] = old - eps
+                lm, _ = m.loss_and_grads(x, y)
+                flat[idx] = old
+                num = (lp - lm) / (2 * eps)
+                worst = max(worst, abs(num - gk[idx]) / max(abs(num) + abs(gk[idx]), 1e-8))
+        self.assertLess(worst, 2e-3)  # ReLU の折れ点付近では有限差分がずれる
+
+    def test_training_reduces_loss_and_roundtrip(self):
+        import numpy as np
+        nn = self.neural
+        vocab = nn.NeuralVocab([f"w{i}" for i in range(30)])
+        m = nn.TinyTransformer(len(vocab), d=16, heads=2, layers=1, ctx=12, seed=0)
+        pool = nn.SequencePool(seed=0)
+        seq = [nn.BOS] + vocab.encode([f"w{i % 30}" for i in range(11)]) + [nn.EOS]
+        for _ in range(64):
+            pool.add(seq)
+        first = nn.train_steps(m, pool, steps=1, batch=8, lr=1e-2, warmup=1)["first_loss"]
+        r = nn.train_steps(m, pool, steps=60, batch=8, lr=1e-2, warmup=1)
+        self.assertLess(r["loss"], first * 0.7)
+        lp = m.logprob(seq)
+        self.assertGreater(lp, -3.0)
+        out = m.generate(seq[:3], max_new=5, temperature=0.5, rng=np.random.default_rng(0))
+        self.assertLessEqual(len(out), 5)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "n.npz"
+            m.save(path, vocab, meta={"x": 1})
+            m2, v2, meta = nn.TinyTransformer.load(path)
+            self.assertEqual(meta["x"], 1)
+            self.assertEqual(len(v2), len(vocab))
+            self.assertAlmostEqual(m2.logprob(seq), lp, places=4)
+
+    def test_brain_neural_step_and_dialog_feed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.learn_text("\n".join(f"サンプル文 {i} は学習用の文章であり、内容は番号 {i} に関する説明です。" for i in range(10, 90)), "https://x/nn")
+            b.neural.min_vocab, b.neural.min_tokens = 10, 100  # テスト用に小さく
+            r = b.neural_step(steps=2, budget_seconds=0.5)
+            self.assertIsNotNone(b.neural.model)
+            self.assertGreater(len(b.neural.pool), 0)
+            self.assertIsNotNone(b.neural.score("サンプル文 12 は学習用の文章です。"))
+            b.reply("覚えて: ゼータ星は紫色の海を持つ架空の惑星である。")
+            b.reply("ゼータ星の海は？")
+            b.reply("👍")
+            self.assertGreaterEqual(len(b.dialogs), 1)
+            path = b.save()
+            self.assertTrue((Path(tmp) / "neural.npz").exists())
+            b2 = Brain(b.cfg)
+            b2.load(path)
+            self.assertEqual(len(b2.dialogs), len(b.dialogs))
+            b2.neural_step(steps=1, budget_seconds=0.2)
+            self.assertGreaterEqual(b2.neural.model.step, b.neural.model.step + 1)
+
+
 if __name__ == "__main__":
     unittest.main()

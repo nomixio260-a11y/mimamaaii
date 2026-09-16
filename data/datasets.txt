@@ -1,0 +1,5 @@
+# Hugging Face datasets-server から読む公開データセット (dataset <TAB> config <TAB> split <TAB> 形式)
+# 形式: conversations / instruction / qa / text。ライセンスは各データセットのページを確認すること。
+llm-jp/oasst1-21k-ja	default	train	conversations
+kunishou/databricks-dolly-15k-ja	default	train	instruction
+databricks/databricks-dolly-15k	default	train	instruction

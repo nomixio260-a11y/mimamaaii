@@ -175,6 +175,45 @@ def cmd_evolve(args) -> int:
     return 0
 
 
+def cmd_train(args) -> int:
+    """ニューラル LM を前面で学習する (numpy が必要)。"""
+    cfg = _build_config(args)
+    _setup_logging(cfg, True)
+    brain = _open_brain(cfg)
+    if not brain.neural.available:
+        print("numpy がありません: pip install numpy")
+        return 1
+    # 知識文と会話ペアを学習データに積む
+    n = 0
+    for d in list(brain.kb.docs.values()):
+        brain._neural_pending_text.append(d.text)
+        n += 1
+    brain.neural_step(steps=1, budget_seconds=0.01)  # モデル準備 + 供給
+    for u, b, _, w in brain.dialogs.pairs:
+        brain.neural.add_dialog(u, b, weight=w)
+    print(f"学習データ: 文 {n}, 会話 {len(brain.dialogs)}, プール {len(brain.neural.pool)} 系列, パラメータ {brain.neural.model.n_params():,}")
+    t0 = time.time()
+    done = 0
+    try:
+        while done < args.steps and (args.seconds is None or time.time() - t0 < args.seconds):
+            r = brain.neural.train_some(steps=10)
+            if r is None:
+                print("学習データが足りません")
+                break
+            done += 10
+            if done % 50 == 0:
+                ev = brain.neural.evaluate(brain.lm.perplexity(brain.holdout) if brain.holdout else None)
+                print(f"step {brain.neural.model.step} loss {r['loss']:.3f} {r['tokens_per_s']} tok/s  {ev}")
+    except KeyboardInterrupt:
+        pass
+    brain.neural.evaluate(brain.lm.perplexity(brain.holdout) if brain.holdout else None)
+    brain.neural.save()
+    print(json.dumps(brain.neural.stats(), ensure_ascii=False))
+    for q in ("こんにちは", "機械学習とは？"):
+        print(q, "->", ["".join(w) for w in brain.neural.generate_reply(q, n=2)])
+    return 0
+
+
 def cmd_stats(args) -> int:
     cfg = _build_config(args)
     _setup_logging(cfg, False)
@@ -292,6 +331,11 @@ def main(argv=None) -> int:
     p.add_argument("--cycles", type=int, help="サイクル数で停止")
     p.add_argument("--seconds", type=float, help="秒数で停止")
     p.set_defaults(func=cmd_evolve)
+
+    p = sub.add_parser("train", help="ニューラル LM (Transformer) を前面で学習 (numpy が必要)")
+    p.add_argument("--steps", type=int, default=500)
+    p.add_argument("--seconds", type=float, default=None)
+    p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("stats", help="状態を表示")
     p.set_defaults(func=cmd_stats)

@@ -37,6 +37,7 @@ class Config:
     evolve_interval: float = 20.0      # 秒。1 サイクルごとの休止
     prefetch_workers: int = field(default_factory=lambda: _env_int("TINYAI_WORKERS", 2))  # 先読みスレッド数
     prefetch_depth: int = 4            # 先読みして貯めておくバッチ数
+    neural_seconds_per_cycle: float = 2.0  # 自律ループ 1 サイクルあたりニューラル LM の学習に使う秒数 (numpy がある時)
     evolve_every: int = 3              # 何サイクルごとにパラメータ進化を試すか
     holdout_size: int = 300            # 自己評価用に取り置く文の数
     save_every: int = 5                # 何サイクルごとに保存するか

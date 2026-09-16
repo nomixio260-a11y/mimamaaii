@@ -7,3 +7,5 @@ tinyai.log
 build/
 dist/
 *.egg-info/
+neural.npz
+neural.npz.vocab.json

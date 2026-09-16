@@ -13,6 +13,9 @@ tinyai/
   semantic.py     意味ベクトル (Random Indexing、int16 × 128 次元、SimHash スケッチで近傍探索)
   suffix.py       接尾辞配列 (最長一致の続きの分布; 生成用)
   reranker.py     学習型リランカー (オンライン ロジスティック回帰)
+  dialog.py       会話データの保持 (発話, 応答, 出典, 重み) と「」の応酬の抽出、個人情報らしい文字列の除外
+  neural.py       numpy だけで書いたデコーダ専用 Transformer (順伝播・逆伝播・AdamW・生成・保存)。勾配は有限差分で検査済み
+  neural_lm.py    Brain との接続: 語彙 (十分なデータが溜まってから固定)、再生バッファ、少しずつの学習、ppl による使用判定
   brain_types.py  質問タイプの判定とタイプ別リランク
   evolution.py    進化するパラメータ (Params) と自己評価・変異・採用の判定
   brain.py        中核: 学習パイプライン、会話パイプライン、関心・通知、整理、メモリ制御、保存
@@ -51,7 +54,9 @@ docs/
 整理時 (2,000 文)、応答の合間 (8 文、スケッチ更新なし) に意味ベクトルへ取り込む。接尾辞配列は文書が 10% 増えるごとに再構築
 (5 万トークンで 0.1 秒)。会話の即時応答経路はこれらを待たない。
 
-段階ごとの所要時間は `Brain.timers` に累積され `/stats` の `timers_ms` で見える (analyze / facts+quality / kb / lm / semantic)。
+段階ごとの所要時間は `Brain.timers` に累積され `/stats` の `timers_ms` で見える (analyze / facts+quality / kb / lm / semantic / neural)。
+ニューラル LM の学習データは、取り込んだ文の 1/3 (品質 0.7 以上は全部) と会話ペアを再生バッファ (2 万系列) に積み、
+`Brain.neural_step` (自律ループ各サイクル 2 秒、`train` コマンドでは連続) で AdamW 更新する。
 909 文の内訳の例: analyze 22ms, facts+quality 9ms, kb 48ms, lm 63ms。
 
 不変条件:
@@ -68,7 +73,8 @@ docs/
      ─ facts.answer  (XのYは? / Xとは? / Xはいつ? / AのBのCは?) → 多出典投票で最有力を即答、食い違いは併記 (fact)
      ─ 未知ガード: 主語を知らない / 属性を含む文が無い → 確信度を抑え「まだ知りません」と正直に答える
      ─ kb.search (+ 低確信なら PMI 関連語で拡張) → 質問タイプ別リランク + 意味類似 + 学習型リランカー → recall / guess
-     ─ generate: 接尾辞配列の最長一致分布 × suffix_weight + n-gram/キャッシュ LM の補間、候補 4 本から最良 (generate)
+     ─ generate: 接尾辞配列の最長一致分布 × suffix_weight + n-gram/キャッシュ LM の補間、候補 4 本 (+ ニューラル LM が使える段階なら 2 本) から
+                 LM スコア + 知識の語 + 質問の句 + ニューラル LM の対数尤度 で最良 (generate)
      ─ 裏で調べ終えた話題 (notices) を一言添える
      ─ 確信が低い話題は調査キューへ → on_gap → 収集を即起動
 ```
@@ -78,7 +84,8 @@ docs/
 ```
 Collector (先読みワーカー × N, 既定 2)
    話題ソース (言語ごと): wikimedia / wikipedia / wiktionary / wikidata / wikinews / wikibooks / duckduckgo を健全性 × 重み の順に
-   供給源 (話題に依らない): random (Wikipedia ランダム記事) / aozora (青空文庫) / gutenberg を健全性 × 重み で抽選
+   供給源 (話題に依らない): random (Wikipedia ランダム記事) / aozora (青空文庫) / gutenberg / hfdatasets (公開対話・指示データ) / stackexchange を健全性 × 重み で抽選
+   供給源の Batch には dialogs [(発話, 応答)] が付き、Brain.learn_batch が会話ストアとニューラル LM の再生バッファに入れる
    ワーカー 0: 話題検索 / 5 回に 1 回フィード / 4 回に 1 回供給源
    ワーカー 1: フロンティア (アンカー文字列の関心 + 新規性 − 深さ) 優先
    Collector.register(Source) で独自ソースを追加できる

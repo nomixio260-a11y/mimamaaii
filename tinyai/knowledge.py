@@ -21,7 +21,7 @@ import time
 from collections import Counter, OrderedDict
 from typing import Iterable
 
-from .tokenizer import is_phrase, term_weight, terms
+from .tokenizer import analyze, is_phrase, term_weight, terms
 
 DOC_BASE_COST = 200
 TF_BITS = 8
@@ -118,7 +118,7 @@ class KnowledgeBase:
             return None
         return hash(tuple(items))
 
-    def add(self, text: str, source: str = "", tf: Counter | None = None, quality: float = 0.5) -> Doc | None:
+    def add(self, text: str, source: str = "", tf: Counter | None = None, quality: float = 0.5, content_key: int | None = None) -> Doc | None:
         text = text.strip()
         if len(text) < 4 or len(text) > 600:
             return None
@@ -129,7 +129,7 @@ class KnowledgeBase:
             tf = Counter(terms(text))
         if not tf:
             return None
-        ck = self._content_key(tf)
+        ck = content_key if content_key is not None else self._content_key(tf)
         self.last_dup_id = None
         if ck is not None:
             orig = self.content_keys.get(ck)
@@ -189,9 +189,9 @@ class KnowledgeBase:
         self.hashes.discard(self._hash(doc.text))
         self.total_len -= doc.length
         tf = Counter(terms(doc.text))
-        ck = self._content_key(tf)
-        if ck is not None and self.content_keys.get(ck) == doc_id:
-            del self.content_keys[ck]
+        for ck in (self._content_key(tf), analyze(doc.text).content_key):
+            if ck is not None and self.content_keys.get(ck) == doc_id:
+                del self.content_keys[ck]
         extra = self.assoc.pop(doc_id, ())
         for t in list(tf) + list(extra):
             self._post_remove(t, doc_id)

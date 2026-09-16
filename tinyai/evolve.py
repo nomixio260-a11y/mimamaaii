@@ -136,6 +136,7 @@ class Evolver(threading.Thread):
         if len(self._recent_gain) > 50:
             del self._recent_gain[:25]
         brain.background_step(budget_docs=400)  # 意味ベクトル・接尾辞配列 (後回しの学習)
+        brain.neural_step(steps=4, budget_seconds=cfg.neural_seconds_per_cycle)  # ニューラル LM の継続学習
         evolved = None
         if self.cycles % cfg.evolve_every == 0 and len(brain.kb) >= 20:
             evolved = brain.evolve_step()

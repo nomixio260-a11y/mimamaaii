@@ -35,8 +35,10 @@ from .brain_types import question_type, _rerank_bonus  # noqa: F401
 from .evolution import Evolution, Params
 from .facts import FactStore, attr_synonyms, extract_facts, parse_question
 from .knowledge import KnowledgeBase, Doc
+from .dialog import DialogStore
 from .lm import NGramLM, CacheLM, EOS
 from .memory import MemoryGuard, MB
+from .neural_lm import NeuralLM
 from .reranker import Reranker
 from .semantic import SemanticSpace
 from .suffix import SuffixIndex
@@ -127,11 +129,15 @@ class Brain:
         self._suffix_dirty = 0                    # 前回構築以降に増えた文書数
         self.cache_lm = CacheLM()                 # 会話キャッシュ LM
         self.reranker = Reranker()                # 👍/👎 から学ぶリランカー
+        self.dialogs = DialogStore()              # 会話データ (自分の会話 + 公開データ)
+        self.neural = NeuralLM(self.cfg.data_dir, seed=self.cfg.seed or 0)  # numpy があれば本物の Transformer LM
+        self._neural_pending_text: deque = deque(maxlen=5000)
         self._last_features: dict[int, dict] = {}  # 直前の候補 doc_id -> 特徴量 (学習用)
         self.timers: Counter = Counter()          # 段階ごとの累積秒 (コスト計測)
         self._docvec_cache: dict[int, tuple[int, list[float] | None]] = {}  # doc_id -> (世代, ベクトル)
         self._last_cover: dict[int, float] = {}
         self._guard_note: tuple[str, str, str] | None = None  # (種類, 主語, 属性) 直前の質問で「知らない」と判定した内容
+        self._last_pair: tuple[str, str] | None = None
         self.params = Params(use_order=min(3, self.cfg.max_order))
         self._apply_params()
         self.evolution = Evolution(self)          # 世代・適応度・変異幅はここが持つ
@@ -243,7 +249,7 @@ class Brain:
                 self.stats["skipped_low_quality"] += 1
                 continue
             t0 = perf()
-            doc = kb.add(s, source, tf=Counter(info.terms), quality=q)
+            doc = kb.add(s, source, tf=Counter(info.terms), quality=q, content_key=info.content_key)
             timers["kb"] += perf() - t0
             if doc is None:
                 dup = kb.last_dup_id
@@ -265,6 +271,8 @@ class Brain:
                 timers["lm"] += perf() - t0
             self._semantic_queue.append((doc.id, info.phrases))
             self._suffix_dirty += 1
+            if self.neural.available and (added % 3 == 0 or q >= 0.7):
+                self._neural_pending_text.append(s)
             if added % 500 == 0:
                 self._maybe_enforce()
         return added
@@ -298,6 +306,39 @@ class Brain:
             self.stats["semantic_docs"] += n
             return {"semantic_docs": n, "sketches": sk, "suffix_rebuilt": rebuilt}
 
+    def neural_step(self, steps: int = 4, budget_seconds: float = 1.0) -> dict | None:
+        """空き時間に呼ぶ: ニューラル LM の準備・データ供給・数ステップの学習。"""
+        nl = self.neural
+        if not nl.available:
+            return None
+        with self.lock:
+            if nl.model is None and not nl.ensure_model(dict((self.lm.words[t], c) for t, c in self.lm.ctx[0].items() if t >= 3)):
+                return None
+            while self._neural_pending_text:
+                nl.add_text(self._neural_pending_text.popleft())
+            if len(nl.pool) < 64 and len(self.kb) > 0:
+                # 再起動直後など: 知識文と会話ペアから学習データを積み直す
+                for d in self.kb.random_docs(min(1000, len(self.kb)), self.rng):
+                    nl.add_text(d.text)
+                for u, b, _, w in list(self.dialogs.pairs)[-2000:]:
+                    nl.add_dialog(u, b, weight=w)
+        t0 = time.perf_counter()
+        r = None
+        while time.perf_counter() - t0 < budget_seconds:
+            r = nl.train_some(steps=steps)
+            if r is None:
+                break
+        if r:
+            self.stats["neural_steps"] += r["steps"]
+            self.timers["neural"] += time.perf_counter() - t0
+            if nl.model.step % 200 < steps:
+                ngram = self.lm.perplexity(self.holdout) if self.holdout else None
+                nl.evaluate(ngram)
+                log.info("ニューラル LM: step=%d loss=%.3f %s", nl.model.step, r["loss"], nl.stats())
+            if time.time() - nl._last_save > 300:
+                nl.save()
+        return r
+
     def rebuild_suffix(self) -> None:
         """知識文全体から接尾辞配列を作り直す (数万文で 0.1 秒程度)。"""
         seqs = []
@@ -327,6 +368,14 @@ class Brain:
             if n and (best is None or n > best[0]):
                 best = (n, src, text)
             log.info("学習 [%s] %s <- %s (%d 文)", batch.kind, batch.topic, src, n)
+        if getattr(batch, "dialogs", None):
+            with self.lock:
+                n_d = 0
+                for q, a in batch.dialogs:
+                    if self.dialogs.add(q, a, source=batch.source or "web"):
+                        n_d += 1
+                        self.neural.add_dialog(q, a)
+                self.stats["dialogs_collected"] += n_d
         with self.lock:
             if batch.kind == "topic":
                 self.explored[batch.topic] = time.time()
@@ -567,6 +616,10 @@ class Brain:
             self._said.extend(reply.doc_ids)
             self.last_mode = reply.mode
             self.cache_lm.push(self.lm.ids(tokenize(reply.text))[:60])
+            if reply.mode in ("fact", "recall", "summary") and reply.confidence >= 0.6:
+                if self.dialogs.add(text, reply.text, source="chat"):
+                    self.neural.add_dialog(text, reply.text)
+            self._last_pair = (text, reply.text)
             self.last_question = text
             if topics:
                 self.last_topics = topics[:2]
@@ -948,17 +1001,29 @@ class Brain:
         return avg / 3.0 + 1.5 * overlap + 1.0 * qhit + ends - 2.0 * rep_pen
 
     def generate(self, seed_tokens: list[str], focus: set[str] | None = None, query: str = "", n_candidates: int = 4, max_len: int = 36) -> str:
-        """候補を複数生成して最良を返す (self-consistency)。"""
+        """候補を複数生成して最良を返す (self-consistency)。ニューラル LM が使える段階なら候補にも採点にも加える。"""
         lm = self.lm
         seed_ids = lm.ids(seed_tokens)
         focus_ids = {lm.vocab[t] for t in (focus or ()) if t in lm.vocab}
         qphr = set(phrases(query)) if query else set()
-        best, best_s = None, -1e9
+        cands: list[list[int]] = []
         for _ in range(max(1, n_candidates)):
             ids = self._sample_sentence(seed_ids, focus_ids, max_len=max_len)
-            if len(ids) <= len(seed_ids):
-                continue
+            if len(ids) > len(seed_ids):
+                cands.append(ids)
+        if self.neural.ready:
+            for _ in range(2):
+                words = self.neural.continue_text(seed_tokens, max_new=max_len)
+                if words:
+                    cands.append(seed_ids + lm.ids(words))
+                    self.stats["neural_candidates"] += 1
+        best, best_s = None, -1e9
+        for ids in cands:
             sc = self._score_candidate(ids, qphr, focus_ids)
+            if self.neural.model is not None:
+                nlp = self.neural.score(detokenize(lm.words[i] for i in ids))
+                if nlp is not None:
+                    sc += 0.3 * (nlp / 3.0)  # ニューラル LM の平均対数尤度 (自然さ)
             if sc > best_s:
                 best, best_s = ids, sc
         if best is None:
@@ -969,6 +1034,10 @@ class Brain:
         low = text.lower()
         if low in ("👍", "good", "いいね", "正解", "そう", "yes", "合ってる", "あってる", "ok", "おk"):
             self._train_reranker(positive=True)
+            if self._last_pair:
+                u, b = self._last_pair
+                self.dialogs.add(u, b, source="chat+", weight=3.0)
+                self.neural.add_dialog(u, b, weight=3.0)
             for d in self.last_docs:
                 self.kb.feedback(d, +1.5)
                 if self.last_question:
@@ -1170,6 +1239,7 @@ class Brain:
                 "interest": self.interest,
                 "semantic": self.semantic.state(),
                 "reranker": self.reranker.state(),
+                "dialogs": self.dialogs.state(),
                 "params": asdict(self.params),
                 "generation": self.generation,
                 "sigma": self.sigma,
@@ -1189,6 +1259,10 @@ class Brain:
                 pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
             os.replace(tmp, path)
             self.stats["saves"] += 1
+            try:
+                self.neural.save()
+            except Exception as e:  # ニューラル LM の保存失敗で本体の保存を止めない
+                log.warning("ニューラル LM 保存失敗: %s", e)
         return path
 
     def load(self, path: str | Path | None = None) -> bool:
@@ -1227,6 +1301,7 @@ class Brain:
             self.interest = state.get("interest", {})
             self.semantic = SemanticSpace.from_state(state["semantic"]) if "semantic" in state else SemanticSpace()
             self.reranker = Reranker.from_state(state.get("reranker", {}))
+            self.dialogs = DialogStore.from_state(state.get("dialogs", []))
             self._semantic_queue = deque(maxlen=50000)
             if not self.semantic.vec:
                 self._semantic_queue.extend(self.kb.docs.keys())
@@ -1267,6 +1342,8 @@ class Brain:
                 "semantic": self.semantic.stats(),
                 "suffix": self.suffix.stats(),
                 "reranker": {"samples": self.reranker.samples, "w": {k: round(v, 2) for k, v in self.reranker.w.items()}},
+                "dialogs": {"pairs": len(self.dialogs), "by_source": self.dialogs.by_source()},
+                "neural": (self.neural.ensure_model({}) and self.neural.stats()) if (self.neural.available and self.neural.model is None and self.neural.path.exists()) else self.neural.stats(),
                 "interest": sorted(self.interest.items(), key=lambda x: -x[1])[:8],
                 "admission": round(self.admission, 2),
                 "memory": self.guard.describe(),
