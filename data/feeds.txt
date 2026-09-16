@@ -1,0 +1,3 @@
+# 自動で読む RSS/Atom フィード (1 行 1 URL)。~/.tinyai/feeds.txt にも追加できる。
+https://ja.wikipedia.org/w/api.php?action=featuredfeed&feed=featured&feedformat=atom
+https://en.wikipedia.org/w/api.php?action=featuredfeed&feed=featured&feedformat=atom

@@ -66,15 +66,17 @@ def _post_has(post, doc_id: int) -> bool:
 
 
 class Doc:
-    __slots__ = ("id", "text", "source", "added", "score", "length")
+    __slots__ = ("id", "text", "source", "added", "score", "length", "quality", "hits")
 
     def __init__(self, id: int, text: str, source: str, added: float, length: int):
         self.id = id
         self.text = text
         self.source = source
         self.added = added
-        self.score = 0.0
+        self.score = 0.0      # フィードバックによる信頼度
         self.length = length
+        self.quality = 0.5    # 文の品質 (0..1): 定義文・数値・固有名詞を含むほど高い
+        self.hits = 0         # 検索で上位に出た回数 (使われる知識は残る)
 
 
 class KnowledgeBase:
@@ -92,13 +94,14 @@ class KnowledgeBase:
         self._est_bytes = 0
         self._cache: OrderedDict = OrderedDict()
         self._version = 0
+        self.on_remove = None  # 文書削除時のフック (事実ストアの同期用)
 
     # ------------------------------------------------------------ 追加/削除
     @staticmethod
     def _hash(text: str) -> str:
         return hashlib.blake2b(text.strip().lower().encode("utf-8"), digest_size=8).hexdigest()
 
-    def add(self, text: str, source: str = "", tf: Counter | None = None) -> Doc | None:
+    def add(self, text: str, source: str = "", tf: Counter | None = None, quality: float = 0.5) -> Doc | None:
         text = text.strip()
         if len(text) < 4 or len(text) > 600 or is_junk(text):
             return None
@@ -110,6 +113,7 @@ class KnowledgeBase:
         if not tf:
             return None
         doc = Doc(self.next_id, text, source[:120], time.time(), sum(tf.values()))
+        doc.quality = quality
         self.next_id += 1
         self.docs[doc.id] = doc
         self.hashes.add(h)
@@ -155,6 +159,8 @@ class KnowledgeBase:
         doc = self.docs.pop(doc_id, None)
         if doc is None:
             return
+        if self.on_remove is not None:
+            self.on_remove(doc_id)
         self.hashes.discard(self._hash(doc.text))
         self.total_len -= doc.length
         tf = Counter(terms(doc.text))
@@ -254,9 +260,12 @@ class KnowledgeBase:
         for doc_id, s in scores.items():
             doc = docs[doc_id]
             c = cover.get(doc_id, 0.0) / total_w
-            ranked.append((s * (0.5 + c) + 0.15 * doc.score, doc))
+            ranked.append((s * (0.5 + c) * (0.85 + 0.3 * doc.quality) + 0.15 * doc.score, doc))
         ranked.sort(key=lambda x: (-x[0], -x[1].added))
-        return ranked[:k]
+        top = ranked[:k]
+        for _, d in top[:2]:
+            d.hits += 1
+        return top
 
     def coverage(self, doc_id: int, query: str) -> float:
         """クエリ語の情報量重み付きカバー率 (0..1)。"""
@@ -321,7 +330,7 @@ class KnowledgeBase:
         def key(d: Doc):
             age = (now - d.added) / 86400.0
             protect = 3.0 if d.source in ("user", "chat", "seed") else 0.0
-            return d.score + protect - age * 0.2
+            return d.score + protect + d.quality + 0.3 * min(d.hits, 10) - age * 0.2
 
         victims = sorted(self.docs.values(), key=key)[:n]
         for d in victims:
@@ -358,6 +367,7 @@ class KnowledgeBase:
             "docs": len(self.docs),
             "terms": len(self.index),
             "assoc": len(self.assoc),
+            "avg_quality": round(sum(d.quality for d in self.docs.values()) / len(self.docs), 3) if self.docs else None,
             "k1": round(self.k1, 3),
             "b": round(self.b, 3),
             "phrase_bonus": round(self.phrase_bonus, 3),

@@ -28,8 +28,10 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass, asdict, replace
 from pathlib import Path
+from typing import Iterable
 
 from .config import Config
+from .facts import FactStore, extract_facts
 from .knowledge import KnowledgeBase, Doc
 from .lm import NGramLM
 from .memory import MemoryGuard, MB
@@ -49,7 +51,10 @@ log = logging.getLogger("tinyai.brain")
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SAVE_NAME = "brain.pkl.gz"
 MAX_TIGHTEN = 6  # 予算を締める回数の上限 (0.8^6 ≈ 26%)
-STRATEGIES = ("gap", "curiosity", "sparse", "seed")
+STRATEGIES = ("gap", "curiosity", "sparse", "seed", "interest")
+_QUALITY_DEF_RE = re.compile(r"とは|である|です|のこと|を指す|is a|is an|is the|refers to|was a|は、")
+_QUALITY_NUM_RE = re.compile(r"\d")
+_QUALITY_PHRASE_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u30a0-\u30ff]{2,}|[A-Za-z][A-Za-z0-9]{2,}")
 
 
 # ---------------------------------------------------------------- 進化するパラメータ
@@ -143,6 +148,24 @@ def _rerank_bonus(qtype: str, doc_text: str, subject: str | None) -> float:
     return min(b, 1.0)
 
 
+def sentence_quality(text: str, has_fact: bool = False) -> float:
+    """文の学習価値 (0..1)。定義文・数値・話題語を含み、長さが適度なものを高く。"""
+    n = len(text)
+    q = 0.3
+    if 20 <= n <= 160:
+        q += 0.2
+    elif n < 12 or n > 300:
+        q -= 0.15
+    if _QUALITY_DEF_RE.search(text):
+        q += 0.15
+    if _QUALITY_NUM_RE.search(text):
+        q += 0.1
+    q += 0.08 * min(len(_QUALITY_PHRASE_RE.findall(text)), 3)
+    if has_fact:
+        q += 0.15
+    return max(0.0, min(1.0, q))
+
+
 def _same_utterance(a: str, b: str) -> bool:
     strip = lambda x: "".join(ch for ch in x.lower() if ch.isalnum())  # noqa: E731
     return strip(a) == strip(b)
@@ -167,6 +190,8 @@ class Brain:
         self.lock = threading.RLock()
         self.lm = NGramLM(max_order=self.cfg.max_order)
         self.kb = KnowledgeBase()
+        self.facts = FactStore()
+        self.kb.on_remove = self.facts.remove_doc
         self.params = Params(use_order=min(3, self.cfg.max_order))
         self._apply_params()
         self.generation = 0
@@ -180,6 +205,10 @@ class Brain:
         self.strategy_stats: dict[str, list] = {s: [0, 0.0] for s in STRATEGIES}  # [試行, 収穫合計]
         self._topic_strategy: dict[str, str] = {}
         self.qa_log: deque = deque(maxlen=200)    # (質問, doc_id, +1/-1)
+        self.interest: dict[str, float] = {}      # 関心プロファイル: 話題語 -> 重み (減衰)
+        self.notices: deque = deque(maxlen=20)    # 会話に反映する「さっき学んだこと」
+        self.on_gap = None                        # 話題が追加された時に呼ぶ (収集を即起動)
+        self.admission = 0.0                      # メモリ逼迫時に上がる取り込み品質しきい値
         self.stats: Counter = Counter()
         self.history: deque = deque(maxlen=20)
         self.last_docs: list[int] = []
@@ -263,15 +292,89 @@ class Brain:
                         self.holdout[self.rng.randrange(len(self.holdout))] = toks
                     continue
             # 知識ベースが受け付けた文 (重複でもジャンクでもない) だけ LM に入れる
-            if kb.add(s, source) is None:
+            facts = extract_facts(s) if len(s) <= 200 else []
+            q = sentence_quality(s, bool(facts))
+            if q < self.admission and not facts and source not in ("user", "chat", "seed"):
+                self.stats["skipped_low_quality"] += 1
+                continue
+            doc = kb.add(s, source, quality=q)
+            if doc is None:
                 continue
             added += 1
+            for subj, rel, obj in facts:
+                if self.facts.add(subj, rel, obj, doc.id):
+                    self.stats["facts_learned"] += 1
             toks = tokenize(s)
             if len(toks) >= 2:
                 lm.learn(toks)
             if added % 500 == 0:
                 self._maybe_enforce()
         return added
+
+    def learn_batch(self, batch, collector=None) -> int:
+        """収集システムの 1 バッチ (複数ページ) を学習し、リンクをフロンティアへ、収穫を報告する。"""
+        total = 0
+        best: tuple[int, str, str] | None = None
+        for src, text, anchors in batch.pages:
+            n = self.learn_text(text, source=src)
+            total += n
+            if collector is not None:
+                collector.report(batch.source or src, n)
+                if anchors:
+                    collector.push_links(anchors, depth=1, base_url=src)
+            if n and (best is None or n > best[0]):
+                best = (n, src, text)
+            log.info("学習 [%s] %s <- %s (%d 文)", batch.kind, batch.topic, src, n)
+        with self.lock:
+            if batch.kind == "topic":
+                self.explored[batch.topic] = time.time()
+                self.stats["topics_explored"] += 1
+                strategy = self._topic_strategy.pop(batch.topic, None)
+                if strategy in self.strategy_stats:
+                    st = self.strategy_stats[strategy]
+                    st[0] += 1
+                    st[1] += min(total, 400) / 100.0
+                if strategy == "gap" and total:
+                    self._add_notice(batch.topic)
+            self.stats["pages_read"] += len(batch.pages)
+        return total
+
+    def _add_notice(self, topic: str) -> None:
+        """調べた話題について、最も関連の高い 1 文を「さっき学んだこと」として貯める。"""
+        hits = self.kb.search(topic, k=1)
+        if hits:
+            self.notices.append((topic, hits[0][1].text, hits[0][1].source))
+
+    def take_notices(self) -> list[tuple[str, str, str]]:
+        with self.lock:
+            out = list(self.notices)
+            self.notices.clear()
+            return out
+
+    # ------------------------------------------------------------ 関心
+    def _bump_interest(self, topics: Iterable[str], weight: float = 1.0) -> None:
+        for t in topics:
+            self.interest[t] = min(5.0, self.interest.get(t, 0.0) * 0.9 + weight)
+        if len(self.interest) > 300:
+            for k in sorted(self.interest, key=self.interest.get)[:100]:
+                del self.interest[k]
+
+    def interest_score(self, text: str) -> float:
+        """収集システム用: アンカー文字列などがどれだけ関心に近いか (-1..1)。"""
+        ks = [k for k in keywords(text, limit=3) if is_phrase(k)] or ([text] if is_phrase(text) else [])
+        if not ks:
+            return -0.5
+        score = 0.0
+        for k in ks:
+            if k in self.gaps:
+                score = max(score, 1.0)
+            if k in self.interest:
+                score = max(score, min(1.0, self.interest[k] / 3.0))
+            if k in self.explored:
+                score -= 0.5
+            elif not self.kb.posting_ids(k):
+                score += 0.2  # 未知の語は少し好奇心
+        return max(-1.0, min(1.0, score))
 
     def learn_file(self, path: str | Path, max_bytes: int = 64 * MB) -> int:
         """ファイルを少しずつ読みながら学習する (一時メモリを抑えるため)。"""
@@ -329,12 +432,17 @@ class Brain:
         if time.time() - self.explored.get(topic, 0) < 86400:
             return
         self.gaps.append(topic)
+        if self.on_gap is not None:
+            try:
+                self.on_gap(topic)
+            except Exception:  # 通知先の失敗で会話を止めない
+                pass
 
     def _pick_strategy(self) -> str:
         """収穫量に基づく UCB1 で探索戦略を選ぶ。"""
         total = sum(st[0] for st in self.strategy_stats.values()) + 1
         best, best_v = "seed", -1.0
-        for name in ("curiosity", "sparse", "seed"):
+        for name in ("interest", "curiosity", "sparse", "seed"):
             tries, gain = self.strategy_stats[name]
             if tries == 0:
                 return name
@@ -343,16 +451,35 @@ class Brain:
                 best, best_v = name, v
         return best
 
+    def _good_topic(self, t: str) -> bool:
+        """探索する価値のある話題語か。英語の一般語 (things, lovers) を避ける。"""
+        if not is_phrase(t):
+            return False
+        if t.isascii():
+            return len(t) >= 4 and not t.isdigit() and len(self.kb.posting_ids(t)) >= 2
+        return len(t) >= 2
+
     def _candidates(self, strategy: str, now: float) -> list[str]:
+        if strategy == "interest":
+            # 会話の関心に近い語のうち、まだ調べていないもの
+            cands = [t for t, w in sorted(self.interest.items(), key=lambda x: -x[1]) if now - self.explored.get(t, 0) > 86400 * 3]
+            out = []
+            for t in cands[:5]:
+                for u, _ in self.kb.related_terms(t, k=3):
+                    if now - self.explored.get(u, 0) > 86400 * 3:
+                        out.append(u)
+                if not self.kb.posting_ids(t):
+                    out.append(t)
+            return out[:10]
         if strategy == "curiosity":
             out = []
             for d in self.kb.random_docs(5, self.rng):
                 for k in keywords(d.text, limit=3):
-                    if is_phrase(k) and now - self.explored.get(k, 0) > 86400 * 3:
+                    if self._good_topic(k) and now - self.explored.get(k, 0) > 86400 * 3:
                         out.append(k)
             return out
         if strategy == "sparse":
-            return [t for t in self.kb.sparse_terms(10, self.rng, min_len=3) if now - self.explored.get(t, 0) > 86400 * 3]
+            return [t for t in self.kb.sparse_terms(10, self.rng, min_len=3) if self._good_topic(t) and now - self.explored.get(t, 0) > 86400 * 3]
         cands = [t for t in self.seed_topics if now - self.explored.get(t, 0) > 86400 * 7]
         return [self.rng.choice(cands)] if cands else (list(self.seed_topics) if self.seed_topics else [])
 
@@ -374,7 +501,7 @@ class Brain:
                     return t
                 tried.append(strategy)
                 self.strategy_stats[strategy][0] += 1  # 候補なし = 収穫ゼロの試行
-                rest = [s for s in ("curiosity", "sparse", "seed") if s not in tried]
+                rest = [s for s in ("interest", "curiosity", "sparse", "seed") if s not in tried]
                 if not rest:
                     break
                 strategy = rest[0]
@@ -403,15 +530,19 @@ class Brain:
 
             # 文脈: 話題語が無い発話は前の話題を引き継ぐ
             topics = [k for k in keywords(text, limit=3) if is_phrase(k)]
+            self._bump_interest(topics)
             query = text
             if not topics and self.last_topics and (question or _FOLLOWUP_RE.match(text.lower())):
                 query = text + " " + " ".join(self.last_topics)
                 topics = list(self.last_topics)
             qtype = question_type(text)
-            hits = self._search(query, exclude_id=new_doc.id if new_doc else None, qtype=qtype, subject=topics[0] if topics else None)
-            reply = self._compose(text, hits, topics, ja, question, qtype)
+            reply = self._answer_from_facts(text, ja)
+            if reply is None:
+                hits = self._search(query, exclude_id=new_doc.id if new_doc else None, qtype=qtype, subject=topics[0] if topics else None)
+                reply = self._compose(text, hits, topics, ja, question, qtype)
+            reply = self._attach_notices(reply, topics, ja)
             for t in topics:
-                if reply.confidence < 0.7:
+                if reply.confidence < 0.7 and (not t.isascii() or len(t) >= 4):
                     self.add_gap(t)
             reply.learned_topics = [t for t in topics if t in self.gaps]
             self.last_docs = reply.doc_ids
@@ -422,6 +553,38 @@ class Brain:
             self.history.append(("ai", reply.text))
             self._maybe_enforce()
             return reply
+
+    def _answer_from_facts(self, text: str, ja: bool) -> Reply | None:
+        """抽出済みの事実で直接答えられる質問 (XのYは? / Xとは?) なら即答。"""
+        try:
+            ans = self.facts.answer(text)
+        except Exception:
+            return None
+        if ans is None:
+            return None
+        sentence, doc_id = ans
+        doc = self.kb.docs.get(doc_id)
+        if doc is None:
+            return None
+        self.stats["fact_answers"] += 1
+        return Reply(sentence, 0.9, "fact", [doc.source], [doc.id], [])
+
+    def _attach_notices(self, reply: Reply, topics: list[str], ja: bool) -> Reply:
+        """裏で調べ終えた話題があれば、次の返答に一言添える (人が「さっき調べたんだけど」と言うように)。"""
+        if not self.notices:
+            return reply
+        related = [n for n in self.notices if any(t in n[0] or n[0] in t for t in topics)]
+        picked = related[0] if related else (self.notices[0] if reply.mode in ("generate", "guess") else None)
+        if picked is None:
+            return reply
+        self.notices.remove(picked)
+        topic, sentence, _ = picked
+        note = f"（さっき「{topic}」を調べました: {sentence}）" if ja else f"(I just looked into '{topic}': {sentence})"
+        if reply.mode in ("generate", "guess") and related:
+            return Reply(sentence, 0.6, "recall", [picked[2]], reply.doc_ids, reply.learned_topics)
+        reply.text = f"{reply.text} {note}"
+        self.stats["notices_delivered"] += 1
+        return reply
 
     def _search(self, text: str, exclude_id: int | None = None, k: int = 5, qtype: str = "none", subject: str | None = None):
         p = self.params
@@ -571,9 +734,13 @@ class Brain:
         n = 0
         first = None
         for s in split_sentences(body) or [body]:
-            d = self.kb.add(s, "user")
+            facts = extract_facts(s)
+            d = self.kb.add(s, "user", quality=sentence_quality(s, bool(facts)))
             if d:
                 d.score = 3.0
+                for subj, rel, obj in facts:
+                    if self.facts.add(subj, rel, obj, d.id):
+                        self.stats["facts_learned"] += 1
                 self.lm.learn(tokenize(s))
                 n += 1
                 first = first or d
@@ -649,6 +816,47 @@ class Brain:
             log.info("進化 gen=%d accepted=%s %s -> %s", self.generation, accepted, base, new)
             return rec
 
+    # ------------------------------------------------------------ 整理 (人の睡眠中の記憶整理に相当)
+    def consolidate(self) -> dict:
+        """重複に近い知識の統合、使われない知識の減衰、関心の減衰、LM の軽い剪定。"""
+        with self.lock:
+            merged = 0
+            # 同じ主語の事実が複数の文書から来ている時、古い方の文書を統合対象にする
+            seen: dict[tuple[str, str], int] = {}
+            victims: set[int] = set()
+            for key, lst in list(self.facts.by_subject.items()):
+                for rel, obj, doc_id in lst:
+                    k = (key, rel)
+                    prev = seen.get(k)
+                    if prev is None:
+                        seen[k] = doc_id
+                        continue
+                    a, b = self.kb.docs.get(prev), self.kb.docs.get(doc_id)
+                    if a is None or b is None:
+                        continue
+                    # 内容がほぼ同じ (語の Jaccard ≥ 0.7) なら品質の低い方を消す
+                    ta, tb = set(terms(a.text)), set(terms(b.text))
+                    if ta and tb and len(ta & tb) / len(ta | tb) >= 0.7:
+                        loser = a if (a.quality + a.score, a.hits) < (b.quality + b.score, b.hits) else b
+                        if loser.source not in ("user", "seed"):
+                            victims.add(loser.id)
+            for doc_id in victims:
+                self.kb.remove(doc_id)
+                merged += 1
+            # 使われない知識は少しずつ信頼度が下がり、関心も減衰する
+            for d in self.kb.docs.values():
+                if d.hits == 0 and d.score > -3.0 and d.source not in ("user", "seed"):
+                    d.score -= 0.05
+            for k in list(self.interest):
+                self.interest[k] *= 0.8
+                if self.interest[k] < 0.05:
+                    del self.interest[k]
+            pruned = self.lm.prune(min_count=2) if self.lm.estimated_bytes() > self.guard.budget * 0.4 else 0
+            self.stats["consolidations"] += 1
+            self.stats["merged_docs"] += merged
+            log.info("整理: 統合 %d 文, LM 剪定 %d", merged, pruned)
+            return {"merged": merged, "pruned_lm": pruned}
+
     # ------------------------------------------------------------ メモリ
     def _maybe_enforce(self) -> None:
         self._enforce_counter += 1
@@ -677,6 +885,9 @@ class Brain:
             if removed_lm or removed_kb:
                 self.stats["pruned_lm"] += removed_lm
                 self.stats["pruned_kb"] += removed_kb
+            # メモリが埋まってきたら、質の低い文は最初から取り込まない (選択的学習)
+            fill = (self.lm.estimated_bytes() + self.kb.estimated_bytes()) / max(budget, 1)
+            self.admission = 0.0 if fill < 0.6 else min(0.6, (fill - 0.6) * 1.5)
             return {"removed_lm": removed_lm, "removed_kb": removed_kb, "rss_mb": round(self.guard.usage() / MB, 1)}
 
     # ------------------------------------------------------------ 保存/読込
@@ -687,7 +898,9 @@ class Brain:
             state = {
                 "version": 2,
                 "lm": self.lm.state(),
-                "kb": {"docs": [(d.id, d.text, d.source, d.added, d.score) for d in self.kb.docs.values()], "next_id": self.kb.next_id, "assoc": self.kb.assoc},
+                "kb": {"docs": [(d.id, d.text, d.source, d.added, d.score, d.quality, d.hits) for d in self.kb.docs.values()], "next_id": self.kb.next_id, "assoc": self.kb.assoc},
+                "facts": self.facts.state(),
+                "interest": self.interest,
                 "params": asdict(self.params),
                 "generation": self.generation,
                 "sigma": self.sigma,
@@ -722,11 +935,22 @@ class Brain:
             self.lm = NGramLM.from_state(state["lm"])
             self.kb = KnowledgeBase()
             id_map: dict[int, int] = {}
-            for id_, text, source, added, score in state["kb"]["docs"]:
+            for row in state["kb"]["docs"]:
+                id_, text, source, added, score = row[:5]
                 d = self.kb.add(text, source)
                 if d:
                     d.added, d.score = added, score
+                    if len(row) >= 7:
+                        d.quality, d.hits = row[5], row[6]
                     id_map[id_] = d.id
+            self.facts = FactStore()
+            for key, lst in state.get("facts", {}).get("by_subject", {}).items():
+                for rel, obj, old_id in lst:
+                    new_id = id_map.get(old_id)
+                    if new_id is not None:
+                        self.facts.add(key, rel, obj, new_id)
+            self.kb.on_remove = self.facts.remove_doc
+            self.interest = state.get("interest", {})
             for old_id, extra in state["kb"].get("assoc", {}).items():
                 new_id = id_map.get(old_id)
                 if new_id is not None:
@@ -759,6 +983,9 @@ class Brain:
                 "params": asdict(self.params),
                 "lm": self.lm.stats(),
                 "kb": self.kb.stats(),
+                "facts": self.facts.stats(),
+                "interest": sorted(self.interest.items(), key=lambda x: -x[1])[:8],
+                "admission": round(self.admission, 2),
                 "memory": self.guard.describe(),
                 "holdout": len(self.holdout),
                 "gaps": list(self.gaps)[:10],

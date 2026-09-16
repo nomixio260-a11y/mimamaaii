@@ -58,7 +58,7 @@ def cmd_chat(args) -> int:
         evolver = Evolver(brain)
         evolver.start()
     print(f"tinyai v{__version__}  gen={brain.generation}  docs={len(brain.kb)}  mem={brain.guard.describe()['rss_mb']}MB")
-    print("終了: /quit  状態: /stats  保存: /save  教える: 覚えて: <文>  調べさせる: 調べて: <話題>  評価: 👍 / 👎")
+    print("終了: /quit  状態: /stats  保存: /save  新着学習: /news  教える: 覚えて: <文>  調べさせる: 調べて: <話題>  評価: 👍 / 👎")
     try:
         while True:
             try:
@@ -77,11 +77,17 @@ def cmd_chat(args) -> int:
             if line == "/save":
                 print("保存:", brain.save())
                 continue
+            if line == "/news":
+                for topic, sentence, src in brain.take_notices():
+                    print(f"[学習] {topic}: {sentence}  ({src})")
+                continue
             if line == "/evolve":
                 print(json.dumps(brain.evolve_step(), ensure_ascii=False))
                 continue
             r = brain.reply(line)
             print(f"AI> {r.text}")
+            if evolver and brain.notices and args.verbose:
+                print(f"   [裏で {len(brain.notices)} 件の新しい学習があります: /news で表示]")
             if args.verbose:
                 extra = f"   [{r.mode} conf={r.confidence}"
                 if r.sources:
@@ -195,6 +201,8 @@ def cmd_serve(args) -> int:
                 q = parse_qs(u.query).get("q", [""])[0]
                 r = brain.reply(q) if q else None
                 self._send(200, r.__dict__ if r else {"error": "q required"})
+            elif u.path == "/notices":
+                self._send(200, {"notices": brain.take_notices()})
             else:
                 self._send(404, {"error": "not found"})
 

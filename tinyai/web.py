@@ -39,10 +39,13 @@ class _TextExtractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.links: list[str] = []
+        self.anchors: list[tuple[str, str]] = []  # (href, アンカー文字列)
         self.title = ""
         self._skip = 0
         self._skip_stack: list[str] = []
         self._in_title = False
+        self._href: str | None = None
+        self._anchor: list[str] = []
 
     def handle_starttag(self, tag, attrs):
         if tag in _SKIP_TAGS:
@@ -54,6 +57,8 @@ class _TextExtractor(HTMLParser):
             for k, v in attrs:
                 if k == "href" and v:
                     self.links.append(v)
+                    self._href = v
+                    self._anchor = []
         if tag in ("div", "table", "span", "ul", "ol", "section", "aside", "p") and not self._skip:
             for k, v in attrs:
                 if k in ("class", "role", "id") and v and (_SKIP_CLASS_RE.search(v) or v == "note"):
@@ -69,31 +74,85 @@ class _TextExtractor(HTMLParser):
             self._skip -= 1
         elif tag == "title":
             self._in_title = False
+        if tag == "a" and self._href is not None:
+            text = "".join(self._anchor).strip()
+            if text and not self._skip:
+                self.anchors.append((self._href, text[:80]))
+            self._href = None
         if tag in _BLOCK_TAGS:
             self.parts.append("\n")
 
     def handle_data(self, data):
         if self._in_title:
             self.title += data
+        if self._href is not None:
+            self._anchor.append(data)
         if not self._skip:
             self.parts.append(data)
 
 
-def html_to_text(html: str) -> tuple[str, list[str], str]:
-    """(本文, リンク一覧, タイトル) を返す。"""
+class Page:
+    __slots__ = ("url", "text", "links", "anchors", "title")
+
+    def __init__(self, url: str, text: str, links: list[str], anchors: list[tuple[str, str]], title: str):
+        self.url, self.text, self.links, self.anchors, self.title = url, text, links, anchors, title
+
+
+def parse_html(html: str, url: str = "") -> Page:
     p = _TextExtractor()
     try:
         p.feed(html)
         p.close()
     except Exception:  # 壊れた HTML でも部分結果を返す
         pass
-    text = "".join(p.parts)
+    text = _clean_text("".join(p.parts))
+    return Page(url, text, p.links, p.anchors, p.title.strip())
+
+
+def html_to_text(html: str) -> tuple[str, list[str], str]:
+    """(本文, リンク一覧, タイトル) を返す。"""
+    page = parse_html(html)
+    return page.text, page.links, page.title
+
+
+def _clean_text(text: str) -> str:
     text = re.sub(r"[ \t　]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n", text)
     lines = [ln.strip() for ln in text.split("\n")]
     # 短すぎる行 (メニュー等) は捨てる
     lines = [ln for ln in lines if len(ln) >= 20 or ln.endswith(("。", ".", "!", "?", "！", "？"))]
-    return "\n".join(lines), p.links, p.title.strip()
+    return "\n".join(lines)
+
+
+_FEED_TAG_RE = re.compile(r"\{[^}]*\}")
+
+
+def parse_feed(xml_text: str) -> list[tuple[str, str, str]]:
+    """RSS 2.0 / Atom を [(title, link, summary_text)] に。壊れていれば空。"""
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    items = []
+    for el in root.iter():
+        tag = _FEED_TAG_RE.sub("", el.tag).lower()
+        if tag not in ("item", "entry"):
+            continue
+        title = link = summary = ""
+        for ch in el:
+            t = _FEED_TAG_RE.sub("", ch.tag).lower()
+            if t == "title":
+                title = (ch.text or "").strip()
+            elif t == "link":
+                link = (ch.get("href") or ch.text or "").strip()
+            elif t in ("description", "summary", "content", "encoded"):
+                raw = ch.text or ""
+                summary = html_to_text(raw)[0] if "<" in raw else raw.strip()
+        if title or summary:
+            items.append((title, link, summary))
+    return items
 
 
 class Fetcher:
@@ -215,6 +274,18 @@ class Fetcher:
         html = data.decode("utf-8", "replace")
         return html_to_text(html)
 
+    def get_page(self, url: str) -> Page | None:
+        data = self.get(url)
+        if data is None:
+            return None
+        return parse_html(data.decode("utf-8", "replace"), url)
+
+    def get_feed(self, url: str) -> list[tuple[str, str, str]]:
+        data = self.get(url)
+        if data is None:
+            return []
+        return parse_feed(data.decode("utf-8", "replace"))
+
     # ------------------------------------------------------------ 検索
     def wikipedia_search(self, query: str, lang: str = "ja", limit: int = 3) -> list[str]:
         q = urllib.parse.quote(query)
@@ -249,15 +320,27 @@ class Fetcher:
             return []
         return [p["key"] for p in js.get("pages", []) if p.get("key")]
 
-    def wikimedia_page_text(self, key: str, lang: str = "ja") -> str:
+    def wikimedia_page(self, key: str, lang: str = "ja") -> Page | None:
+        """Wikimedia Core API から記事本文 (Parsoid HTML) を取り、本文と記事内リンクを返す。"""
         k = urllib.parse.quote(key)
-        data = self.get(f"https://api.wikimedia.org/core/v1/wikipedia/{lang}/page/{k}/html")
+        url = f"https://api.wikimedia.org/core/v1/wikipedia/{lang}/page/{k}/html"
+        data = self.get(url)
         if not data:
-            return ""
-        text, _, _ = html_to_text(data.decode("utf-8", "replace"))
-        # 出典番号 [1] や編集リンクを除く
-        text = re.sub(r"\[\d+\]|\[編集\]|\[edit\]", "", text)
-        return text
+            return None
+        page = parse_html(data.decode("utf-8", "replace"), f"https://{lang}.wikipedia.org/wiki/{k}")
+        page.text = re.sub(r"\[\d+\]|\[編集\]|\[edit\]", "", page.text)
+        # 記事内リンク (./記事名) を wiki: 形式に正規化。ファイル/カテゴリ等は除く
+        anchors = []
+        for href, text in page.anchors:
+            if href.startswith("./") and ":" not in href and "#" not in href:
+                anchors.append((f"wiki:{lang}:{urllib.parse.unquote(href[2:])}", text))
+        page.anchors = anchors
+        page.links = [a for a, _ in anchors]
+        return page
+
+    def wikimedia_page_text(self, key: str, lang: str = "ja") -> str:
+        page = self.wikimedia_page(key, lang)
+        return page.text if page else ""
 
     def crawl_site(self, start_url: str, max_pages: int = 3, seen: set | None = None) -> list[tuple[str, str]]:
         """同一ドメイン内でリンクをたどり、最大 max_pages ページの本文を返す。"""

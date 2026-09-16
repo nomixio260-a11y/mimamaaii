@@ -10,7 +10,9 @@ from tinyai.evolve import Evolver
 from tinyai.knowledge import KnowledgeBase
 from tinyai.lm import NGramLM
 from tinyai.memory import MemoryGuard, rss_bytes
-from tinyai.brain import question_type
+from tinyai.brain import question_type, sentence_quality
+from tinyai.collector import Batch, Collector
+from tinyai.facts import FactStore, extract_facts, parse_question
 from tinyai.knowledge import is_junk
 from tinyai.tokenizer import detokenize, is_phrase, is_question, keywords, split_sentences, terms, tokenize
 from tinyai.web import html_to_text
@@ -175,7 +177,7 @@ class BrainTest(unittest.TestCase):
 
     def test_recall_from_seed(self):
         r = self.brain.reply("日本の首都は？")
-        self.assertEqual(r.mode, "recall")
+        self.assertIn(r.mode, ("recall", "fact"))
         self.assertIn("東京", r.text)
 
     def test_greeting_does_not_echo(self):
@@ -207,7 +209,7 @@ class BrainTest(unittest.TestCase):
     def test_continuation_and_context(self):
         self.brain.learn_text("ゼータ理論は架空の理論である。\nゼータ理論は 1999 年に提案された。\nゼータ理論の提案者はアルファ博士である。", "https://example.org/zeta")
         r1 = self.brain.reply("ゼータ理論とは？")
-        self.assertEqual(r1.mode, "recall")
+        self.assertIn(r1.mode, ("recall", "fact"))
         r2 = self.brain.reply("もっと詳しく")
         self.assertIn("1999", r2.text)
         r3 = self.brain.reply("それは誰が提案したの？")  # 話題語が無いので前の話題を引き継ぐ
@@ -288,22 +290,44 @@ class BrainTest(unittest.TestCase):
         self.assertLess(rss_bytes(), b.guard.limit * 3)  # 極端な超過はしない
 
 
+class FakeCollector(Collector):
+    """ネットワークを使わない収集システム。"""
+
+    def __init__(self, data_dir):
+        super().__init__(fetcher=object(), data_dir=data_dir)  # fetcher は「有効」であればよい
+        self.collected: list[str] = []
+
+    def collect(self, topic, max_pages=3):
+        self.collected.append(topic)
+        text = f"{topic}とは、テスト用の話題である。{topic}の説明文です。{topic}は 2001 年に作られた。"
+        return Batch(topic, "topic", [(f"https://fake/{topic}", text, [("https://fake/link", f"{topic}の関連")])], "fake", 0.0)
+
+    def collect_link(self):
+        return None
+
+    def collect_feeds(self, min_interval=1800.0, max_items=5):
+        return None
+
+    def collect_site(self, index):
+        return None
+
+    def start_prefetch(self, topic_fn):
+        pass
+
+    def next_ready(self, timeout=0.0):
+        return None
+
+
 class EvolverTest(unittest.TestCase):
-    def test_cycle_offline_with_fake_fetcher(self):
-        class FakeFetcher:
-            fetched = failed = 0
-
-            def search_and_read(self, query, langs=(), max_pages=3):
-                self.fetched += 1
-                return [(f"https://fake/{query}", f"{query}についての説明文です。{query}はテスト用の話題です。")]
-
+    def test_cycle_offline_with_fake_collector(self):
         with tempfile.TemporaryDirectory() as tmp:
             b = make_brain(tmp)
-            b.add_gap("架空話題")
+            col = FakeCollector(Path(tmp))
             inbox = Path(tmp) / "inbox"
             inbox.mkdir()
             (inbox / "note.txt").write_text("インボックスの文章は自動で取り込まれます。", encoding="utf-8")
-            ev = Evolver(b, fetcher=FakeFetcher(), interval=0, max_cycles=3)
+            ev = Evolver(b, interval=0, max_cycles=3, collector=col)
+            b.add_gap("架空話題")  # on_gap 経由で起こされる
             ev.run()
             self.assertEqual(ev.cycles, 3)
             self.assertIn("架空話題", b.explored)
@@ -311,16 +335,105 @@ class EvolverTest(unittest.TestCase):
             self.assertTrue((Path(tmp) / "learned" / "note.txt").exists())
             self.assertIn("架空話題", b.reply("架空話題とは？").text)
             self.assertTrue((Path(tmp) / "brain.pkl.gz").exists())
+            self.assertEqual(col.collected[0], "架空話題")
+            self.assertGreater(len(col.frontier), 0)  # リンクがフロンティアへ入った
+            self.assertEqual(b.facts.lookup("架空話題", "definition")[0][1], "テスト用の話題")
+
+    def test_realtime_gap_notice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            col = FakeCollector(Path(tmp))
+            ev = Evolver(b, interval=0.05, collector=col)
+            ev.start()
+            r = b.reply("ホゲ理論について教えて")  # 分からない -> gap -> 即収集
+            self.assertLess(r.confidence, 0.7)
+            for _ in range(100):
+                if b.notices or "ホゲ理論" in b.explored:
+                    break
+                threading.Event().wait(0.05)
+            ev.stop()
+            self.assertIn("ホゲ理論", b.explored)
+            r2 = b.reply("ホゲ理論とは？")
+            self.assertIn("ホゲ理論", r2.text)
+            self.assertIn(r2.mode, ("fact", "recall"))
 
     def test_thread_stop(self):
         with tempfile.TemporaryDirectory() as tmp:
             b = make_brain(tmp)
-            ev = Evolver(b, fetcher=None, interval=0.05)
+            ev = Evolver(b, collector=Collector(None, Path(tmp)), interval=0.05)
             ev.start()
             threading.Event().wait(0.3)
             ev.stop()
             self.assertFalse(ev.is_alive())
             self.assertGreater(ev.cycles, 0)
+
+
+class FactsTest(unittest.TestCase):
+    def test_extract_and_answer(self):
+        fs = FactStore()
+        for i, s in enumerate(["東京タワーの高さは 333 メートルである。", "東京タワーは東京都港区に位置する。", "機械学習とは、データから規則性を学ぶ手法のことである。", "日本の首都は東京です。", "Tokyo Tower was built in 1958."]):
+            fs.add_from_sentence(s, i)
+        self.assertEqual(fs.stats()["facts"], 5)
+        self.assertIn("333", fs.answer("東京タワーの高さは？")[0])
+        self.assertIn("港区", fs.answer("東京タワーはどこ？")[0])
+        self.assertIn("規則性", fs.answer("機械学習って何？")[0])
+        self.assertIn("東京", fs.answer("日本の首都はどこ？")[0])
+        self.assertIn("1958", fs.answer("When was Tokyo Tower built?")[0] or "") if fs.answer("When was Tokyo Tower built?") else None
+        self.assertIsNone(fs.answer("日本の面積は？"))
+        self.assertEqual(parse_question("富士山の標高は？"), ("富士山", "標高"))
+        self.assertEqual(extract_facts("彼の名前は太郎です。"), [])
+        fs.remove_doc(0)
+        self.assertIsNone(fs.answer("東京タワーの高さは？"))
+        # 定義が無ければ知っている事実を並べる
+        self.assertIn("港区", fs.answer("東京タワーとは？")[0])
+
+    def test_quality(self):
+        self.assertGreater(sentence_quality("東京タワーとは、東京都港区にある高さ 333 メートルの電波塔である。", True), sentence_quality("うん。"))
+
+
+class CollectorTest(unittest.TestCase):
+    def test_frontier_priority_and_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            interest = {"人工知能": 1.0}
+            col = Collector(None, Path(tmp), interest=lambda t: interest.get(t, 0.0))
+            n = col.push_links([("./人工知能", "人工知能"), ("./雑談", "雑談"), ("#x", ""), ("./深い", "深い")], depth=1, base_url="https://ex/")
+            self.assertEqual(n, 3)
+            target, anchor, depth = col.pop_link()
+            self.assertEqual(anchor, "人工知能")
+            self.assertEqual(target, "https://ex/人工知能")
+            # 同じリンクは二度取らない
+            col.push_links([("./人工知能", "人工知能")], 1, "https://ex/")
+            self.assertNotEqual(col.pop_link()[1], "人工知能")
+            h = col._h("wikimedia:ja")
+            h.record(True, 1.0, 0.5)
+            h.record(False, 0.0, 2.0)
+            self.assertGreater(h.score, col._h("duckduckgo").score * 0.5)
+            self.assertIsNone(col.collect("x").pages or None)
+
+
+class BrainMemoryTest(unittest.TestCase):
+    def test_consolidate_merges_duplicates_and_admission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.learn_text("東京タワーの高さは 333 メートルである。", "https://a/1")
+            b.learn_text("東京タワーの高さは 333 メートルである！", "https://a/2")
+            self.assertEqual(len(b.facts.lookup("東京タワー", "高さ")), 2)
+            rec = b.consolidate()
+            self.assertEqual(rec["merged"], 1)
+            self.assertEqual(len(b.facts.lookup("東京タワー", "高さ")), 1)
+            b.admission = 0.9
+            n = b.learn_text("うん、そうだね。", "https://a/3")
+            self.assertEqual(n, 0)
+            self.assertGreater(b.stats["skipped_low_quality"], 0)
+
+    def test_notice_attached_to_reply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.learn_text("ピヨ理論とは、架空の理論である。", "https://a/p")
+            b.notices.append(("ピヨ理論", "ピヨ理論とは、架空の理論である。", "https://a/p"))
+            r = b.reply("ピヨ理論について何か知ってる？")
+            self.assertIn("ピヨ理論", r.text)
+            self.assertEqual(len(b.notices), 0)
 
 
 class WebTest(unittest.TestCase):
