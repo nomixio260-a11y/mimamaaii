@@ -194,7 +194,8 @@ def cmd_train(args) -> int:
         print("学習データが足りません (文が少なすぎます)。まず learn や evolve で集めてください。")
         return 1
     nl = brain.neural
-    print(f"モデル {nl.size}: パラメータ {nl.model.n_params():,}, 語彙 {len(nl.tok)}, プール {len(nl.pool)} 系列 / {nl.pool.total_tokens:,} トークン, 会話 {len(brain.dialogs)}")
+    nl.set_workers(args.workers if args.workers is not None else cfg.neural_workers)
+    print(f"モデル {nl.size}: パラメータ {nl.model.n_params():,}, 語彙 {len(nl.tok)}, プール {len(nl.pool)} 系列 / {nl.pool.total_tokens:,} トークン, 会話 {len(brain.dialogs)}, 並列 {nl.workers}")
     collector = None
     if args.hours and cfg.web_enabled:
         from .collector import Collector
@@ -230,6 +231,7 @@ def cmd_train(args) -> int:
     except KeyboardInterrupt:
         pass
     nl.evaluate(brain.lm.perplexity(brain.holdout) if brain.holdout else None)
+    nl.stop_parallel()
     brain.save()
     print(json.dumps(nl.stats(), ensure_ascii=False))
     for q in ("こんにちは", "機械学習とは？", "宇宙について教えて"):
@@ -362,6 +364,7 @@ def main(argv=None) -> int:
     p.add_argument("--seconds", type=float, default=None)
     p.add_argument("--hours", type=float, default=None, help="収集しながら長時間学習する")
     p.add_argument("--size", choices=["small", "base", "large"], default=None)
+    p.add_argument("--workers", type=int, default=None, help="データ並列のプロセス数 (既定: CPU 数 - 1)")
     p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("stats", help="状態を表示")

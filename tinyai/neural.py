@@ -15,8 +15,14 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from pathlib import Path
+
+# BLAS のスレッド数は既定 1: 要素ごとの演算が支配的なので、プロセス並列 (neural_parallel) の方が速い。
+# 環境変数で上書きできる (単一プロセスで大きな行列積を回す時は 4 など)
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, os.environ.get("TINYAI_BLAS_THREADS", "1"))
 
 try:
     import numpy as np
@@ -26,9 +32,9 @@ except ImportError:  # numpy が無ければこのモジュールは使えない
 from .bpe import PAD, UNK, BOS, EOS, USR, BOT, CTX, SEP, SPECIALS, SubwordTokenizer  # noqa: F401
 
 PRESETS = {
-    "small": dict(d=128, layers=2, heads=4, ctx=64, ff=384, batch=32),
-    "base": dict(d=192, layers=4, heads=6, ctx=128, ff=512, batch=12),
-    "large": dict(d=256, layers=6, heads=8, ctx=128, ff=704, batch=8),
+    "small": dict(d=128, layers=2, heads=4, ctx=64, ff=384, batch=32, lr=1e-3),
+    "base": dict(d=192, layers=4, heads=6, ctx=128, ff=512, batch=12, lr=6e-4),
+    "large": dict(d=256, layers=6, heads=8, ctx=128, ff=704, batch=8, lr=4e-4),
 }
 
 
@@ -53,12 +59,16 @@ def _rms_backward(dy, cache):
     return dx, dg
 
 
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
 def _silu(x):
-    return x / (1.0 + np.exp(-x))
+    return x * _sigmoid(x)
 
 
-def _silu_grad(x):
-    s = 1.0 / (1.0 + np.exp(-x))
+def _silu_grad_from_sig(x, s):
+    """順伝播で計算した sigmoid を使い回す (exp を 3 回節約)。"""
     return s * (1.0 + x * (1.0 - s))
 
 
@@ -145,10 +155,12 @@ class TinyTransformer:
             h2, c2 = _rms_forward(x2, p[f"l{i}.rms2"])
             u = h2 @ p[f"l{i}.w1"]
             gt = h2 @ p[f"l{i}.wg"]
-            act = _silu(gt) * u
+            sig = _sigmoid(gt)
+            silu = gt * sig
+            act = silu * u
             x3 = x2 + act @ p[f"l{i}.w2"]
             if train:
-                caches.append((h, c1, q, k, v, att, a, h2, c2, u, gt, act))
+                caches.append((h, c1, q, k, v, att, a, h2, c2, u, gt, sig, silu, act))
             x = x3
         xf, cf = _rms_forward(x, p["rmsf"])
         logits = xf @ p["wte"].T
@@ -177,12 +189,12 @@ class TinyTransformer:
         dxf = dlogits @ p["wte"]
         dx, g["rmsf"] = _rms_backward(dxf, cf)
         for i in reversed(range(self.L)):
-            h, c1, q, k, v, att, a, h2, c2, u, gt, act = caches[i]
+            h, c1, q, k, v, att, a, h2, c2, u, gt, sig, silu, act = caches[i]
             # MLP (SwiGLU)
             g[f"l{i}.w2"] = act.reshape(-1, self.ff).T @ dx.reshape(-1, self.d)
             dact = dx @ p[f"l{i}.w2"].T
-            du = dact * _silu(gt)
-            dgt = dact * u * _silu_grad(gt)
+            du = dact * silu
+            dgt = dact * u * _silu_grad_from_sig(gt, sig)
             g[f"l{i}.w1"] = h2.reshape(-1, self.d).T @ du.reshape(-1, self.ff)
             g[f"l{i}.wg"] = h2.reshape(-1, self.d).T @ dgt.reshape(-1, self.ff)
             dh2 = du @ p[f"l{i}.w1"].T + dgt @ p[f"l{i}.wg"].T
@@ -213,21 +225,27 @@ class TinyTransformer:
 
     def adamw(self, grads, lr: float = 3e-4, beta1=0.9, beta2=0.99, wd=0.05, clip=1.0) -> float:
         self.step += 1
-        norm = math.sqrt(sum(float((v.astype(np.float64) ** 2).sum()) for v in grads.values()))
+        norm = math.sqrt(sum(float(np.dot(v.ravel(), v.ravel())) for v in grads.values()))
         scale = min(1.0, clip / (norm + 1e-6))
         b1t = 1 - beta1 ** self.step
         b2t = 1 - beta2 ** self.step
+        lr_eff = lr / b1t
         for k, gk in grads.items():
-            gk = gk * scale
             m, v = self.m[k], self.v[k]
+            # m = b1 m + (1-b1) g ; v = b2 v + (1-b2) g²   (全部インプレース、一時配列は 1 つ)
             m *= beta1
-            m += (1 - beta1) * gk
+            m += ((1 - beta1) * scale) * gk
+            tmp = gk * gk
+            tmp *= (1 - beta2) * scale * scale
             v *= beta2
-            v += (1 - beta2) * gk * gk
-            upd = lr * (m / b1t) / (np.sqrt(v / b2t) + 1e-8)
+            v += tmp
+            np.multiply(v, 1.0 / b2t, out=tmp)
+            np.sqrt(tmp, out=tmp)
+            tmp += 1e-8
+            np.divide(m, tmp, out=tmp)
             if gk.ndim >= 2:
                 self.p[k] *= (1 - lr * wd)
-            self.p[k] -= upd.astype(self.dtype)
+            self.p[k] -= (lr_eff * tmp).astype(self.dtype, copy=False)
         return norm
 
     # ------------------------------------------------------------ 推論
@@ -255,6 +273,79 @@ class TinyTransformer:
             x = x + (_silu(h2 @ p[f"l{i}.wg"]) * (h2 @ p[f"l{i}.w1"])) @ p[f"l{i}.w2"]
         xf, _ = _rms_forward(x, p["rmsf"])
         return (xf @ p["wte"].T)[0]
+
+    def _step_batch(self, toks: np.ndarray, pos: int, cache: list) -> np.ndarray:
+        """B 本の系列を同時に 1 トークン進める (候補を並列に生成するため)。toks: (B,)"""
+        p = self.p
+        dh = self.d // self.h
+        B = toks.shape[0]
+        x = p["wte"][toks]  # (B, d)
+        cos, sin = self.cos[pos : pos + 1], self.sin[pos : pos + 1]
+        for i in range(self.L):
+            h, _ = _rms_forward(x, p[f"l{i}.rms1"])
+            qkv = h @ p[f"l{i}.wqkv"]
+            q, k, v = np.split(qkv, 3, axis=-1)
+            q = _rope(q.reshape(B, self.h, 1, dh), cos, sin)
+            k = _rope(k.reshape(B, self.h, 1, dh), cos, sin)
+            v = v.reshape(B, self.h, 1, dh)
+            K, Vc = cache[i]
+            K = np.concatenate([K, k], axis=2) if K is not None else k
+            Vc = np.concatenate([Vc, v], axis=2) if Vc is not None else v
+            cache[i] = (K, Vc)
+            att = _softmax(q @ K.transpose(0, 1, 3, 2) / math.sqrt(dh))
+            a = (att @ Vc).reshape(B, self.d)
+            x = x + a @ p[f"l{i}.wo"]
+            h2, _ = _rms_forward(x, p[f"l{i}.rms2"])
+            x = x + (_silu(h2 @ p[f"l{i}.wg"]) * (h2 @ p[f"l{i}.w1"])) @ p[f"l{i}.w2"]
+        xf, _ = _rms_forward(x, p["rmsf"])
+        return xf @ p["wte"].T  # (B, V)
+
+    def generate_batch(self, prompt: list[int], n: int = 3, max_new: int = 40, temperature: float = 0.8, top_k: int = 40, top_p: float = 0.9, repetition_penalty: float = 1.3, rng=None, stop=(EOS,)) -> list[list[int]]:
+        """同じプロンプトから n 本の候補を同時に生成 (1 本ずつより約 n 倍速い)。"""
+        rng = rng or np.random.default_rng()
+        prompt = prompt[-(self.T - 1):]
+        cache = [(None, None) for _ in range(self.L)]
+        logits = None
+        for pos, tok in enumerate(prompt):
+            logits = self._step_batch(np.full(n, tok, dtype=np.int64), pos, cache)
+        outs: list[list[int]] = [[] for _ in range(n)]
+        alive = np.ones(n, dtype=bool)
+        pos = len(prompt)
+        for _ in range(max_new):
+            if pos >= self.T or not alive.any():
+                break
+            z = logits.astype(np.float64)
+            z[:, PAD] = -1e9
+            z[:, UNK] = -1e9
+            next_toks = np.zeros(n, dtype=np.int64)
+            for b in range(n):
+                if not alive[b]:
+                    continue
+                zb = z[b]
+                if repetition_penalty > 1.0 and outs[b]:
+                    for t in set(outs[b][-20:]):
+                        zb[t] = zb[t] / repetition_penalty if zb[t] > 0 else zb[t] * repetition_penalty
+                zb = zb / max(temperature, 1e-3)
+                if top_k and top_k < len(zb):
+                    thr = np.partition(zb, -top_k)[-top_k]
+                    zb[zb < thr] = -1e9
+                pr = _softmax(zb)
+                if 0 < top_p < 1.0:
+                    order = np.argsort(-pr)
+                    cum = np.cumsum(pr[order])
+                    cut = order[cum > top_p]
+                    if len(cut) > 1:
+                        pr[cut[1:]] = 0.0
+                        pr /= pr.sum()
+                tok = int(rng.choice(len(pr), p=pr))
+                if tok in stop:
+                    alive[b] = False
+                    continue
+                outs[b].append(tok)
+                next_toks[b] = tok
+            logits = self._step_batch(next_toks, pos, cache)
+            pos += 1
+        return outs
 
     def logprob(self, ids: list[int]) -> float:
         if len(ids) < 2:

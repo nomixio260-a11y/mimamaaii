@@ -16,7 +16,8 @@ tinyai/
   dialog.py       会話データの保持 (発話, 応答, 出典, 重み) と「」の応酬の抽出、個人情報らしい文字列の除外
   bpe.py          サブワードトークナイザ (頻度ベース WordPiece 風の最長一致、基本文字は常に語彙に含む、▁ で英単語の空白を保持)
   neural.py       numpy だけで書いた LLaMA 系 Transformer (RMSNorm・RoPE・SwiGLU・KV キャッシュ・top-p・コサイン LR・系列パッキング)。勾配は有限差分で検査済み
-  neural_lm.py    Brain との接続: 語彙学習 (十分なデータが溜まってから固定)、平文/会話/RAG/合成 QA の系列化、再生バッファ、継続学習、ppl による使用判定、RAG 生成
+  neural_lm.py    Brain との接続: 語彙学習 (十分なデータが溜まってから固定)、平文/会話/RAG/合成 QA/抽出練習の系列化、再生バッファ、継続学習、ppl による使用判定、RAG 生成 (候補を一括生成)
+  neural_parallel.py データ並列学習: fork したワーカーが共有メモリ上のパラメータで勾配を計算し、親が平均して AdamW (同期 SGD)
   brain_types.py  質問タイプの判定とタイプ別リランク
   evolution.py    進化するパラメータ (Params) と自己評価・変異・採用の判定
   brain.py        中核: 学習パイプライン、会話パイプライン、関心・通知、整理、メモリ制御、保存

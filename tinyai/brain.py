@@ -357,6 +357,12 @@ class Brain:
         while self._neural_pending_dialog:
             u, b, ctx, w = self._neural_pending_dialog.popleft()
             nl.add_dialog(u, b, ctx, weight=w)
+        # 文脈からの抽出練習: 最近の知識文をキーワード付きで (RAG で「検索文を使う」ことを学ぶ)
+        for d in self.kb.random_docs(min(20, len(self.kb)), self.rng):
+            ks = [k for k in keywords(d.text, limit=2) if is_phrase(k)]
+            if ks and d.source not in ("chat",):
+                nb = self.kb.docs.get(d.id + 1)
+                nl.add_copy_example(ks[0], d.text, nb.text if nb and nb.source == d.source else None)
         n = 0
         for key, lst in self.facts.by_subject.items():
             for rel, obj, doc_id in lst:

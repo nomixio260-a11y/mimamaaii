@@ -781,6 +781,31 @@ class NeuralTest(unittest.TestCase):
             self.assertEqual(len(t2), len(tok))
             self.assertAlmostEqual(m2.logprob(seq), lp, places=4)
 
+    def test_generate_batch_and_parallel_trainer(self):
+        import numpy as np
+        nn = self.neural
+        from tinyai.neural_parallel import ParallelTrainer
+        m = nn.TinyTransformer(vocab_size=60, d=16, heads=2, layers=1, ctx=12, ff=32, seed=3)
+        rng = np.random.default_rng(0)
+        outs = m.generate_batch([8, 9, 10], n=3, max_new=6, rng=rng)
+        self.assertEqual(len(outs), 3)
+        self.assertTrue(all(len(o) <= 6 for o in outs))
+        pool = nn.SequencePool(seed=0)
+        seq = [nn.BOS] + list(range(8, 19)) + [nn.EOS]
+        for _ in range(64):
+            pool.add(seq)
+        pt = ParallelTrainer(m, pool, workers=2)
+        if not pt.start():
+            self.skipTest("fork が使えない環境")
+        try:
+            first = pt.train(steps=1, batch=4, lr=1e-2, total=100, warmup=1)["first_loss"]
+            r = pt.train(steps=40, batch=4, lr=1e-2, total=100, warmup=1)
+            self.assertEqual(r["workers"], 2)
+            self.assertLess(r["loss"], first * 0.8)  # 並列でも学習が進む
+        finally:
+            pt.stop()
+        self.assertGreater(m.logprob(seq), -3.0)  # 停止後も (通常メモリに戻した) パラメータが有効
+
     def test_subword_tokenizer(self):
         from tinyai.bpe import SubwordTokenizer
         tok = SubwordTokenizer.train(["機械学習とは、データから規則性を学ぶ手法である。"] * 5 + ["Tokyo Tower was built in 1958."] * 5, size=200)

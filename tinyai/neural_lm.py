@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import neural
 from .bpe import BOS, BOT, CTX, EOS, USR, SubwordTokenizer
+from .neural_parallel import ParallelTrainer
 
 log = logging.getLogger("tinyai.neural")
 
@@ -54,6 +55,9 @@ class NeuralLM:
         self._holdout: list[list[int]] = []
         self._last_save = 0.0
         self.batch = neural.PRESETS[self.size]["batch"] if self.available else 8
+        self.lr = neural.PRESETS[self.size]["lr"] if self.available else 5e-4
+        self.workers = 1                       # >1 ならデータ並列 (train コマンドで使う)
+        self._parallel: ParallelTrainer | None = None
 
     # ------------------------------------------------------------ 構築
     def ensure_model(self, texts=None) -> bool:
@@ -71,6 +75,7 @@ class NeuralLM:
                 self.size = meta.get("size", self.size)
                 self._holdout = [list(x) for x in meta.get("holdout", [])][:300]
                 self.batch = neural.PRESETS.get(self.size, {}).get("batch", self.batch)
+                self.lr = neural.PRESETS.get(self.size, {}).get("lr", self.lr)
                 log.info("ニューラル LM を読込: %s %d params, step=%d", self.size, self.model.n_params(), self.model.step)
                 return True
             except Exception as e:
@@ -126,6 +131,14 @@ class NeuralLM:
         for _ in range(max(1, int(round(weight)))):
             self.pool.add(ids)
 
+    def add_copy_example(self, keyword: str, sentence: str, neighbors: str | None = None) -> None:
+        """RAG の「文脈から抜き出す」練習: 文脈 (その文 + 周辺) を与え、キーワードについて聞かれたらその文を答える。"""
+        if self.model is None:
+            return
+        context = f"{sentence} {neighbors}" if neighbors else sentence
+        q = self.rng.choice([f"{keyword}について教えて", f"{keyword}とは？", f"{keyword}は？", f"{keyword}について"])
+        self.pool.add(self.seq_dialog(q, sentence, context))
+
     def add_synthetic_qa(self, subject: str, relation: str, obj: str, answer: str, context: str) -> int:
         """事実から質問文を作り (テンプレート)、文脈付き/無しの両方で会話例にする。"""
         if self.model is None:
@@ -142,12 +155,40 @@ class NeuralLM:
         return n
 
     # ------------------------------------------------------------ 学習
+    def set_workers(self, n: int) -> int:
+        """データ並列のワーカー数を設定 (1 で単一プロセス)。モデルが無い間は予約だけ。"""
+        self.workers = max(1, int(n))
+        if self._parallel is not None and self._parallel.workers != self.workers:
+            self._parallel.stop()
+            self._parallel = None
+        return self.workers
+
+    def stop_parallel(self) -> None:
+        if self._parallel is not None:
+            self._parallel.stop()
+            self._parallel = None
+
     def train_some(self, steps: int = 4, batch: int | None = None) -> dict | None:
         if self.model is None or len(self.pool) < 32:
             return None
         batch = batch or self.batch
+        if self.workers > 1:
+            if self._parallel is None:
+                self._parallel = ParallelTrainer(self.model, self.pool, workers=self.workers)
+                if not self._parallel.start():
+                    self._parallel = None
+                    self.workers = 1
+            if self._parallel is not None:
+                try:
+                    r = self._parallel.train(steps=steps, batch=batch, lr=self.lr, total=self.total_steps)
+                except MemoryError:
+                    self.batch = max(2, batch // 2)
+                    return None
+                self.trained_tokens += steps * batch * self._parallel.workers * self.model.T
+                self.last_loss = r.get("loss")
+                return r
         try:
-            r = neural.train_steps(self.model, self.pool, steps=steps, batch=batch, total=self.total_steps)
+            r = neural.train_steps(self.model, self.pool, steps=steps, batch=batch, lr=self.lr, total=self.total_steps)
         except MemoryError:
             # メモリ上限に当たったらバッチを半分にして続ける
             self.batch = max(2, batch // 2)
@@ -187,8 +228,7 @@ class NeuralLM:
             return []
         prompt = self.prompt_dialog(user, context)
         out = []
-        for _ in range(n):
-            ids = self.model.generate(prompt, max_new=max_new, temperature=temperature, rng=self.nprng)
+        for ids in self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=temperature, rng=self.nprng):
             text = self.tok.decode(ids).strip()
             if len(text) >= 2:
                 out.append(text)
