@@ -1,8 +1,16 @@
-"""補間付き絶対ディスカウント n-gram 言語モデル。
+"""補間付き絶対ディスカウント + Kneser-Ney 継続カウントの n-gram 言語モデル。
 
-`ctx[context_tuple] = [total, {token: count}]` の入れ子辞書で保持する。
-メモリ制限に合わせて `prune()` で低頻度エントリを削り、`use_order` で
-実際に使う次数を進化 (evolve) で変えられる。
+メモリ効率のため、トークンは整数 ID に変換し、文脈 (直前 n トークン) は
+1 個の整数にパックして辞書のキーにする:
+
+    key = n | (t[i-1] << 4) | (t[i-2] << 24) | (t[i-3] << 44) ...   (20 bit / トークン)
+
+これにより文字列タプルをキーにするより 1 エントリあたりのメモリが半分以下になり、
+文脈キーの計算も加算とシフトだけになる。
+
+各文脈の分布は、後続トークンが 1 種類だけの間は 1 個の整数 (tok | count << 20) で持ち
+(高次の文脈はほとんどこれ)、2 種類以上になった時だけ {token_id: count, -1: 合計} の
+辞書に昇格する。辞書 1 個は約 200 bytes なので、これで実メモリがさらに半減する。
 """
 from __future__ import annotations
 
@@ -12,9 +20,14 @@ from typing import Iterable, Sequence
 
 from .tokenizer import SENT_END, SENT_START
 
-# 1 エントリ (context->token->count) あたりのおおよそのメモリ (bytes)
-ENTRY_COST = 110
-CONTEXT_COST = 240
+UNK, BOS, EOS = 0, 1, 2
+TOKEN_BITS = 20
+TOKEN_MASK = (1 << TOKEN_BITS) - 1
+MAX_VOCAB = TOKEN_MASK  # 約 100 万語
+
+# 1 エントリ (context->token->count) / 1 文脈あたりのおおよそのメモリ (bytes)。tools/bench.py で較正。
+ENTRY_COST = 60
+CONTEXT_COST = 50
 
 
 class NGramLM:
@@ -22,73 +35,132 @@ class NGramLM:
         self.max_order = max(1, int(max_order))
         self.use_order = min(self.max_order, use_order or self.max_order)
         self.discount = discount
-        self.ctx: dict[tuple, list] = {(): [0, {}]}
+        self.vocab: dict[str, int] = {SENT_START: BOS, SENT_END: EOS}
+        self.words: list[str] = ["<unk>", SENT_START, SENT_END]
+        self.ctx: dict[int, dict[int, int]] = {0: {-1: 0}}
+        self.cont: dict[int, int] = {}   # token -> 直前トークンの種類数 (KN 継続カウント)
+        self.cont_total = 0
         self.entries = 0
         self.sentences = 0
-        self.prune_threshold = 1  # プルーニングで削る最大カウント (段階的に上がる)
+        self.prune_threshold = 1
+
+    # ------------------------------------------------------------ 語彙
+    def _id(self, tok: str) -> int:
+        i = self.vocab.get(tok)
+        if i is None:
+            if len(self.words) >= MAX_VOCAB:
+                return UNK
+            i = len(self.words)
+            self.vocab[tok] = i
+            self.words.append(tok)
+        return i
+
+    def ids(self, tokens: Iterable[str]) -> list[int]:
+        v = self.vocab
+        return [v.get(t, UNK) for t in tokens]
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.words)
+
+    def knows(self, token: str) -> bool:
+        i = self.vocab.get(token)
+        return i is not None and i in self.ctx[0]
 
     # ------------------------------------------------------------ 学習
     def learn(self, tokens: Sequence[str]) -> int:
         if not tokens:
             return 0
-        toks = [SENT_START] + list(tokens) + [SENT_END]
-        ctxs = self.ctx
+        ids = [BOS] + [self._id(t) for t in tokens] + [EOS]
+        ctx = self.ctx
+        cont = self.cont
+        max_order = self.max_order
         new = 0
-        for i in range(1, len(toks)):
-            tok = toks[i]
-            for n in range(self.max_order):
-                if i - n < 0:
-                    break
-                key = tuple(toks[i - n : i]) if n else ()
-                e = ctxs.get(key)
-                if e is None:
-                    e = ctxs[key] = [0, {}]
-                d = e[1]
-                if tok in d:
-                    d[tok] += 1
-                else:
-                    d[tok] = 1
+        one = 1 << TOKEN_BITS
+        for i in range(1, len(ids)):
+            tok = ids[i]
+            key = 0
+            for n in range(max_order):
+                if n:
+                    if i - n < 0:
+                        break
+                    key += 1 + (ids[i - n] << (4 + TOKEN_BITS * (n - 1)))
+                d = ctx.get(key)
+                if d is None:
+                    if n == 0:
+                        ctx[key] = {-1: 1, tok: 1}
+                    else:
+                        ctx[key] = tok | one  # 単一後続トークンの圧縮表現
                     new += 1
-                e[0] += 1
+                    if n == 1:
+                        cont[tok] = cont.get(tok, 0) + 1
+                        self.cont_total += 1
+                elif type(d) is int:
+                    if (d & TOKEN_MASK) == tok:
+                        ctx[key] = d + one
+                    else:
+                        cnt = d >> TOKEN_BITS
+                        ctx[key] = {-1: cnt + 1, d & TOKEN_MASK: cnt, tok: 1}
+                        new += 1
+                        if n == 1:
+                            cont[tok] = cont.get(tok, 0) + 1
+                            self.cont_total += 1
+                else:
+                    c = d.get(tok)
+                    if c is None:
+                        d[tok] = 1
+                        new += 1
+                        if n == 1:
+                            cont[tok] = cont.get(tok, 0) + 1
+                            self.cont_total += 1
+                    else:
+                        d[tok] = c + 1
+                    d[-1] += 1
         self.entries += new
         self.sentences += 1
         return new
 
     # ------------------------------------------------------------ 確率
-    @property
-    def vocab_size(self) -> int:
-        return len(self.ctx[()][1]) + 1
+    def _keys(self, hist: Sequence[int]) -> list[int]:
+        """履歴 (ID 列) から各次数の文脈キー [key0, key1, ...] を作る。"""
+        keys = [0]
+        key = 0
+        for n in range(1, self.use_order):
+            if n > len(hist):
+                break
+            key += 1 + (hist[-n] << (4 + TOKEN_BITS * (n - 1)))
+            keys.append(key)
+        return keys
+
+    def _prob_keys(self, keys: list[int], n: int, tok: int) -> float:
+        if n == 0:
+            return (self.cont.get(tok, 0) + 1.0) / (self.cont_total + self.vocab_size)
+        d = self.ctx.get(keys[n])
+        lower = self._prob_keys(keys, n - 1, tok)
+        if d is None:
+            return lower
+        disc = self.discount
+        if type(d) is int:
+            total = d >> TOKEN_BITS
+            c = total if (d & TOKEN_MASK) == tok else 0
+            return max(c - disc, 0.0) / total + disc / total * lower
+        total = d[-1]
+        c = d.get(tok, 0)
+        return max(c - disc, 0.0) / total + disc * (len(d) - 1) / total * lower
 
     def prob(self, context: Sequence[str], token: str) -> float:
-        """P(token | context) 補間付き絶対ディスカウント。"""
-        order = self.use_order
-        ctx = tuple(context[-(order - 1):]) if order > 1 else ()
-        return self._prob(ctx, token)
-
-    def _prob(self, ctx: tuple, token: str) -> float:
-        if not ctx:
-            root = self.ctx[()]
-            total = root[0]
-            v = self.vocab_size
-            return (root[1].get(token, 0) + 1.0) / (total + v)
-        e = self.ctx.get(ctx)
-        lower = self._prob(ctx[1:], token)
-        if e is None or e[0] == 0:
-            return lower
-        total, d = e
-        c = d.get(token, 0)
-        disc = self.discount
-        p = max(c - disc, 0.0) / total
-        backoff = disc * len(d) / total
-        return p + backoff * lower
+        hist = self.ids(context)
+        keys = self._keys(hist)
+        return self._prob_keys(keys, len(keys) - 1, self.vocab.get(token, UNK))
 
     def perplexity(self, sentences: Iterable[Sequence[str]]) -> float:
         logp = 0.0
         n = 0
         for tokens in sentences:
-            toks = [SENT_START] + list(tokens) + [SENT_END]
-            for i in range(1, len(toks)):
-                p = self.prob(toks[:i], toks[i])
+            ids = [BOS] + self.ids(tokens) + [EOS]
+            for i in range(1, len(ids)):
+                keys = self._keys(ids[:i])
+                p = self._prob_keys(keys, len(keys) - 1, ids[i])
                 logp += math.log(max(p, 1e-12))
                 n += 1
         if n == 0:
@@ -103,33 +175,47 @@ class NGramLM:
         temperature: float = 0.8,
         rng: random.Random | None = None,
         min_len: int = 4,
+        focus: set[str] | None = None,
+        focus_bonus: float = 2.0,
     ) -> list[str]:
+        """seed の続きを生成。focus に含まれる語 (検索で見つかった知識の語) を優先する。"""
         rng = rng or random
-        out = [SENT_START] + list(seed)
-        order = self.use_order
-        for step in range(max_len):
+        out = [BOS] + self.ids(seed)
+        focus_ids = {self.vocab[t] for t in focus if t in self.vocab} if focus else set()
+        for _ in range(max_len):
+            keys = self._keys(out)
             cands = None
-            for n in range(order - 1, -1, -1):
-                key = tuple(out[-n:]) if n else ()
-                e = self.ctx.get(key)
-                if e and e[0] >= (2 if n else 1):
-                    cands = list(e[1].keys())
+            n_used = 0
+            for n in range(len(keys) - 1, -1, -1):
+                d = self.ctx.get(keys[n])
+                if d is None:
+                    continue
+                if type(d) is int:
+                    if (d >> TOKEN_BITS) >= 2:
+                        cands = [d & TOKEN_MASK]
+                        n_used = n
+                        break
+                elif d[-1] >= (2 if n else 1):
+                    cands = [t for t in d if t != -1]
+                    n_used = n
                     break
             if not cands:
                 break
             if len(cands) > 64:
-                # 高頻度候補から絞る
-                e = self.ctx[key]
-                cands = sorted(cands, key=lambda t: e[1][t], reverse=True)[:64]
+                d = self.ctx[keys[n_used]]
+                cands = sorted(cands, key=lambda t: d[t], reverse=True)[:64]
             weights = []
+            recent = out[-6:]
+            inv_t = 1.0 / max(temperature, 0.05)
             for t in cands:
-                p = self.prob(out, t)
-                if t == SENT_END and len(out) - 1 < min_len:
+                p = self._prob_keys(keys, len(keys) - 1, t)
+                if t == EOS and len(out) - 1 < min_len:
                     p *= 0.05
-                # 同じ語の繰り返しを抑制
-                if t in out[-6:]:
+                if t in recent:
                     p *= 0.3
-                weights.append(p ** (1.0 / max(temperature, 0.05)))
+                if t in focus_ids:
+                    p *= focus_bonus
+                weights.append(p ** inv_t)
             tot = sum(weights)
             if tot <= 0:
                 break
@@ -141,17 +227,15 @@ class NGramLM:
                 if acc >= r:
                     pick = t
                     break
-            if pick == SENT_END:
+            if pick == EOS:
                 break
             out.append(pick)
-        return out[1:]
-
-    def knows(self, token: str) -> bool:
-        return token in self.ctx[()][1]
+        words = self.words
+        return [words[i] for i in out[1:]]
 
     # ------------------------------------------------------------ 圧縮
     def estimated_bytes(self) -> int:
-        return self.entries * ENTRY_COST + len(self.ctx) * CONTEXT_COST
+        return self.entries * ENTRY_COST + len(self.ctx) * CONTEXT_COST + len(self.words) * 70
 
     def prune(self, min_count: int | None = None, keep_orders: int | None = None) -> int:
         """カウントが min_count 未満のエントリ (unigram 以外) を削除。削除数を返す。"""
@@ -159,22 +243,39 @@ class NGramLM:
             min_count = self.prune_threshold + 1
         removed = 0
         dead = []
-        for key, (total, d) in self.ctx.items():
-            if not key:
+        cont = self.cont
+        for key, d in self.ctx.items():
+            if key == 0:
                 continue
-            if keep_orders is not None and len(key) >= keep_orders:
+            n = key & 15
+            if type(d) is int:
+                if (keep_orders is not None and n >= keep_orders) or (d >> TOKEN_BITS) < min_count:
+                    dead.append(key)
+                    removed += 1
+                    if n == 1:
+                        cont[d & TOKEN_MASK] -= 1
+                        self.cont_total -= 1
+                continue
+            if keep_orders is not None and n >= keep_orders:
                 dead.append(key)
-                removed += len(d)
+                removed += len(d) - 1
+                if n == 1:
+                    for t in d:
+                        if t != -1:
+                            cont[t] -= 1
+                            self.cont_total -= 1
                 continue
-            drop = [t for t, c in d.items() if c < min_count]
+            drop = [t for t, c in d.items() if t != -1 and c < min_count]
             if drop:
                 lost = 0
                 for t in drop:
                     lost += d.pop(t)
+                    if n == 1:
+                        cont[t] -= 1
+                        self.cont_total -= 1
                 removed += len(drop)
-                total -= lost
-                self.ctx[key][0] = total
-            if not d:
+                d[-1] -= lost
+            if len(d) == 1:
                 dead.append(key)
         for key in dead:
             self.ctx.pop(key, None)
@@ -183,7 +284,6 @@ class NGramLM:
         return removed
 
     def shrink_to(self, budget_bytes: int) -> int:
-        """推定サイズが予算内に収まるまで段階的にプルーニング。"""
         removed = 0
         rounds = 0
         while self.estimated_bytes() > budget_bytes and rounds < 8:
@@ -197,6 +297,27 @@ class NGramLM:
             self.max_order -= 1
             self.use_order = min(self.use_order, self.max_order)
         return removed
+
+    # ------------------------------------------------------------ 保存
+    def state(self) -> dict:
+        return {
+            "words": self.words, "ctx": self.ctx, "cont": self.cont, "cont_total": self.cont_total,
+            "entries": self.entries, "sentences": self.sentences, "max_order": self.max_order,
+            "prune_threshold": self.prune_threshold, "format": 2,
+        }
+
+    @classmethod
+    def from_state(cls, st: dict) -> "NGramLM":
+        lm = cls(max_order=st["max_order"])
+        lm.words = st["words"]
+        lm.vocab = {w: i for i, w in enumerate(lm.words)}
+        lm.ctx = st["ctx"]
+        lm.cont = st["cont"]
+        lm.cont_total = st["cont_total"]
+        lm.entries = st["entries"]
+        lm.sentences = st["sentences"]
+        lm.prune_threshold = st.get("prune_threshold", 1)
+        return lm
 
     def stats(self) -> dict:
         return {

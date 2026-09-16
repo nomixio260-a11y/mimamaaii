@@ -1,21 +1,68 @@
 """文単位の知識ベース + BM25 転置インデックス。
 
-各文書は (id, text, source, added, score) を持つ。`score` は会話中の
-フィードバック (👍/👎) や検索ヒットで増減し、メモリ逼迫時の追い出し順に
-使う (古くて役に立たない文から消える)。
+高速化・省メモリの工夫:
+  * 転置索引の投稿リストは、文書が 1 件だけの間は 1 個の整数 (doc_id << 8 | tf) で持ち、
+    2 件以上になった時だけ {doc_id: tf} の辞書に昇格する (語の大半は 1 件だけ)
+  * 出現文書率が高すぎる語 (かな bigram など) は他に語があれば無視する (動的ストップ語)
+  * 検索結果は小さな LRU キャッシュに入れ、追加/削除で無効化する
+  * 追い出し時の転置索引の更新は文書のテキストから語を再計算する (文書ごとに語列を持たない)
+  * ジャンク文 (記号だらけ、数字だらけ、表の断片) は最初から取り込まない
+
+知能面の工夫:
+  * associate(): 質問文の語を答えの文に結び付ける (訂正・👍 から学ぶ)
+  * related_terms(): 共起から関連語を求める (クエリ拡張に使う。学習時のコストはゼロ)
 """
 from __future__ import annotations
 
 import hashlib
 import math
 import random
+import re
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from typing import Iterable
 
-from .tokenizer import term_weight, terms
+from .tokenizer import is_phrase, term_weight, terms
 
-DOC_BASE_COST = 220
+DOC_BASE_COST = 200
+TF_BITS = 8
+TF_MAX = (1 << TF_BITS) - 1
+_JUNK_RE = re.compile(r"[\[\]{}|<>=_*#@^~\\]")
+
+
+def is_junk(text: str) -> bool:
+    """学習する価値の低い文かどうか。"""
+    n = len(text)
+    if n < 4:
+        return True
+    alnum = sum(1 for ch in text if ch.isalnum())
+    if alnum / n < 0.55:
+        return True
+    digits = sum(1 for ch in text if ch.isdigit())
+    if digits / n > 0.4:
+        return True
+    if len(_JUNK_RE.findall(text)) > 2:
+        return True
+    # 同じ文字の異常な繰り返し
+    if n >= 12 and len(set(text)) < n / 4:
+        return True
+    return False
+
+
+def _post_items(post):
+    if type(post) is int:
+        return ((post >> TF_BITS, post & TF_MAX),)
+    return post.items()
+
+
+def _post_len(post) -> int:
+    return 1 if type(post) is int else len(post)
+
+
+def _post_has(post, doc_id: int) -> bool:
+    if type(post) is int:
+        return (post >> TF_BITS) == doc_id
+    return doc_id in post
 
 
 class Doc:
@@ -31,44 +78,78 @@ class Doc:
 
 
 class KnowledgeBase:
-    def __init__(self, k1: float = 1.4, b: float = 0.6, phrase_bonus: float = 1.5):
+    def __init__(self, k1: float = 1.4, b: float = 0.6, phrase_bonus: float = 1.5, stop_ratio: float = 0.2):
         self.k1 = k1
         self.b = b
-        self.phrase_bonus = phrase_bonus  # 漢字/カタカナ連続語 (>=2 文字) が一致した時の重み
+        self.phrase_bonus = phrase_bonus
+        self.stop_ratio = stop_ratio      # これ以上の文書に出る語は (他に語があれば) 無視
         self.docs: dict[int, Doc] = {}
         self.index: dict[str, dict[int, int]] = {}
         self.hashes: set[str] = set()
+        self.assoc: dict[int, list[str]] = {}  # doc_id -> 結び付けた追加の語
         self.next_id = 1
         self.total_len = 0
         self._est_bytes = 0
+        self._cache: OrderedDict = OrderedDict()
+        self._version = 0
 
     # ------------------------------------------------------------ 追加/削除
     @staticmethod
     def _hash(text: str) -> str:
         return hashlib.blake2b(text.strip().lower().encode("utf-8"), digest_size=8).hexdigest()
 
-    def add(self, text: str, source: str = "") -> Doc | None:
+    def add(self, text: str, source: str = "", tf: Counter | None = None) -> Doc | None:
         text = text.strip()
-        if len(text) < 4 or len(text) > 600:
+        if len(text) < 4 or len(text) > 600 or is_junk(text):
             return None
         h = self._hash(text)
         if h in self.hashes:
             return None
-        tf = Counter(terms(text))
+        if tf is None:
+            tf = Counter(terms(text))
         if not tf:
             return None
         doc = Doc(self.next_id, text, source[:120], time.time(), sum(tf.values()))
         self.next_id += 1
         self.docs[doc.id] = doc
         self.hashes.add(h)
+        index = self.index
         for t, c in tf.items():
-            post = self.index.get(t)
-            if post is None:
-                post = self.index[t] = {}
-            post[doc.id] = c
+            self._post_add(index, t, doc.id, c)
         self.total_len += doc.length
-        self._est_bytes += DOC_BASE_COST + len(text) * 2 + len(tf) * 90
+        self._est_bytes += DOC_BASE_COST + len(text) * 2 + len(tf) * 60
+        self._version += 1
         return doc
+
+    @staticmethod
+    def _post_add(index: dict, t: str, doc_id: int, c: int) -> None:
+        c = min(c, TF_MAX)
+        post = index.get(t)
+        if post is None:
+            index[t] = (doc_id << TF_BITS) | c
+        elif type(post) is int:
+            index[t] = {post >> TF_BITS: post & TF_MAX, doc_id: c}
+        else:
+            post[doc_id] = c
+
+    def _post_remove(self, t: str, doc_id: int) -> None:
+        post = self.index.get(t)
+        if post is None:
+            return
+        if type(post) is int:
+            if (post >> TF_BITS) == doc_id:
+                del self.index[t]
+            return
+        post.pop(doc_id, None)
+        if not post:
+            del self.index[t]
+        elif len(post) == 1:
+            (d, c), = post.items()
+            self.index[t] = (d << TF_BITS) | c
+
+    def posting_ids(self, t: str) -> list[int]:
+        post = self.index.get(t)
+        return [d for d, _ in _post_items(post)] if post is not None else []
 
     def remove(self, doc_id: int) -> None:
         doc = self.docs.pop(doc_id, None)
@@ -77,13 +158,31 @@ class KnowledgeBase:
         self.hashes.discard(self._hash(doc.text))
         self.total_len -= doc.length
         tf = Counter(terms(doc.text))
-        for t in tf:
+        extra = self.assoc.pop(doc_id, ())
+        for t in list(tf) + list(extra):
+            self._post_remove(t, doc_id)
+        self._est_bytes -= DOC_BASE_COST + len(doc.text) * 2 + len(tf) * 60
+        self._version += 1
+
+    def associate(self, doc_id: int, text: str, weight: int = 2) -> int:
+        """質問文の語をこの文書に結び付ける。次から同じ聞き方で直接ヒットする。"""
+        if doc_id not in self.docs:
+            return 0
+        added = 0
+        lst = self.assoc.setdefault(doc_id, [])
+        for t in set(terms(text)):
+            if term_weight(t) < 1.0:
+                continue
             post = self.index.get(t)
-            if post:
-                post.pop(doc_id, None)
-                if not post:
-                    del self.index[t]
-        self._est_bytes -= DOC_BASE_COST + len(doc.text) * 2 + len(tf) * 90
+            if post is not None and _post_has(post, doc_id):
+                continue
+            self._post_add(self.index, t, doc_id, weight)
+            lst.append(t)
+            added += 1
+            self._est_bytes += 80
+        if added:
+            self._version += 1
+        return added
 
     def __len__(self) -> int:
         return len(self.docs)
@@ -92,47 +191,125 @@ class KnowledgeBase:
         return max(0, self._est_bytes)
 
     # ------------------------------------------------------------ 検索
-    def search(self, query: str, k: int = 5, exclude_sources: Iterable[str] = ()) -> list[tuple[float, Doc]]:
+    def search(self, query: str, k: int = 5, extra: dict[str, float] | None = None) -> list[tuple[float, Doc]]:
+        """BM25 検索。extra は拡張語 -> 重み (0..1)。戻り値は (スコア, 文書)。"""
         q_terms = terms(query)
         if not q_terms or not self.docs:
             return []
+        key = (query, k, tuple(sorted(extra.items())) if extra else None, self._version)
+        hit = self._cache.get(key)
+        if hit is not None:
+            self._cache.move_to_end(key)
+            return list(hit)
+        res = self._search_terms(Counter(q_terms), k, extra)
+        self._cache[key] = res
+        if len(self._cache) > 64:
+            self._cache.popitem(last=False)
+        return list(res)
+
+    def _search_terms(self, qtf: Counter, k: int, extra: dict[str, float] | None) -> list[tuple[float, Doc]]:
         n = len(self.docs)
         avgdl = self.total_len / n if n else 1.0
-        scores: dict[int, float] = {}
-        excl = set(exclude_sources)
-        qtf = Counter(q_terms)
+        index = self.index
+        docs = self.docs
+        k1, b = self.k1, self.b
+        # 動的ストップ語: 文書の stop_ratio 以上に出る語は、他に語があれば飛ばす
+        limit = max(50, int(n * self.stop_ratio))
+        weighted: list[tuple[str, float, int]] = []
         for t, qc in qtf.items():
-            post = self.index.get(t)
-            if not post:
+            post = index.get(t)
+            if post is None:
                 continue
-            df = len(post)
+            weighted.append((t, min(qc, 2), _post_len(post)))
+        if extra:
+            for t, w in extra.items():
+                post = index.get(t)
+                if post is not None and t not in qtf:
+                    weighted.append((t, w, _post_len(post)))
+        if not weighted:
+            return []
+        informative = [x for x in weighted if x[2] <= limit]
+        if informative:
+            weighted = informative
+        scores: dict[int, float] = {}
+        cover: dict[int, float] = {}
+        total_w = sum(term_weight(t) for t in qtf) or 1.0
+        for t, qw, df in weighted:
+            post = index[t]
             idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
-            w = idf * term_weight(t) * (1.0 + (self.phrase_bonus - 1.0) * (len(t) >= 3 or (len(t) == 2 and not _is_kana_bigram(t))))
-            for doc_id, tf in post.items():
-                doc = self.docs[doc_id]
-                denom = tf + self.k1 * (1 - self.b + self.b * doc.length / avgdl)
-                s = w * tf * (self.k1 + 1) / denom
-                scores[doc_id] = scores.get(doc_id, 0.0) + s * min(qc, 2)
+            tw = term_weight(t)
+            w = idf * tw * (1.0 + (self.phrase_bonus - 1.0) * (len(t) >= 3 or (len(t) == 2 and not _is_kana_bigram(t))))
+            in_query = t in qtf
+            for doc_id, tf in _post_items(post):
+                doc = docs.get(doc_id)
+                if doc is None:
+                    continue
+                denom = tf + k1 * (1 - b + b * doc.length / avgdl)
+                scores[doc_id] = scores.get(doc_id, 0.0) + w * qw * tf * (k1 + 1) / denom
+                if in_query:
+                    cover[doc_id] = cover.get(doc_id, 0.0) + tw
         if not scores:
             return []
-        # クエリ語のカバー率で正規化 (どれだけの語が一致したか)
         ranked = []
-        total_w = sum(term_weight(t) for t in qtf) or 1.0
         for doc_id, s in scores.items():
-            doc = self.docs[doc_id]
-            if doc.source in excl:
-                continue
-            matched = sum(term_weight(t) for t in qtf if doc_id in self.index.get(t, ()))
-            cover = matched / total_w
-            s = s * (0.5 + cover) + 0.15 * doc.score
-            ranked.append((s, doc))
+            doc = docs[doc_id]
+            c = cover.get(doc_id, 0.0) / total_w
+            ranked.append((s * (0.5 + c) + 0.15 * doc.score, doc))
         ranked.sort(key=lambda x: (-x[0], -x[1].added))
         return ranked[:k]
+
+    def coverage(self, doc_id: int, query: str) -> float:
+        """クエリ語の情報量重み付きカバー率 (0..1)。"""
+        q = set(terms(query))
+        if not q:
+            return 0.0
+        total = sum(term_weight(t) for t in q) or 1.0
+        index = self.index
+        got = 0.0
+        for t in q:
+            post = index.get(t)
+            if post is not None and _post_has(post, doc_id):
+                got += term_weight(t)
+        return got / total
+
+    def related_terms(self, term: str, k: int = 3, max_docs: int = 40) -> list[tuple[str, float]]:
+        """term と共起しやすい語 (分布的な関連語)。学習時には何も計算しない。"""
+        post = self.index.get(term)
+        if post is None or len(self.docs) < 20:
+            return []
+        n = len(self.docs)
+        df_t = _post_len(post)
+        ids = [d for d, _ in _post_items(post)][-max_docs:]
+        co: Counter = Counter()
+        for doc_id in ids:
+            doc = self.docs.get(doc_id)
+            if doc is None:
+                continue
+            for u in set(terms(doc.text)):
+                if u != term and is_phrase(u) and u not in term and term not in u:
+                    co[u] += 1
+        # 部分文字列 (カタカナ bigram など) は、それを含むより長い候補があれば捨てる
+        top = [u for u, _ in co.most_common(60)]
+        keep = [u for u in top if not any(len(v) > len(u) and u in v for v in top)]
+        out = []
+        for u in keep:
+            c = co[u]
+            pu = self.index.get(u)
+            df_u = _post_len(pu) if pu is not None else 0
+            if df_u < 2 or c < 2:
+                continue
+            # PMI 風: 共起 / 期待共起
+            pmi = math.log((c * n) / (df_t * df_u) + 1e-9)
+            if pmi > 0.5:
+                out.append((u, pmi * min(1.0, c / 5.0)))
+        out.sort(key=lambda x: -x[1])
+        return out[:k]
 
     def feedback(self, doc_id: int, delta: float) -> None:
         d = self.docs.get(doc_id)
         if d:
             d.score = max(-5.0, min(20.0, d.score + delta))
+            self._version += 1
 
     # ------------------------------------------------------------ 圧縮
     def evict(self, n: int) -> int:
@@ -140,11 +317,12 @@ class KnowledgeBase:
         if n <= 0 or not self.docs:
             return 0
         now = time.time()
-        # 低スコア・古い順。ユーザーが教えた文は残しやすくする。
+
         def key(d: Doc):
             age = (now - d.added) / 86400.0
             protect = 3.0 if d.source in ("user", "chat", "seed") else 0.0
             return d.score + protect - age * 0.2
+
         victims = sorted(self.docs.values(), key=key)[:n]
         for d in victims:
             self.remove(d.id)
@@ -167,7 +345,7 @@ class KnowledgeBase:
 
     def sparse_terms(self, n: int, rng: random.Random, min_len: int = 2) -> list[str]:
         """出現文書数が少ない (知識が薄い) 語をサンプリングして返す。"""
-        cands = [t for t, post in self.index.items() if len(post) <= 2 and len(t) >= min_len and not _is_kana_bigram(t)]
+        cands = [t for t, post in self.index.items() if _post_len(post) <= 2 and len(t) >= min_len and is_phrase(t)]
         if not cands:
             return []
         return rng.sample(cands, min(n, len(cands)))
@@ -179,6 +357,7 @@ class KnowledgeBase:
         return {
             "docs": len(self.docs),
             "terms": len(self.index),
+            "assoc": len(self.assoc),
             "k1": round(self.k1, 3),
             "b": round(self.b, 3),
             "phrase_bonus": round(self.phrase_bonus, 3),

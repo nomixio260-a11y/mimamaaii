@@ -129,6 +129,14 @@ def term_weight(t: str) -> float:
     return 1.0
 
 
+_PHRASE_RE = re.compile(rf"[{_KANJI}\u30a0-\u30ff]{{2,}}|[a-z][a-z0-9_'’]{{2,}}")
+
+
+def is_phrase(t: str) -> bool:
+    """「話題語」として意味を持つ語か (漢字/カタカナ 2 文字以上の連続、または 3 文字以上のラテン語)。"""
+    return bool(_PHRASE_RE.fullmatch(t)) and t not in STOPWORDS_EN
+
+
 def keywords(text: str, limit: int = 6) -> list[str]:
     """人間に見せたり検索クエリに使う「話題語」。漢字/カタカナ連続語とラテン語を優先。"""
     text = normalize(text)
