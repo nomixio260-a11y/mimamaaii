@@ -22,7 +22,12 @@ _WORD_RE = re.compile(
     r"|[가-힯]"             # ハングル
     r"|[^\sA-Za-z0-9_'’぀-ヿㇰ-ㇿ㐀-䶿一-鿿々〆가-힯]"
 )
-_SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?])\s*|(?<=[.])\s+(?=[A-Z0-9])|\n+")
+# 文末: 。！？ の後 (ただし閉じ括弧・引用符が続けばその後)、英語のピリオド + 空白 + 大文字、改行
+_SENT_SPLIT_RE = re.compile(
+    r"(?<=[。！？!?])(?![」』）)】])\s*"                       # 。！？ の後 (閉じ括弧が続く時は区切らない)
+    r"|(?<=\.)(?<!Mr\.)(?<!Mrs\.)(?<!Dr\.)(?<!Ms\.)(?<!St\.)(?<!No\.)(?<!vs\.)(?<!etc\.)(?<!Jr\.)(?<!Prof\.)(?<!Inc\.)(?<!Ltd\.)\s+(?=[A-Z0-9])"  # 英語のピリオド (略語を除く)
+    r"|\n+"
+)
 _SPACE_RE = re.compile(r"[ \t　]+")
 
 _KANA = "぀-ヿㇰ-ㇿ"
@@ -44,9 +49,13 @@ STOPWORDS_KANA = set("はがのをにへとでもやかなねよねぇーっぁ�
 
 
 def normalize(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text)
-    text = text.replace("\r", "\n")
-    return _SPACE_RE.sub(" ", text).strip()
+    if not unicodedata.is_normalized("NFKC", text):
+        text = unicodedata.normalize("NFKC", text)
+    if "\r" in text:
+        text = text.replace("\r", "\n")
+    if "  " in text or "\t" in text or "\u3000" in text:
+        text = _SPACE_RE.sub(" ", text)
+    return text.strip()
 
 
 def split_sentences(text: str) -> list[str]:
@@ -55,7 +64,11 @@ def split_sentences(text: str) -> list[str]:
     for s in _SENT_SPLIT_RE.split(text):
         s = s.strip()
         if len(s) >= 4:
-            out.append(s)
+            # 「」で始まり閉じない断片は前の文に付ける (会話の引用が途中で切れるのを防ぐ)
+            if out and s[0] in "」』）)" :
+                out[-1] += s
+            else:
+                out.append(s)
     return out
 
 

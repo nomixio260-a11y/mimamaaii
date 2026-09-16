@@ -21,8 +21,10 @@ class Config:
     memory_mb: int = field(default_factory=lambda: _env_int("TINYAI_MEMORY_MB", 256))
     # OS レベルの強制上限 (RLIMIT) も掛けるか
     hard_limit: bool = True
-    # 言語モデルの最大 n-gram 次数 (これより高い次数は保存しない)
-    max_order: int = 4
+    # 言語モデルの最大 n-gram 次数 (これより高い次数は保存しない)。
+    # tools/experiment.py の結果: 数千文規模では 4 次は 3 次とパープレキシティが同じで、
+    # エントリ数 1.8 倍・学習時間 1.6 倍。大規模コーパスなら 4 に上げる。
+    max_order: int = _env_int("TINYAI_MAX_ORDER", 3)
     # 知識ベースに保持する最大文数 (メモリ予算とどちらか厳しい方)
     max_docs: int = 60000
     # Web 探索
@@ -33,6 +35,8 @@ class Config:
     user_agent: str = "tinyai/0.1 (+https://github.com/nomixio260-a11y/mimamaaii; self-learning toy bot)"
     # 自律学習ループ
     evolve_interval: float = 20.0      # 秒。1 サイクルごとの休止
+    prefetch_workers: int = field(default_factory=lambda: _env_int("TINYAI_WORKERS", 2))  # 先読みスレッド数
+    prefetch_depth: int = 4            # 先読みして貯めておくバッチ数
     evolve_every: int = 3              # 何サイクルごとにパラメータ進化を試すか
     holdout_size: int = 300            # 自己評価用に取り置く文の数
     save_every: int = 5                # 何サイクルごとに保存するか

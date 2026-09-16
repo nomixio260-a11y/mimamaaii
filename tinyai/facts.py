@@ -57,9 +57,30 @@ _BAD_SUBJ = re.compile(r"^(これ|それ|あれ|この|その|あの|ここ|そ�
 _RELATION_ALIASES = {
     "definition": ("とは", "定義", "意味", "what", "definition"),
     "is": ("とは", "何", "what"),
-    "location": ("場所", "所在地", "位置", "どこ", "where"),
-    "event": ("いつ", "年", "設立", "誕生", "創業", "when", "founded", "born"),
+    "location": ("場所", "所在地", "位置", "どこ", "where", "本社", "所在"),
+    "event": ("いつ", "年", "設立", "誕生", "創業", "when", "founded", "born", "built", "created", "established"),
 }
+# 同じ意味の属性名 (英日・同義語)。lookup で相互に引ける
+_ATTR_SYNONYMS = [
+    ("creator", "author", "作者", "開発者", "創始者", "考案者", "設計者", "著者", "作った人"),
+    ("founder", "創業者", "創設者", "設立者"),
+    ("capital", "首都"),
+    ("height", "高さ", "標高", "身長"),
+    ("population", "人口"),
+    ("area", "面積", "広さ"),
+    ("length", "長さ", "全長"),
+    ("president", "ceo", "社長", "代表", "代表者"),
+    ("headquarters", "本社", "本部", "所在地"),
+    ("birthday", "誕生日", "生年月日"),
+    ("name", "名前", "名称"),
+    ("advantage", "利点", "長所", "メリット"),
+    ("purpose", "目的", "用途"),
+]
+_SYNONYM_OF: dict[str, frozenset] = {}
+for _grp in _ATTR_SYNONYMS:
+    _fs = frozenset(_grp)
+    for _w in _grp:
+        _SYNONYM_OF[_w] = _fs
 
 
 def _clean(s: str) -> str:
@@ -89,6 +110,10 @@ def extract_facts(sentence: str) -> list[tuple[str, str, str]]:
         g = [(_clean(x) if x else "") for x in m.groups()]
         if kind == "attr" and not ascii_:
             subj, rel, obj = g[0], g[1], g[2]
+            m2 = re.search(r"(に位置する|にある|にあります|に属する)$", obj)
+            if m2:
+                obj = obj[: m2.start()]
+                rel = rel if rel not in ("場所", "所在地", "位置") else "location"
         elif kind == "attr" and ascii_:
             rel, subj, obj = g[0].lower(), g[1], g[2]
         elif kind == "attr2":
@@ -127,7 +152,12 @@ def parse_question(text: str) -> tuple[str, str] | None:
         return None
     m = _JA_ATTR_Q.match(t)
     if m:
-        subj, rel = _clean(m.group(1)), re.sub(r"(は|って|を)$", "", m.group(2))
+        subj, rel = _clean(m.group(1)), re.sub(r"(は誰|はいつ|はどこ|は何|はなに|は|って|を)$", "", m.group(2))
+        if "の" in rel:  # 「AのBのC」: 最後の C が属性、手前は主語の連鎖
+            parts = [x for x in rel.split("の") if x]
+            if len(parts) >= 2:
+                subj = subj + "の" + "の".join(parts[:-1])
+                rel = parts[-1]
         if rel and not _BAD_SUBJ.match(subj):
             return subj, rel
     m = _JA_WH_Q.match(t)
@@ -203,20 +233,46 @@ class FactStore:
         if out:
             return out
         aliases = {r for r, names in _RELATION_ALIASES.items() if rel in names}
+        aliases |= _SYNONYM_OF.get(rel, frozenset())
         out = [f for f in lst if f[0] in aliases]
         if out:
             return out
         # 属性名が関係名の一部 (「高さ」 と 「最高高さ」)
         return [f for f in lst if len(rel) >= 2 and (rel in f[0] or f[0] in rel)]
 
+    def resolve_chain(self, subject: str, relations: list[str]) -> tuple[str, list[tuple[str, str, str, int]]] | None:
+        """subject に relations を順に適用して辿る (多段推論)。途中経過も返す。"""
+        cur = subject
+        trail = []
+        for rel in relations:
+            facts = self.lookup(cur, rel)
+            if not facts:
+                return None
+            r, obj, doc_id = facts[0]
+            trail.append((cur, r, obj, doc_id))
+            cur = _clean(obj)
+        return cur, trail
+
     def answer(self, question: str) -> tuple[str, int] | None:
-        """質問に事実で答えられれば (文, doc_id)。"""
+        """質問に事実で答えられれば (文, doc_id)。「AのBのCは?」は連鎖で辿る。"""
         parsed = parse_question(question)
         if not parsed:
             return None
         subj, rel = parsed
-        facts = self.lookup(subj, rel)
         ja = not question.isascii()
+        # 多段: 主語が「A の B」 の形なら A→B を先に解決する
+        if ja and "の" in subj:
+            head, *rest = subj.split("の")
+            if head and all(rest):
+                chain = self.resolve_chain(head, rest)
+                if chain is not None:
+                    mid, trail = chain
+                    facts = self.lookup(mid, rel)
+                    if facts:
+                        r, obj, doc_id = facts[0]
+                        steps = "、".join(f"{a}の{b}は{c}" for a, b, c, _ in trail)
+                        return f"{steps}なので、{self._render(mid, r, obj, ja)}", doc_id
+        facts = self.lookup(subj, rel)
         if not facts and rel == "definition":
             # 定義そのものが無くても、知っている事実を 2 つまで並べて答える
             facts = self.lookup(subj)[:2]
@@ -227,6 +283,9 @@ class FactStore:
         if not facts:
             return None
         relation, obj, doc_id = facts[0]
+        # 質問の言語と保存した関係名の言語が違えば、質問側の語で表現する (creator ↔ 作者)
+        if relation not in ("definition", "is", "location", "event") and relation.isascii() != rel.isascii():
+            relation = rel
         return self._render(subj, relation, obj, ja), doc_id
 
     @staticmethod

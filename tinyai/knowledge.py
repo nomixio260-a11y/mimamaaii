@@ -14,7 +14,6 @@
 """
 from __future__ import annotations
 
-import hashlib
 import math
 import random
 import re
@@ -28,18 +27,19 @@ DOC_BASE_COST = 200
 TF_BITS = 8
 TF_MAX = (1 << TF_BITS) - 1
 _JUNK_RE = re.compile(r"[\[\]{}|<>=_*#@^~\\]")
+_NON_ALNUM_RE = re.compile(r"[\W_]+")
+_DIGIT_RE = re.compile(r"\d")
 
 
 def is_junk(text: str) -> bool:
-    """学習する価値の低い文かどうか。"""
+    """学習する価値の低い文かどうか (正規表現だけで判定、1 文あたり数 µs)。"""
     n = len(text)
     if n < 4:
         return True
-    alnum = sum(1 for ch in text if ch.isalnum())
+    alnum = n - sum(len(m) for m in _NON_ALNUM_RE.findall(text))
     if alnum / n < 0.55:
         return True
-    digits = sum(1 for ch in text if ch.isdigit())
-    if digits / n > 0.4:
+    if len(_DIGIT_RE.findall(text)) / n > 0.4:
         return True
     if len(_JUNK_RE.findall(text)) > 2:
         return True
@@ -87,7 +87,8 @@ class KnowledgeBase:
         self.stop_ratio = stop_ratio      # これ以上の文書に出る語は (他に語があれば) 無視
         self.docs: dict[int, Doc] = {}
         self.index: dict[str, dict[int, int]] = {}
-        self.hashes: set[str] = set()
+        self.hashes: set[int] = set()
+        self.content_keys: set[int] = set()  # 近似重複判定用 (情報量の高い語の集合のハッシュ)
         self.assoc: dict[int, list[str]] = {}  # doc_id -> 結び付けた追加の語
         self.next_id = 1
         self.total_len = 0
@@ -98,20 +99,35 @@ class KnowledgeBase:
 
     # ------------------------------------------------------------ 追加/削除
     @staticmethod
-    def _hash(text: str) -> str:
-        return hashlib.blake2b(text.strip().lower().encode("utf-8"), digest_size=8).hexdigest()
+    def _hash(text: str) -> int:
+        # プロセス内で一貫していればよい (保存時は文書を再追加して作り直す)
+        return hash(text.strip().lower())
+
+    @staticmethod
+    def _content_key(tf: Counter) -> int | None:
+        """情報量の高い語 (句) の集合から作る鍵。語順や助詞が違うだけの文は同じ鍵になる。"""
+        # 句 (漢字/カタカナ語・英単語) と数字・英数字トークンが文の「中身」。かな bigram は無視
+        items = sorted(t for t in tf if is_phrase(t) or (t.isascii() and len(t) >= 2))
+        if len(items) < 3:
+            return None
+        return hash(tuple(items))
 
     def add(self, text: str, source: str = "", tf: Counter | None = None, quality: float = 0.5) -> Doc | None:
         text = text.strip()
-        if len(text) < 4 or len(text) > 600 or is_junk(text):
+        if len(text) < 4 or len(text) > 600:
             return None
         h = self._hash(text)
-        if h in self.hashes:
+        if h in self.hashes or is_junk(text):
             return None
         if tf is None:
             tf = Counter(terms(text))
         if not tf:
             return None
+        ck = self._content_key(tf)
+        if ck is not None:
+            if ck in self.content_keys:
+                return None  # 近似重複 (同じ句の集合を持つ文が既にある)
+            self.content_keys.add(ck)
         doc = Doc(self.next_id, text, source[:120], time.time(), sum(tf.values()))
         doc.quality = quality
         self.next_id += 1
@@ -164,6 +180,9 @@ class KnowledgeBase:
         self.hashes.discard(self._hash(doc.text))
         self.total_len -= doc.length
         tf = Counter(terms(doc.text))
+        ck = self._content_key(tf)
+        if ck is not None:
+            self.content_keys.discard(ck)
         extra = self.assoc.pop(doc_id, ())
         for t in list(tf) + list(extra):
             self._post_remove(t, doc_id)

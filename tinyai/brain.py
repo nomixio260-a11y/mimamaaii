@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Iterable
 
 from .config import Config
+from .brain_types import question_type, _rerank_bonus  # noqa: F401
+from .evolution import Evolution, Params
 from .facts import FactStore, extract_facts
 from .knowledge import KnowledgeBase, Doc
 from .lm import NGramLM
@@ -52,43 +54,10 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SAVE_NAME = "brain.pkl.gz"
 MAX_TIGHTEN = 6  # 予算を締める回数の上限 (0.8^6 ≈ 26%)
 STRATEGIES = ("gap", "curiosity", "sparse", "seed", "interest")
+_NOT_TOPICS = {"tinyai", "http", "https", "www", "com", "html", "wiki", "wikipedia", "inbox", "sources", "feeds"}
 _QUALITY_DEF_RE = re.compile(r"とは|である|です|のこと|を指す|is a|is an|is the|refers to|was a|は、")
 _QUALITY_NUM_RE = re.compile(r"\d")
 _QUALITY_PHRASE_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u30a0-\u30ff]{2,}|[A-Za-z][A-Za-z0-9]{2,}")
-
-
-# ---------------------------------------------------------------- 進化するパラメータ
-@dataclass
-class Params:
-    use_order: int = 3            # LM で使う n-gram 次数
-    discount: float = 0.75        # 絶対ディスカウント
-    k1: float = 1.4               # BM25
-    b: float = 0.6
-    phrase_bonus: float = 1.5
-    expand_weight: float = 0.4    # 関連語によるクエリ拡張の重み
-    rerank_weight: float = 0.1    # 質問タイプ別リランクの重み (👍/👎 を通じて進化で調整)
-    answer_threshold: float = 0.45
-    temperature: float = 0.8
-
-    def mutate(self, rng: random.Random, max_order: int, sigma: float = 1.0) -> "Params":
-        p = replace(self)
-        which = rng.choice(["use_order", "discount", "k1", "b", "phrase_bonus", "expand_weight", "rerank_weight", "discount", "k1"])
-        g = lambda sd: rng.gauss(0, sd * sigma)  # noqa: E731
-        if which == "use_order":
-            p.use_order = max(2, min(max_order, p.use_order + rng.choice([-1, 1])))
-        elif which == "discount":
-            p.discount = min(0.98, max(0.3, p.discount + g(0.08)))
-        elif which == "k1":
-            p.k1 = min(3.0, max(0.5, p.k1 + g(0.2)))
-        elif which == "b":
-            p.b = min(1.0, max(0.0, p.b + g(0.1)))
-        elif which == "phrase_bonus":
-            p.phrase_bonus = min(4.0, max(1.0, p.phrase_bonus + g(0.3)))
-        elif which == "expand_weight":
-            p.expand_weight = min(1.0, max(0.0, p.expand_weight + g(0.1)))
-        elif which == "rerank_weight":
-            p.rerank_weight = min(0.6, max(0.0, p.rerank_weight + g(0.05)))
-        return p
 
 
 @dataclass
@@ -99,53 +68,6 @@ class Reply:
     sources: list
     doc_ids: list
     learned_topics: list
-
-
-# ---------------------------------------------------------------- 質問タイプ
-_QTYPE_PATTERNS = [
-    ("when", re.compile(r"いつ|何年|何月|何日|何世紀|\bwhen\b|what year", re.I)),
-    ("where", re.compile(r"どこ|何処|どちら|\bwhere\b", re.I)),
-    ("howmany", re.compile(r"いくつ|いくら|何人|何個|何回|何歳|どれくらい|どのくらい|高さ|長さ|広さ|人口|距離|面積|重さ|速さ|how (many|much|tall|long|far|old|big|fast)", re.I)),
-    ("who", re.compile(r"誰|だれ|\bwho\b", re.I)),
-    ("why", re.compile(r"なぜ|何故|どうして|\bwhy\b", re.I)),
-    ("definition", re.compile(r"とは|って何|ってなに|とは何|何ですか|なんですか|何のこと|意味|what is|what are|what's|define|explain|教えて", re.I)),
-]
-_YEAR_RE = re.compile(r"\d{3,4}\s*年|\d+\s*世紀|\b1\d{3}\b|\b20\d{2}\b|年代|月|日")
-_PLACE_RE = re.compile(r"[都道府県市区町村国島湾山川洲]|に位置|にある|located|\bin\b")
-_NUMBER_RE = re.compile(r"\d[\d,.]*\s*(m|km|メートル|キロ|人|個|km2|km²|平方|トン|kg|グラム|秒|分|時間|年|歳|倍|%|パーセント|円|ドル|億|万|千)")
-_WHO_RE = re.compile(r"氏|さん|博士|教授|作家|学者|者|創業|設立|発明|開発|by\b|founded|invented")
-
-
-def question_type(text: str) -> str:
-    for name, pat in _QTYPE_PATTERNS:
-        if pat.search(text):
-            return name
-    return "definition" if is_question(text) else "none"
-
-
-def _rerank_bonus(qtype: str, doc_text: str, subject: str | None) -> float:
-    """質問タイプに合う文に加点 (0..1)。"""
-    b = 0.0
-    if qtype == "definition":
-        if subject:
-            head = doc_text[: len(subject) + 4]
-            if head.startswith(subject) or subject in head:
-                b += 0.6
-            if re.search(re.escape(subject) + r"\s*(とは|は|が|、|は、|とは、|\(|（)", doc_text):
-                b += 0.4
-        if re.search(r"とは|である|です|のこと|を指す|refers to|is a|is the|は、", doc_text):
-            b += 0.2
-    elif qtype == "when":
-        b += 1.0 if _YEAR_RE.search(doc_text) else 0.0
-    elif qtype == "where":
-        b += 1.0 if _PLACE_RE.search(doc_text) else 0.0
-    elif qtype == "howmany":
-        b += 1.0 if _NUMBER_RE.search(doc_text) else (0.3 if re.search(r"\d", doc_text) else 0.0)
-    elif qtype == "who":
-        b += 0.8 if _WHO_RE.search(doc_text) else 0.0
-    elif qtype == "why":
-        b += 0.8 if re.search(r"ため|から|ので|理由|原因|because|due to", doc_text) else 0.0
-    return min(b, 1.0)
 
 
 def sentence_quality(text: str, has_fact: bool = False) -> float:
@@ -194,10 +116,7 @@ class Brain:
         self.kb.on_remove = self.facts.remove_doc
         self.params = Params(use_order=min(3, self.cfg.max_order))
         self._apply_params()
-        self.generation = 0
-        self.fitness = None
-        self.fitness_log: deque = deque(maxlen=200)
-        self.sigma = 1.0                          # 変異幅 (適応)
+        self.evolution = Evolution(self)          # 世代・適応度・変異幅はここが持つ
         self.holdout: list[list[str]] = []
         self._holdout_counter = 0
         self.gaps: deque = deque(maxlen=200)      # 調べたい話題
@@ -212,6 +131,7 @@ class Brain:
         self.stats: Counter = Counter()
         self.history: deque = deque(maxlen=20)
         self.last_docs: list[int] = []
+        self._said: deque = deque(maxlen=12)      # 最近答えに使った文書 (「もっと詳しく」で繰り返さない)
         self.last_mode = ""
         self.last_question = ""
         self.last_topics: list[str] = []
@@ -279,11 +199,12 @@ class Brain:
 
     def _learn_sentences(self, sentences, source: str) -> int:
         added = 0
-        from_web = source.startswith("http")
+        # 自己評価用の取り置きは、長い Web 文書からだけ (短い入力は 1 文が重要なので全部学ぶ)
+        holdout_ok = source.startswith("http") and len(sentences) >= 40
         kb, lm = self.kb, self.lm
         for s in sentences:
             self._holdout_counter += 1
-            if from_web and self._holdout_counter % 40 == 0:
+            if holdout_ok and self._holdout_counter % 40 == 0:
                 toks = tokenize(s)
                 if len(toks) >= 4:
                     if len(self.holdout) < self.cfg.holdout_size:
@@ -453,7 +374,7 @@ class Brain:
 
     def _good_topic(self, t: str) -> bool:
         """探索する価値のある話題語か。英語の一般語 (things, lovers) を避ける。"""
-        if not is_phrase(t):
+        if not is_phrase(t) or t.lower() in _NOT_TOPICS:
             return False
         if t.isascii():
             return len(t) >= 4 and not t.isdigit() and len(self.kb.posting_ids(t)) >= 2
@@ -546,6 +467,7 @@ class Brain:
                     self.add_gap(t)
             reply.learned_topics = [t for t in topics if t in self.gaps]
             self.last_docs = reply.doc_ids
+            self._said.extend(reply.doc_ids)
             self.last_mode = reply.mode
             self.last_question = text
             if topics:
@@ -634,7 +556,18 @@ class Brain:
             ids.append(nxt.id)
             if sum(len(x) for x in parts) > 240:
                 break
+        if not parts and self.last_topics:
+            # 続きの文が無ければ、同じ話題についてまだ言っていない文を探す
+            query = " ".join(self.last_topics)
+            for conf, d in self._confidences(self.kb.search(query, k=8), query, None):
+                if conf >= self.params.answer_threshold * 0.8 and d.id not in self._said and d.id != last.id:
+                    parts.append(d.text)
+                    ids.append(d.id)
+                    last = d
+                    break
         if not parts:
+            for t in self.last_topics:
+                self.add_gap(t)
             return Reply("それについてはこれ以上知りません。調べておきます。" if ja else "That's all I know about it for now. I'll look it up.", 0.2, "generate", [], [], [])
         self.stats["continued"] += 1
         return Reply(" ".join(parts), 0.8, "recall", [last.source], ids, [])
@@ -750,71 +683,44 @@ class Brain:
         self.stats["taught"] += n
         return Reply(f"覚えました ({n} 文)。" if ja else f"Got it ({n} sentences).", 1.0, "command", [], [], [])
 
-    # ------------------------------------------------------------ 自己評価と進化
-    def _retrieval_selftest(self, rng: random.Random, n: int = 40) -> float:
-        docs = self.kb.random_docs(n, rng)
-        if not docs:
-            return 0.0
-        hit = 0
-        for d in docs:
-            ts = terms(d.text)
-            if len(ts) < 2:
-                continue
-            q = [t for i, t in enumerate(ts) if i % 2 == 0]
-            res = self.kb.search(" ".join(q), k=3)
-            if any(x.id == d.id for _, x in res):
-                hit += 1
-        return hit / len(docs)
-
-    def _qa_score(self) -> float:
-        """ユーザーの 👍/👎 と教えた答えが、今のパラメータで再現できる割合 (-1..1)。"""
-        if not self.qa_log:
-            return 0.0
-        s = 0.0
-        n = 0
-        for q, doc_id, sign in list(self.qa_log)[-60:]:
-            if doc_id not in self.kb.docs:
-                continue
-            hits = self._search(q, qtype=question_type(q), subject=(keywords(q, limit=1) or [None])[0], k=3)
-            top = hits[0][1].id == doc_id if hits else False
-            s += sign if top else -sign * 0.5
-            n += 1
-        return s / n if n else 0.0
-
+    # ------------------------------------------------------------ 自己評価と進化 (evolution.py に委譲)
     def evaluate(self, seed: int | None = None) -> dict:
-        rng = random.Random(seed if seed is not None else self.rng.random())
-        ppl = self.lm.perplexity(self.holdout) if self.holdout else float("nan")
-        hit = self._retrieval_selftest(rng)
-        qa = self._qa_score()
-        f = hit + 0.5 * qa - (0.1 * math.log(ppl) if ppl == ppl else 0.0)
-        return {"perplexity": round(ppl, 2) if ppl == ppl else None, "retrieval_hit": round(hit, 3), "qa": round(qa, 3), "fitness": round(f, 4)}
+        return self.evolution.evaluate(seed)
 
     def evolve_step(self) -> dict:
-        """パラメータを 1 つ変異させ、自己評価が上がれば採用する。変異幅は適応する。"""
-        with self.lock:
-            seed = self.rng.randrange(1 << 30)
-            base = self.evaluate(seed)
-            old = self.params
-            cand = old.mutate(self.rng, self.lm.max_order, self.sigma)
-            self.params = cand
-            self._apply_params()
-            new = self.evaluate(seed)
-            accepted = new["fitness"] > base["fitness"] + 1e-6
-            if accepted:
-                self.generation += 1
-                self.fitness = new
-                self.sigma = min(3.0, self.sigma * 1.5)
-                self.stats["evolutions_accepted"] += 1
-            else:
-                self.params = old
-                self._apply_params()
-                self.fitness = base
-                self.sigma = max(0.2, self.sigma * 0.9)
-            self.stats["evolutions_tried"] += 1
-            rec = {"time": time.time(), "generation": self.generation, "accepted": accepted, "before": base, "after": new, "params": asdict(self.params), "sigma": round(self.sigma, 3)}
-            self.fitness_log.append(rec)
-            log.info("進化 gen=%d accepted=%s %s -> %s", self.generation, accepted, base, new)
-            return rec
+        return self.evolution.step()
+
+    @property
+    def generation(self) -> int:
+        return self.evolution.generation
+
+    @generation.setter
+    def generation(self, v: int) -> None:
+        self.evolution.generation = v
+
+    @property
+    def sigma(self) -> float:
+        return self.evolution.sigma
+
+    @sigma.setter
+    def sigma(self, v: float) -> None:
+        self.evolution.sigma = v
+
+    @property
+    def fitness(self):
+        return self.evolution.fitness
+
+    @fitness.setter
+    def fitness(self, v) -> None:
+        self.evolution.fitness = v
+
+    @property
+    def fitness_log(self) -> deque:
+        return self.evolution.log
+
+    @fitness_log.setter
+    def fitness_log(self, v) -> None:
+        self.evolution.log = deque(v, maxlen=200)
 
     # ------------------------------------------------------------ 整理 (人の睡眠中の記憶整理に相当)
     def consolidate(self) -> dict:

@@ -69,38 +69,68 @@ class NGramLM:
 
     # ------------------------------------------------------------ 学習
     def learn(self, tokens: Sequence[str]) -> int:
+        """次数ごとにストリーミングでカウントする。文脈キーは前の位置のキーから
+        シフトと加算で作るので、位置ごとにタプルを組み立てるより速い。"""
         if not tokens:
             return 0
-        ids = [BOS] + [self._id(t) for t in tokens] + [EOS]
+        vocab = self.vocab
+        words = self.words
+        ids = [BOS]
+        for t in tokens:
+            i = vocab.get(t)
+            if i is None:
+                if len(words) >= MAX_VOCAB:
+                    i = UNK
+                else:
+                    i = len(words)
+                    vocab[t] = i
+                    words.append(t)
+            ids.append(i)
+        ids.append(EOS)
         ctx = self.ctx
         cont = self.cont
-        max_order = self.max_order
-        new = 0
         one = 1 << TOKEN_BITS
-        for i in range(1, len(ids)):
+        mask = TOKEN_MASK
+        L = len(ids)
+        new = 0
+        # 次数 0 (unigram)
+        uni = ctx[0]
+        for i in range(1, L):
             tok = ids[i]
-            key = 0
-            for n in range(max_order):
-                if n:
-                    if i - n < 0:
-                        break
-                    key += 1 + (ids[i - n] << (4 + TOKEN_BITS * (n - 1)))
+            c = uni.get(tok)
+            if c is None:
+                uni[tok] = 1
+                new += 1
+            else:
+                uni[tok] = c + 1
+        uni[-1] += L - 1
+        # 次数 n ≥ 1: key = n | ids[i-1]<<4 | ids[i-2]<<24 | ...
+        for n in range(1, self.max_order):
+            if L - 1 < n + 1:
+                break
+            shift_new = 4 + TOKEN_BITS * (n - 1)  # 最も古いトークンのスロット
+            # 位置 i = n のキーを直接作る
+            key = n
+            for j in range(1, n + 1):
+                key |= ids[n - j] << (4 + TOKEN_BITS * (j - 1))
+            for i in range(n, L):
+                if i > n:
+                    # 1 つ進める: 最も新しいトークン ids[i-1] を最下位スロットへ、最古を捨てる
+                    key = n | ((key >> 4) << (4 + TOKEN_BITS) & ((1 << (4 + TOKEN_BITS * n)) - 1)) | (ids[i - 1] << 4)
+                tok = ids[i]
                 d = ctx.get(key)
                 if d is None:
-                    if n == 0:
-                        ctx[key] = {-1: 1, tok: 1}
-                    else:
-                        ctx[key] = tok | one  # 単一後続トークンの圧縮表現
+                    ctx[key] = tok | one
                     new += 1
                     if n == 1:
                         cont[tok] = cont.get(tok, 0) + 1
                         self.cont_total += 1
                 elif type(d) is int:
-                    if (d & TOKEN_MASK) == tok:
+                    if (d & mask) == tok:
                         ctx[key] = d + one
                     else:
                         cnt = d >> TOKEN_BITS
-                        ctx[key] = {-1: cnt + 1, d & TOKEN_MASK: cnt, tok: 1}
+                        ctx[key] = {-1: cnt + 1, d & mask: cnt, tok: 1}
                         new += 1
                         if n == 1:
                             cont[tok] = cont.get(tok, 0) + 1

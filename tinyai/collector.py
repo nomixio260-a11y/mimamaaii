@@ -61,7 +61,7 @@ class SourceHealth:
 
 
 class Collector:
-    def __init__(self, fetcher: Fetcher | None, data_dir: Path, languages: Iterable[str] = ("ja", "en"), interest: Callable[[str], float] | None = None, prefetch: int = 3):
+    def __init__(self, fetcher: Fetcher | None, data_dir: Path, languages: Iterable[str] = ("ja", "en"), interest: Callable[[str], float] | None = None, prefetch: int = 3, workers: int = 2):
         self.fetcher = fetcher
         self.data_dir = Path(data_dir)
         self.languages = tuple(languages)
@@ -75,7 +75,8 @@ class Collector:
         self.topic_fn: Callable[[], str | None] | None = None
         self._stop = threading.Event()
         self._poke = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._threads: list[threading.Thread] = []
+        self.workers = workers
         self.lock = threading.RLock()  # pop_link -> _mark_seen で再入する
         self.stats = {"batches": 0, "pages": 0, "frontier_reads": 0, "feed_items": 0}
 
@@ -175,10 +176,49 @@ class Collector:
                 break
         return out
 
+    def _wikidata(self, topic: str, lang: str, max_pages: int) -> list[tuple[str, str, list]]:
+        """Wikidata の検索 API: 項目のラベルと説明文を「X とは、Y である」の定義文にして返す。"""
+        f = self.fetcher
+        q = urllib.parse.quote(topic)
+        js = f.get_json(f"https://www.wikidata.org/w/api.php?action=wbsearchentities&search={q}&language={lang}&uselang={lang}&format=json&limit=5")
+        if not js:
+            return []
+        lines = []
+        for item in js.get("search", []):
+            label = item.get("label", "").strip()
+            desc = item.get("description", "").strip()
+            if label and desc and len(desc) > 3:
+                lines.append(f"{label}とは、{desc}である。" if lang == "ja" else f"{label} is a {desc}.")
+        if not lines:
+            return []
+        url = f"https://www.wikidata.org/wiki/Special:Search?search={q}"
+        return [(url, "\n".join(lines), [])] if self._mark_seen(url) else []
+
+    def random_article(self, lang: str = "ja") -> Batch | None:
+        """Wikipedia のランダム記事 (探索の多様性を上げる)。"""
+        if self.fetcher is None:
+            return None
+        js = self.fetcher.get_json(f"https://{lang}.wikipedia.org/w/api.php?action=query&list=random&rnnamespace=0&rnlimit=1&format=json")
+        if not js:
+            return None
+        titles = [r["title"] for r in js.get("query", {}).get("random", [])]
+        if not titles:
+            return None
+        t0 = time.time()
+        page = self.fetcher.wikimedia_page(titles[0], lang=lang)
+        pages = []
+        if page and len(page.text) > 200:
+            url = f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(titles[0])}"
+            self._mark_seen(url)
+            pages.append((url, page.text, page.anchors))
+        self._h("random").record(bool(pages), 0.0, time.time() - t0)
+        return Batch(titles[0], "random", pages, "random", time.time() - t0)
+
     def _ordered_sources(self, lang: str) -> list[tuple[str, Callable]]:
         cands = [
             (f"wikimedia:{lang}", lambda t, n, lang=lang: self._wikimedia(t, lang, n)),
             (f"wikipedia:{lang}", lambda t, n, lang=lang: self._wikipedia_action(t, lang, n)),
+            (f"wikidata:{lang}", lambda t, n, lang=lang: self._wikidata(t, lang, n)),
             ("duckduckgo", lambda t, n: self._duckduckgo(t, lang, n)),
         ]
         cands.sort(key=lambda x: -self._h(x[0]).score)
@@ -196,6 +236,8 @@ class Collector:
             for name, fn in self._ordered_sources(lang):
                 if name == "duckduckgo" and pages:
                     continue
+                if name.startswith("wikidata") and len(pages) >= max_pages - 1:
+                    continue  # Wikidata は定義文の補助。本文が十分ならスキップ
                 st = time.time()
                 try:
                     got = fn(topic, max_pages - len(pages))
@@ -298,11 +340,15 @@ class Collector:
 
     # ------------------------------------------------------------ 先読み
     def start_prefetch(self, topic_fn: Callable[[], str | None]) -> None:
-        if self.fetcher is None or self._thread is not None:
+        """先読みワーカーを起動。ワーカーごとに役割をずらす (話題検索 / フロンティア / フィード・ランダム)。
+        ホストごとの間隔は Fetcher が守るので、別ホストへの取得が並列になる。"""
+        if self.fetcher is None or self._threads:
             return
         self.topic_fn = topic_fn
-        self._thread = threading.Thread(target=self._prefetch_loop, name="tinyai-prefetch", daemon=True)
-        self._thread.start()
+        for w in range(max(1, self.workers)):
+            th = threading.Thread(target=self._prefetch_loop, args=(w,), name=f"tinyai-prefetch-{w}", daemon=True)
+            th.start()
+            self._threads.append(th)
 
     def poke(self) -> None:
         self._poke.set()
@@ -310,19 +356,21 @@ class Collector:
     def stop(self) -> None:
         self._stop.set()
         self._poke.set()
-        if self._thread is not None:
-            self._thread.join(timeout=15)
+        for th in self._threads:
+            th.join(timeout=15)
 
-    def _prefetch_loop(self) -> None:
-        turn = 0
+    def _prefetch_loop(self, worker: int = 0) -> None:
+        turn = worker
         while not self._stop.is_set():
             try:
                 turn += 1
                 batch = None
                 if turn % 5 == 0:
                     batch = self.collect_feeds()
-                if batch is None and turn % 3 == 0:
-                    batch = self.collect_link()
+                if batch is None and turn % 7 == 0:
+                    batch = self.random_article(self.languages[0] if self.languages else "ja")
+                if batch is None and (turn % 3 == 0 or worker % 2 == 1):
+                    batch = self.collect_link()  # 奇数ワーカーはフロンティア優先
                 if batch is None and self.topic_fn is not None:
                     topic = self.topic_fn()
                     batch = self.collect(topic) if topic else None
@@ -356,6 +404,6 @@ class Collector:
             "frontier": len(self.frontier),
             "seen": len(self.seen),
             "ready": self.ready.qsize(),
-            "prefetch_alive": bool(self._thread and self._thread.is_alive()),
+            "prefetch_alive": sum(1 for th in self._threads if th.is_alive()),
             **self.stats,
         }

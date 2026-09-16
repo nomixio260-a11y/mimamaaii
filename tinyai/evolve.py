@@ -28,7 +28,9 @@ class Evolver(threading.Thread):
         if fetcher is None and cfg.web_enabled and collector is None:
             fetcher = Fetcher(cfg.user_agent, cfg.fetch_timeout, cfg.max_page_bytes)
         self.fetcher = fetcher
-        self.collector = collector if collector is not None else Collector(fetcher, cfg.data_dir, cfg.languages, interest=brain.interest_score)
+        self.collector = collector if collector is not None else Collector(
+            fetcher, cfg.data_dir, cfg.languages, interest=brain.interest_score, prefetch=cfg.prefetch_depth, workers=cfg.prefetch_workers
+        )
         self.interval = cfg.evolve_interval if interval is None else interval
         self.max_cycles = max_cycles
         self.max_seconds = max_seconds

@@ -39,6 +39,8 @@ class TokenizerTest(unittest.TestCase):
 
     def test_split_sentences(self):
         self.assertEqual(split_sentences("今日は晴れ。明日は雨です！行きますか？"), ["今日は晴れ。", "明日は雨です!", "行きますか?"])
+        # 閉じ括弧は前の文に付く。英語のピリオドは大文字が続く時だけ区切る
+        self.assertEqual(split_sentences("彼は「行くよ。」と言った。Mr. Smith left. He came back."), ["彼は「行くよ。」と言った。", "Mr. Smith left.", "He came back."])
 
     def test_detokenize(self):
         self.assertEqual(detokenize(["hello", "world", "!"]), "hello world!")
@@ -136,6 +138,16 @@ class KnowledgeTest(unittest.TestCase):
         self.assertIs(type(kb.index["オメガシグマ"]), int)
         self.assertEqual(kb.posting_ids("オメガシグマ"), [kb.next_id - 1])
         self.assertTrue(any(type(p) is dict for p in kb.index.values()))
+
+    def test_near_duplicate_rejected(self):
+        kb = KnowledgeBase()
+        self.assertIsNotNone(kb.add("東京タワーの高さは 333 メートルである。", "t"))
+        self.assertIsNone(kb.add("東京タワーの高さは 333 メートルである！", "t"))      # 記号だけ違う
+        self.assertIsNone(kb.add("333 メートルである、東京タワーの高さは。", "t"))     # 語順だけ違う
+        self.assertIsNotNone(kb.add("東京タワーの高さは 333 メートル (公式) である。", "t"))  # 句が増えた
+        self.assertEqual(len(kb), 2)
+        kb.remove(1)
+        self.assertIsNotNone(kb.add("東京タワーの高さは 333 メートルである。", "t"))  # 消せば再登録できる
 
     def test_dynamic_stop_terms(self):
         kb = KnowledgeBase()
@@ -243,8 +255,16 @@ class BrainTest(unittest.TestCase):
         self.assertIn("超弦理論", self.brain.gaps)
         self.assertEqual(self.brain.next_topic(), "超弦理論")
 
+    def test_short_web_text_is_not_held_out(self):
+        # 短い文書は取り置きせず全文学ぶ (39 文までは holdout 無し)
+        text = "\n".join(f"短い項目 {i} は記録されています。" for i in range(10, 49))
+        self.brain._holdout_counter = 39  # 次の文が 40 番目
+        n = self.brain.learn_text(text, source="https://example.org/short")
+        self.assertEqual(n, 39)
+        self.assertEqual(len(self.brain.holdout), 0)
+
     def test_learn_text_and_holdout(self):
-        text = "\n".join(f"項目 {i} は第 {i} 番目の事実として記録されています。" for i in range(100))
+        text = "\n".join(f"項目 {i} は第 {i} 番目の事実として記録されています。" for i in range(10, 110))
         n = self.brain.learn_text(text, source="https://example.org/x")
         self.assertGreater(n, 90)
         self.assertGreaterEqual(len(self.brain.holdout), 1)
@@ -390,6 +410,18 @@ class FactsTest(unittest.TestCase):
     def test_quality(self):
         self.assertGreater(sentence_quality("東京タワーとは、東京都港区にある高さ 333 メートルの電波塔である。", True), sentence_quality("うん。"))
 
+    def test_multihop_and_synonyms(self):
+        fs = FactStore()
+        for i, t in enumerate(["アルファ社の本社は大阪市にある。", "大阪市の人口は約 270 万人である。", "Python の作者は Guido van Rossum である。", "大阪市の市長は横山英幸である。"]):
+            fs.add_from_sentence(t, i)
+        self.assertEqual(fs.lookup("アルファ社", "本社")[0][1], "大阪市")  # 「にある」は目的語から外れる
+        self.assertIn("270", fs.answer("アルファ社の本社の人口は？")[0])
+        self.assertIn("横山", fs.answer("アルファ社の本社の市長は誰？")[0])
+        ans = fs.answer("Who is the creator of Python?")[0]
+        self.assertIn("Guido", ans)
+        self.assertIn("creator", ans)  # 質問側の言語で関係名を表現する
+        self.assertEqual(parse_question("アルファ社の本社の人口は？"), ("アルファ社の本社", "人口"))
+
 
 class CollectorTest(unittest.TestCase):
     def test_frontier_priority_and_health(self):
@@ -416,7 +448,10 @@ class BrainMemoryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             b = make_brain(tmp)
             b.learn_text("東京タワーの高さは 333 メートルである。", "https://a/1")
-            b.learn_text("東京タワーの高さは 333 メートルである！", "https://a/2")
+            # 語順・記号だけ違う文は取り込み時点で近似重複として弾かれる
+            self.assertEqual(b.learn_text("東京タワーの高さは 333 メートルである！", "https://a/2"), 0)
+            # 少し言い回しが違う同じ事実は取り込まれ、整理で統合される
+            self.assertEqual(b.learn_text("東京タワーの高さは 333 メートル (公式) である。", "https://a/3"), 1)
             self.assertEqual(len(b.facts.lookup("東京タワー", "高さ")), 2)
             rec = b.consolidate()
             self.assertEqual(rec["merged"], 1)

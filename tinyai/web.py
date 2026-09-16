@@ -181,7 +181,7 @@ class Fetcher:
         parts = urllib.parse.urlsplit(url)
         host = parts.netloc
         # MediaWiki API はクローラ向け robots.txt の対象外 (API 利用規約に従い UA と間隔を守る)
-        if parts.path == "/w/api.php" and host.endswith((".wikipedia.org", ".wikimedia.org")):
+        if parts.path == "/w/api.php" and host.endswith((".wikipedia.org", ".wikimedia.org", "wikidata.org", ".wiktionary.org")):
             return True
         rp = self._robots.get(host, "unset")
         if rp == "unset":
