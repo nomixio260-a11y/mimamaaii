@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinyai"
+version = "0.1.0"
+description = "超小型・自己進化型の会話 AI (標準ライブラリのみ、メモリ上限つき)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+tinyai = "tinyai.cli:main"
+
+[tool.setuptools]
+packages = ["tinyai"]
+
+[tool.setuptools.package-data]
+tinyai = []

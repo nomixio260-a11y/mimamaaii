@@ -1,0 +1,51 @@
+# 自律探索の出発点となる話題。探索済みの話題は 1 週間は再訪しない。
+人工知能
+機械学習
+自然言語処理
+コンピュータ
+プログラミング言語
+Python
+インターネット
+宇宙
+太陽系
+地球
+海
+気候
+生物
+人体
+脳
+数学
+物理学
+化学
+歴史
+日本
+世界遺産
+音楽
+映画
+文学
+料理
+スポーツ
+経済
+哲学
+言語
+心理学
+天気
+植物
+動物
+科学技術
+ロボット
+医学
+健康
+睡眠
+食べ物
+交通
+都市
+artificial intelligence
+machine learning
+computer science
+history of science
+mathematics
+astronomy
+biology
+philosophy
+language
