@@ -116,6 +116,7 @@ class Evolver(threading.Thread):
                 topic = batch.topic
                 learned += brain.learn_batch(batch, col)
         self.last_topic, self.last_learned = topic, learned
+        brain.background_step(budget_docs=400)  # 意味ベクトル・接尾辞配列 (後回しの学習)
         evolved = None
         if self.cycles % cfg.evolve_every == 0 and len(brain.kb) >= 20:
             evolved = brain.evolve_step()

@@ -286,18 +286,22 @@ class KnowledgeBase:
             d.hits += 1
         return top
 
-    def coverage(self, doc_id: int, query: str) -> float:
+    def query_weights(self, query: str) -> tuple[dict[str, float], float]:
+        """クエリ語 -> 重み と合計 (coverage を何度も呼ぶ時に一度だけ計算する)。"""
+        w = {t: term_weight(t) for t in set(terms(query))}
+        return w, (sum(w.values()) or 1.0)
+
+    def coverage(self, doc_id: int, query: str, qw: tuple[dict[str, float], float] | None = None) -> float:
         """クエリ語の情報量重み付きカバー率 (0..1)。"""
-        q = set(terms(query))
-        if not q:
+        weights, total = qw if qw is not None else self.query_weights(query)
+        if not weights:
             return 0.0
-        total = sum(term_weight(t) for t in q) or 1.0
         index = self.index
         got = 0.0
-        for t in q:
+        for t, tw in weights.items():
             post = index.get(t)
             if post is not None and _post_has(post, doc_id):
-                got += term_weight(t)
+                got += tw
         return got / total
 
     def related_terms(self, term: str, k: int = 3, max_docs: int = 40) -> list[tuple[str, float]]:

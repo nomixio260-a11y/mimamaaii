@@ -31,10 +31,15 @@ class Params:
     rerank_weight: float = 0.1    # 質問タイプ別リランクの重み (👍/👎 を通じて進化で調整)
     answer_threshold: float = 0.45
     temperature: float = 0.8
+    semantic_weight: float = 0.2  # 意味ベクトルのコサインを確信度に混ぜる重み
+    suffix_weight: float = 0.7    # 生成で接尾辞配列 (最長一致) の分布を混ぜる重み
+    cache_weight: float = 0.15    # 生成で会話キャッシュ LM を混ぜる重み
+    learned_weight: float = 0.3   # 学習型リランカーの確率を確信度に混ぜる重み
 
     def mutate(self, rng: random.Random, max_order: int, sigma: float = 1.0) -> "Params":
         p = replace(self)
-        which = rng.choice(["use_order", "discount", "k1", "b", "phrase_bonus", "expand_weight", "rerank_weight", "discount", "k1"])
+        which = rng.choice(["use_order", "discount", "k1", "b", "phrase_bonus", "expand_weight", "rerank_weight", "discount", "k1",
+                            "semantic_weight", "suffix_weight", "cache_weight", "learned_weight"])
         g = lambda sd: rng.gauss(0, sd * sigma)  # noqa: E731
         if which == "use_order":
             p.use_order = max(2, min(max_order, p.use_order + rng.choice([-1, 1])))
@@ -50,6 +55,14 @@ class Params:
             p.expand_weight = min(1.0, max(0.0, p.expand_weight + g(0.1)))
         elif which == "rerank_weight":
             p.rerank_weight = min(0.6, max(0.0, p.rerank_weight + g(0.05)))
+        elif which == "semantic_weight":
+            p.semantic_weight = min(0.6, max(0.0, p.semantic_weight + g(0.08)))
+        elif which == "suffix_weight":
+            p.suffix_weight = min(0.95, max(0.0, p.suffix_weight + g(0.1)))
+        elif which == "cache_weight":
+            p.cache_weight = min(0.5, max(0.0, p.cache_weight + g(0.05)))
+        elif which == "learned_weight":
+            p.learned_weight = min(0.8, max(0.0, p.learned_weight + g(0.1)))
         return p
 
 

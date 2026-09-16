@@ -14,6 +14,11 @@ from tinyai.brain import question_type, sentence_quality
 from tinyai.collector import Batch, Collector
 from tinyai.facts import FactStore, extract_facts, parse_question
 from tinyai.knowledge import is_junk
+from tinyai.lm import CacheLM
+from tinyai.reranker import Reranker
+from tinyai.semantic import SemanticSpace
+from tinyai.suffix import SuffixIndex
+from tinyai.tokenizer import phrases
 from tinyai.tokenizer import detokenize, is_phrase, is_question, keywords, split_sentences, terms, tokenize
 from tinyai.web import html_to_text
 
@@ -469,6 +474,93 @@ class BrainMemoryTest(unittest.TestCase):
             r = b.reply("ピヨ理論について何か知ってる？")
             self.assertIn("ピヨ理論", r.text)
             self.assertEqual(len(b.notices), 0)
+
+
+class SemanticTest(unittest.TestCase):
+    def test_similar_terms_cluster(self):
+        sp = SemanticSpace()
+        rng = random.Random(0)
+        animals = ["犬", "猫", "馬", "牛"]
+        foods = ["寿司", "天ぷら", "蕎麦", "饂飩"]
+        for _ in range(300):
+            a = rng.sample(animals, 2)
+            sp.learn(["動物", a[0], "飼育", a[1], "牧場"])
+            f = rng.sample(foods, 2)
+            sp.learn(["料理", f[0], "食事", f[1], "店"])
+        sp.refresh_sketches(limit=1000)
+        near = [t for t, _ in sp.similar("犬", k=3)]
+        self.assertTrue(set(near) & set(animals))
+        self.assertFalse(set(near) & set(foods))
+        v = sp.text_vector(["犬", "猫"])
+        self.assertGreater(sp.cosine(v, sp.text_vector(["馬"])), sp.cosine(v, sp.text_vector(["寿司"])))
+        sp2 = SemanticSpace.from_state(sp.state())
+        self.assertEqual(len(sp2.vec), len(sp.vec))
+        self.assertGreater(sp.shrink_to(10 * (2 * sp.dim + 160)), 0)
+
+    def test_phrases(self):
+        self.assertEqual(phrases("機械学習とは、データから規則性を学ぶ手法である。Python is great"), ["機械学習", "データ", "規則性", "手法", "python", "great"])
+
+
+class SuffixTest(unittest.TestCase):
+    def test_continuations(self):
+        seqs = [[3, 4, 5, 6, 7], [3, 4, 5, 6, 8], [9, 4, 5, 10]]
+        si = SuffixIndex.build(seqs)
+        L, c = si.continuations([1, 3, 4, 5, 6])
+        self.assertEqual(L, 4)
+        self.assertEqual(set(c), {7, 8})
+        L, c = si.continuations([4, 5])
+        self.assertEqual(L, 2)
+        self.assertEqual(c[6], 2)
+        self.assertEqual(c[10], 1)
+        self.assertEqual(si.continuations([99, 98])[0], 0)
+
+
+class CacheAndRerankerTest(unittest.TestCase):
+    def test_cache_lm(self):
+        c = CacheLM()
+        c.push([5, 6, 7, 5, 6])
+        self.assertGreater(c.prob(5, 6), c.prob(5, 7))
+        self.assertEqual(c.prob(None, 42), 0.0)
+        c.clear()
+        self.assertEqual(c.prob(5, 6), 0.0)
+
+    def test_reranker_learns(self):
+        r = Reranker()
+        good = Reranker.features(8, 0.9, 1.0, 0.5, 0.8, 2.0, "user", 40, False, True)
+        bad = Reranker.features(2, 0.2, 0.0, 0.0, 0.3, -1.0, "https://x", 200, True, False)
+        for _ in range(30):
+            r.update(good, 1)
+            r.update(bad, 0)
+        self.assertGreater(r.predict(good), 0.8)
+        self.assertLess(r.predict(bad), 0.3)
+        r2 = Reranker.from_state(r.state())
+        self.assertAlmostEqual(r2.predict(good), r.predict(good))
+
+
+class GenerationTest(unittest.TestCase):
+    def test_suffix_backed_generation_and_feedback_training(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            text = "\n".join(["ゼータ星は紫色の海を持つ架空の惑星である。", "ゼータ星の住民は歌で会話する。", "ゼータ星には二つの月がある。"] * 3)
+            b.learn_text(text.replace("ゼータ星", "ゼータ星") , "https://x/zeta")
+            b.background_step(budget_docs=1000)
+            self.assertGreater(len(b.suffix), 0)
+            self.assertGreater(len(b.semantic.vec), 0)
+            out = b.generate(tokenize("ゼータ星"), query="ゼータ星", n_candidates=3)
+            self.assertTrue(out.startswith("ゼータ星"))
+            self.assertGreater(len(out), 5)
+            b.reply("ゼータ星の海の色は？")
+            b.reply("👍")
+            self.assertGreaterEqual(b.reranker.samples, 1)
+            b.reply("ゼータ星の月は？")
+            b.reply("👎")
+            path = b.save()
+            b2 = Brain(b.cfg)
+            self.assertTrue(b2.load(path))
+            self.assertEqual(b2.reranker.samples, b.reranker.samples)
+            self.assertEqual(len(b2.semantic.vec), len(b.semantic.vec))
+            b2.background_step()
+            self.assertEqual(len(b2.suffix), len(b.suffix))
 
 
 class WebTest(unittest.TestCase):

@@ -35,15 +35,20 @@ from .brain_types import question_type, _rerank_bonus  # noqa: F401
 from .evolution import Evolution, Params
 from .facts import FactStore, extract_facts
 from .knowledge import KnowledgeBase, Doc
-from .lm import NGramLM
+from .lm import NGramLM, CacheLM, EOS
 from .memory import MemoryGuard, MB
+from .reranker import Reranker
+from .semantic import SemanticSpace
+from .suffix import SuffixIndex
 from .tokenizer import (
     detokenize,
     is_phrase,
     is_question,
     keywords,
     normalize,
+    phrases,
     split_sentences,
+    term_weight,
     terms,
     tokenize,
 )
@@ -114,6 +119,15 @@ class Brain:
         self.kb = KnowledgeBase()
         self.facts = FactStore()
         self.kb.on_remove = self.facts.remove_doc
+        self.semantic = SemanticSpace()           # 意味ベクトル (後回しで学習)
+        self._semantic_queue: deque = deque(maxlen=50000)  # 意味ベクトル未学習の文書 ID
+        self.suffix = SuffixIndex()               # 最長一致生成用の接尾辞配列 (整理時に再構築)
+        self._suffix_dirty = 0                    # 前回構築以降に増えた文書数
+        self.cache_lm = CacheLM()                 # 会話キャッシュ LM
+        self.reranker = Reranker()                # 👍/👎 から学ぶリランカー
+        self._last_features: dict[int, dict] = {}  # 直前の候補 doc_id -> 特徴量 (学習用)
+        self._docvec_cache: dict[int, tuple[int, list[float] | None]] = {}  # doc_id -> (世代, ベクトル)
+        self._last_cover: dict[int, float] = {}
         self.params = Params(use_order=min(3, self.cfg.max_order))
         self._apply_params()
         self.evolution = Evolution(self)          # 世代・適応度・変異幅はここが持つ
@@ -228,9 +242,42 @@ class Brain:
             toks = tokenize(s)
             if len(toks) >= 2:
                 lm.learn(toks)
+            self._semantic_queue.append(doc.id)
+            self._suffix_dirty += 1
             if added % 500 == 0:
                 self._maybe_enforce()
         return added
+
+    # ------------------------------------------------------------ 後回しの学習 (意味ベクトル・接尾辞配列)
+    def background_step(self, budget_docs: int = 300, sketches: bool = True) -> dict:
+        """空き時間に呼ぶ: 意味ベクトルの取り込み、スケッチ更新、必要なら接尾辞配列の再構築。
+        応答経路からは sketches=False・小さな budget で呼び、数百 µs に抑える。"""
+        with self.lock:
+            n = 0
+            while self._semantic_queue and n < budget_docs:
+                doc = self.kb.docs.get(self._semantic_queue.popleft())
+                if doc is None:
+                    continue
+                self.semantic.learn(phrases(doc.text))
+                n += 1
+            sk = self.semantic.refresh_sketches(limit=400) if sketches and (n or self.semantic._dirty) else 0
+            rebuilt = False
+            if sketches and (self._suffix_dirty >= max(50, len(self.kb) // 10) or (self._suffix_dirty and not len(self.suffix))):
+                self.rebuild_suffix()
+                rebuilt = True
+            self.stats["semantic_docs"] += n
+            return {"semantic_docs": n, "sketches": sk, "suffix_rebuilt": rebuilt}
+
+    def rebuild_suffix(self) -> None:
+        """知識文全体から接尾辞配列を作り直す (数万文で 0.1 秒程度)。"""
+        seqs = []
+        for d in self.kb.docs.values():
+            ids = self.lm.ids(tokenize(d.text))
+            if len(ids) >= 3:
+                seqs.append(ids)
+        self.suffix = SuffixIndex.build(seqs)
+        self._suffix_dirty = 0
+        self.stats["suffix_rebuilds"] += 1
 
     def learn_batch(self, batch, collector=None) -> int:
         """収集システムの 1 バッチ (複数ページ) を学習し、リンクをフロンティアへ、収穫を報告する。"""
@@ -444,6 +491,9 @@ class Brain:
             toks = tokenize(text)
             if toks:
                 self.lm.learn(toks)  # 会話の文体を学ぶ
+                self.cache_lm.push(self.lm.ids(toks))
+            if self._semantic_queue:
+                self.background_step(budget_docs=8, sketches=False)
             question = is_question(text)
             new_doc = None
             if not question and len(text) >= 8:
@@ -453,9 +503,11 @@ class Brain:
             topics = [k for k in keywords(text, limit=3) if is_phrase(k)]
             self._bump_interest(topics)
             query = text
-            if not topics and self.last_topics and (question or _FOLLOWUP_RE.match(text.lower())):
+            # 引き継ぎは「指示語で始まる」か「情報量のある語がほとんど無い」時だけ (「光の速さは？」には不要)
+            info = sum(term_weight(t) for t in set(terms(text)))
+            if self.last_topics and (_FOLLOWUP_RE.match(text.lower()) or (question and not topics and info < 1.5)):
                 query = text + " " + " ".join(self.last_topics)
-                topics = list(self.last_topics)
+                topics = topics or list(self.last_topics)
             qtype = question_type(text)
             reply = self._answer_from_facts(text, ja)
             if reply is None:
@@ -469,6 +521,7 @@ class Brain:
             self.last_docs = reply.doc_ids
             self._said.extend(reply.doc_ids)
             self.last_mode = reply.mode
+            self.cache_lm.push(self.lm.ids(tokenize(reply.text))[:60])
             self.last_question = text
             if topics:
                 self.last_topics = topics[:2]
@@ -510,8 +563,10 @@ class Brain:
 
     def _search(self, text: str, exclude_id: int | None = None, k: int = 5, qtype: str = "none", subject: str | None = None):
         p = self.params
+        qw = self.kb.query_weights(text)
         hits = self.kb.search(text, k=k + 1)
-        conf = self._confidences(hits, text, exclude_id)
+        conf = self._confidences(hits, text, exclude_id, qw=qw)
+        cover_map = dict(self._last_cover)
         # 確信が低ければ関連語でクエリを広げてもう一度
         if (not conf or conf[0][0] < p.answer_threshold) and p.expand_weight > 0:
             extra: dict[str, float] = {}
@@ -520,21 +575,53 @@ class Brain:
                     extra[u] = max(extra.get(u, 0.0), min(1.0, w) * p.expand_weight)
             if extra:
                 hits2 = self.kb.search(text, k=k + 1, extra=extra)
-                conf2 = self._confidences(hits2, text, exclude_id, penalty=0.9)
+                conf2 = self._confidences(hits2, text, exclude_id, penalty=0.9, qw=qw)
+                cover_map.update(self._last_cover)
                 seen = {d.id for _, d in conf}
                 conf.extend(x for x in conf2 if x[1].id not in seen)
                 self.stats["expanded"] += 1
-        if qtype != "none" and p.rerank_weight > 0:
-            conf = [(min(1.0, c + p.rerank_weight * _rerank_bonus(qtype, d.text, subject)), d) for c, d in conf]
-        conf.sort(key=lambda x: -x[0])
-        return conf[:k]
+        # 意味ベクトル: 質問と文の句ベクトルのコサイン
+        qvec = self.semantic.text_vector(phrases(text)) if p.semantic_weight > 0 and self.semantic.vec else None
+        expanded = self.stats.get("expanded", 0)
+        rescored = []
+        self._last_features = {}
+        for c, d in conf:
+            qb = _rerank_bonus(qtype, d.text, subject) if qtype != "none" else 0.0
+            sem = 0.0
+            if qvec is not None:
+                dvec = self._doc_vector(d)
+                if dvec is not None:
+                    sem = self.semantic.cosine(qvec, dvec)
+            c2 = c + p.rerank_weight * qb + p.semantic_weight * max(sem, 0.0) * 0.5
+            x = Reranker.features(c * 10, cover_map.get(d.id, 0.0), qb, sem, d.quality, d.score, d.source, len(d.text), False, d.id in self.facts.by_doc)
+            if self.reranker.samples >= 5 and p.learned_weight > 0:
+                c2 = (1 - p.learned_weight) * c2 + p.learned_weight * self.reranker.predict(x)
+            self._last_features[d.id] = x
+            rescored.append((min(1.0, c2), d))
+        rescored.sort(key=lambda x: -x[0])
+        return rescored[:k]
 
-    def _confidences(self, hits, text: str, exclude_id: int | None, penalty: float = 1.0):
+    def _doc_vector(self, doc: Doc):
+        """文書の意味ベクトル (意味空間の世代ごとにキャッシュ)。"""
+        gen = self.semantic.updates // 2000
+        hit = self._docvec_cache.get(doc.id)
+        if hit is not None and hit[0] == gen:
+            return hit[1]
+        vec = self.semantic.text_vector(phrases(doc.text))
+        if len(self._docvec_cache) > 5000:
+            self._docvec_cache.clear()
+        self._docvec_cache[doc.id] = (gen, vec)
+        return vec
+
+    def _confidences(self, hits, text: str, exclude_id: int | None, penalty: float = 1.0, qw=None):
         out = []
+        qw = qw or self.kb.query_weights(text)
+        self._last_cover = {}
         for score, doc in hits:
             if doc.id == exclude_id:
                 continue
-            cover = self.kb.coverage(doc.id, text)
+            cover = self.kb.coverage(doc.id, text, qw)
+            self._last_cover[doc.id] = cover
             conf = (0.65 * cover + 0.35 * (1 - math.exp(-score / 6.0))) * penalty
             out.append((conf, doc))
         return out
@@ -588,8 +675,11 @@ class Brain:
                 doc = nxt
             elif same_next and len(doc.text) < 12 and doc.source in ("seed", "user"):
                 answer = f"{doc.text} {nxt.text}"
+            qphr = set(phrases(text))
             for c2, d2 in hits[1:3]:
-                if d2.source == doc.source and doc.source not in ("seed", "chat") and c2 >= p.answer_threshold * 0.8 and len(answer) + len(d2.text) < 320:
+                # 2 文目を足すのは、同じ出典で「隣接する文」か「質問の句を含む文」だけ (話題の混入を防ぐ)
+                related = abs(d2.id - doc.id) <= 2 or (qphr and qphr & set(phrases(d2.text)))
+                if d2.source == doc.source and doc.source not in ("seed", "chat") and related and c2 >= p.answer_threshold * 0.8 and len(answer) + len(d2.text) < 320:
                     answer = f"{answer} {d2.text}"
                     break
             self.stats["recall"] += 1
@@ -610,8 +700,7 @@ class Brain:
         focus: set[str] = set()
         for _, d in hits[:3]:
             focus.update(tokenize(d.text))
-        gen = self.lm.generate(seed_tokens, max_len=30, temperature=p.temperature, rng=self.rng, focus=focus)
-        sentence = detokenize(gen).strip()
+        sentence = self.generate(seed_tokens, focus=focus, query=text, n_candidates=4)
         self.stats["generate"] += 1
         if len(sentence) < 4 or sentence == "".join(seed_tokens):
             if ja:
@@ -622,9 +711,112 @@ class Brain:
         tail = ("…と思います。" if ja and not sentence.endswith(("。", "！", "？", "!", "?")) else "")
         return Reply(sentence + tail, 0.15, "generate", [], [d.id for _, d in hits[:1]], [])
 
+    # ------------------------------------------------------------ 生成 (接尾辞配列 + n-gram + 会話キャッシュ、自己一貫性)
+    def _sample_sentence(self, seed_ids: list[int], focus_ids: set[int], max_len: int = 36, min_len: int = 4) -> list[int]:
+        p = self.params
+        out = [1] + list(seed_ids)  # BOS
+        lm = self.lm
+        rng = self.rng
+        inv_t = 1.0 / max(p.temperature, 0.05)
+        for _ in range(max_len):
+            keys = lm._keys(out)
+            # 候補集合: 接尾辞配列の最長一致の続き + n-gram の候補
+            L, cont = self.suffix.continuations(out[1:], min_ctx=2) if len(self.suffix) else (0, None)
+            cands: dict[int, float] = {}
+            if cont:
+                tot = sum(cont.values())
+                for t, c in cont.items():
+                    cands[t] = c / tot
+            ng = None
+            for n in range(len(keys) - 1, -1, -1):
+                d = lm.ctx.get(keys[n])
+                if d is None:
+                    continue
+                if type(d) is int:
+                    if (d >> 20) >= 2:
+                        ng = [d & 0xFFFFF]
+                        break
+                elif d[-1] >= (2 if n else 1):
+                    ng = [t for t in d if t != -1]
+                    if len(ng) > 48:
+                        ng = sorted(ng, key=lambda t: d[t], reverse=True)[:48]
+                    break
+            for t in ng or ():
+                cands.setdefault(t, 0.0)
+            if not cands:
+                break
+            # 混合: suffix_w × 最長一致分布 (一致が長いほど信頼) + (1-suffix_w) × n-gram + cache_w × キャッシュ
+            sw = p.suffix_weight * min(1.0, L / 6.0) if cont else 0.0
+            prev = out[-1]
+            weights = []
+            toks = list(cands)
+            recent = out[-8:]
+            for t in toks:
+                pn = lm._prob_keys(keys, len(keys) - 1, t)
+                pc = self.cache_lm.prob(prev, t) if p.cache_weight > 0 else 0.0
+                pr = sw * cands[t] + (1 - sw) * ((1 - p.cache_weight) * pn + p.cache_weight * pc)
+                if t == EOS and len(out) - 1 < min_len:
+                    pr *= 0.05
+                if t in recent and t != EOS:
+                    pr *= 0.3
+                if t in focus_ids:
+                    pr *= 1.8
+                weights.append(pr ** inv_t)
+            tot = sum(weights)
+            if tot <= 0:
+                break
+            r = rng.random() * tot
+            acc = 0.0
+            pick = toks[-1]
+            for t, w in zip(toks, weights):
+                acc += w
+                if acc >= r:
+                    pick = t
+                    break
+            if pick == EOS:
+                break
+            out.append(pick)
+        return out[1:]
+
+    def _score_candidate(self, ids: list[int], query_phr: set[str], focus_ids: set[int]) -> float:
+        """自己一貫性: LM の平均対数確率 + 知識の語との重なり + 質問の句との重なり - 繰り返し。"""
+        lm = self.lm
+        toks = [1] + ids + [EOS]
+        logp = 0.0
+        for i in range(1, len(toks)):
+            keys = lm._keys(toks[:i])
+            logp += math.log(max(lm._prob_keys(keys, len(keys) - 1, toks[i]), 1e-9))
+        avg = logp / max(len(toks) - 1, 1)
+        words = [lm.words[i] for i in ids]
+        text = "".join(words)
+        overlap = sum(1 for t in ids if t in focus_ids) / max(len(ids), 1)
+        qhit = sum(1 for ph in query_phr if ph in text) / max(len(query_phr), 1)
+        rep_pen = 1.0 - len(set(ids)) / max(len(ids), 1)
+        ends = 0.3 if text.endswith(("。", "！", "？", ".", "!", "?")) else 0.0
+        return avg / 3.0 + 1.5 * overlap + 1.0 * qhit + ends - 2.0 * rep_pen
+
+    def generate(self, seed_tokens: list[str], focus: set[str] | None = None, query: str = "", n_candidates: int = 4, max_len: int = 36) -> str:
+        """候補を複数生成して最良を返す (self-consistency)。"""
+        lm = self.lm
+        seed_ids = lm.ids(seed_tokens)
+        focus_ids = {lm.vocab[t] for t in (focus or ()) if t in lm.vocab}
+        qphr = set(phrases(query)) if query else set()
+        best, best_s = None, -1e9
+        for _ in range(max(1, n_candidates)):
+            ids = self._sample_sentence(seed_ids, focus_ids, max_len=max_len)
+            if len(ids) <= len(seed_ids):
+                continue
+            sc = self._score_candidate(ids, qphr, focus_ids)
+            if sc > best_s:
+                best, best_s = ids, sc
+        if best is None:
+            return ""
+        return detokenize(lm.words[i] for i in best).strip()
+
     def _command(self, text: str, ja: bool) -> Reply | None:
         low = text.lower()
         if low in ("👍", "good", "いいね", "正解", "そう", "yes", "合ってる", "あってる", "ok", "おk"):
+            self._train_reranker(positive=True)
             for d in self.last_docs:
                 self.kb.feedback(d, +1.5)
                 if self.last_question:
@@ -636,6 +828,7 @@ class Brain:
             self.stats["feedback_pos"] += 1
             return Reply("ありがとう、覚えておきます。" if ja else "Thanks, noted.", 1.0, "command", [], [], [])
         if low in ("👎", "bad", "違う", "ちがう", "wrong", "no", "間違い", "まちがい"):
+            self._train_reranker(positive=False)
             for d in self.last_docs:
                 self.kb.feedback(d, -2.0)
                 if self.last_question:
@@ -662,6 +855,16 @@ class Brain:
             self.last_mode = ""
             return r
         return None
+
+    def _train_reranker(self, positive: bool) -> None:
+        """直前の答えに使った候補を正例/負例、他の候補を逆側の弱い例として学習。"""
+        used = set(self.last_docs)
+        for doc_id, x in self._last_features.items():
+            if doc_id in used:
+                self.reranker.update(x, 1.0 if positive else 0.0)
+            elif positive:
+                self.reranker.update(x, 0.0)  # 選ばれなかった候補は「より悪かった」
+        self.stats["reranker_updates"] += 1
 
     def _teach(self, body: str, ja: bool) -> Reply:
         n = 0
@@ -758,6 +961,10 @@ class Brain:
                 if self.interest[k] < 0.05:
                     del self.interest[k]
             pruned = self.lm.prune(min_count=2) if self.lm.estimated_bytes() > self.guard.budget * 0.4 else 0
+            self.background_step(budget_docs=2000)
+            self.semantic.refresh_sketches(limit=5000)
+            if self._suffix_dirty:
+                self.rebuild_suffix()
             self.stats["consolidations"] += 1
             self.stats["merged_docs"] += merged
             log.info("整理: 統合 %d 文, LM 剪定 %d", merged, pruned)
@@ -773,13 +980,15 @@ class Brain:
         with self.lock:
             scale = 0.8 ** self._tighten
             budget = self.guard.budget * scale
-            lm_budget = int(budget * 0.55)
-            kb_budget = int(budget * 0.35)
+            lm_budget = int(budget * 0.45)
+            kb_budget = int(budget * 0.30)
+            sem_budget = int(budget * 0.10)   # 残り 15% は接尾辞配列 (8 bytes/トークン) と余裕
             removed_lm = self.lm.shrink_to(lm_budget)
             removed_kb = self.kb.shrink_to(kb_budget, self.cfg.max_docs)
+            self.semantic.shrink_to(sem_budget, keep_terms=self.interest)
             if removed_lm or removed_kb:
                 self.guard.collect()
-            live = self.lm.estimated_bytes() + self.kb.estimated_bytes()
+            live = self.lm.estimated_bytes() + self.kb.estimated_bytes() + self.semantic.estimated_bytes() + 8 * len(self.suffix)
             if self.guard.over_soft() and self._tighten < MAX_TIGHTEN and live > budget * 0.25:
                 # 推定が甘かった: 予算を恒久的に締めてもう一度削る (締め過ぎないよう上限あり。
                 # Python は解放したメモリを OS に返さないことが多いので RSS は下がらないことがある)
@@ -792,7 +1001,7 @@ class Brain:
                 self.stats["pruned_lm"] += removed_lm
                 self.stats["pruned_kb"] += removed_kb
             # メモリが埋まってきたら、質の低い文は最初から取り込まない (選択的学習)
-            fill = (self.lm.estimated_bytes() + self.kb.estimated_bytes()) / max(budget, 1)
+            fill = (self.lm.estimated_bytes() + self.kb.estimated_bytes() + self.semantic.estimated_bytes() + 8 * len(self.suffix)) / max(budget, 1)
             self.admission = 0.0 if fill < 0.6 else min(0.6, (fill - 0.6) * 1.5)
             return {"removed_lm": removed_lm, "removed_kb": removed_kb, "rss_mb": round(self.guard.usage() / MB, 1)}
 
@@ -807,6 +1016,8 @@ class Brain:
                 "kb": {"docs": [(d.id, d.text, d.source, d.added, d.score, d.quality, d.hits) for d in self.kb.docs.values()], "next_id": self.kb.next_id, "assoc": self.kb.assoc},
                 "facts": self.facts.state(),
                 "interest": self.interest,
+                "semantic": self.semantic.state(),
+                "reranker": self.reranker.state(),
                 "params": asdict(self.params),
                 "generation": self.generation,
                 "sigma": self.sigma,
@@ -857,6 +1068,12 @@ class Brain:
                         self.facts.add(key, rel, obj, new_id)
             self.kb.on_remove = self.facts.remove_doc
             self.interest = state.get("interest", {})
+            self.semantic = SemanticSpace.from_state(state["semantic"]) if "semantic" in state else SemanticSpace()
+            self.reranker = Reranker.from_state(state.get("reranker", {}))
+            self._semantic_queue = deque(maxlen=50000)
+            if not self.semantic.vec:
+                self._semantic_queue.extend(self.kb.docs.keys())
+            self._suffix_dirty = len(self.kb)  # 接尾辞配列は保存しない (再構築が速い)
             for old_id, extra in state["kb"].get("assoc", {}).items():
                 new_id = id_map.get(old_id)
                 if new_id is not None:
@@ -890,6 +1107,9 @@ class Brain:
                 "lm": self.lm.stats(),
                 "kb": self.kb.stats(),
                 "facts": self.facts.stats(),
+                "semantic": self.semantic.stats(),
+                "suffix": self.suffix.stats(),
+                "reranker": {"samples": self.reranker.samples, "w": {k: round(v, 2) for k, v in self.reranker.w.items()}},
                 "interest": sorted(self.interest.items(), key=lambda x: -x[1])[:8],
                 "admission": round(self.admission, 2),
                 "memory": self.guard.describe(),

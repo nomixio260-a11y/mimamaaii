@@ -150,6 +150,23 @@ def is_phrase(t: str) -> bool:
     return bool(_PHRASE_RE.fullmatch(t)) and t not in STOPWORDS_EN
 
 
+def phrases(text: str) -> list[str]:
+    """文中の句 (漢字/カタカナ 2〜12 文字の連続、3 文字以上の英単語) を出現順に。意味ベクトル用。"""
+    text = normalize(text)
+    out: list[str] = []
+    for m in _PHRASE_SEQ_RE.finditer(text.lower()):
+        w = m.group(0)
+        if w.isascii():
+            if len(w) >= 3 and w not in STOPWORDS_EN and not w.isdigit():
+                out.append(w)
+        elif 2 <= len(w) <= 12:
+            out.append(w)
+    return out
+
+
+_PHRASE_SEQ_RE = re.compile(rf"[{_KANJI}\u30a0-\u30ff]+|[a-z][a-z0-9_'’]*")
+
+
 def keywords(text: str, limit: int = 6) -> list[str]:
     """人間に見せたり検索クエリに使う「話題語」。漢字/カタカナ連続語とラテン語を優先。"""
     text = normalize(text)

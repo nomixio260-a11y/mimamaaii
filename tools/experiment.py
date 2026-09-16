@@ -221,11 +221,95 @@ def exp_suffix(train, hold, base: NGramLM):
     print("→ 構築は純 Python では遅いが、メモリ/トークンは n-gram 辞書より小さく、次数に上限が無い。整理 (consolidate) の裏で再構築する用途に向く。")
 
 
+# ---------------------------------------------------------------- 4. 純 Python の小型ニューラル LM
+class TinyNeuralLM:
+    """対数双線形 bigram LM (Mnih & Hinton 2007 の最小形): p(w|h) ∝ exp(e_w · (W e_h + b))。
+    学習は負例サンプリング (k=5) の SGD。純 Python でどこまで速いか・n-gram にどこまで迫るかを測る。"""
+
+    def __init__(self, vocab: int, dim: int = 32, lr: float = 0.05, rng: random.Random | None = None):
+        self.V, self.D, self.lr = vocab, dim, lr
+        rng = rng or random.Random(0)
+        sc = 0.1
+        self.E = [[rng.uniform(-sc, sc) for _ in range(dim)] for _ in range(vocab)]   # 入力埋め込み
+        self.O = [[rng.uniform(-sc, sc) for _ in range(dim)] for _ in range(vocab)]   # 出力埋め込み
+        self.W = [[(1.0 if i == j else 0.0) + rng.uniform(-0.05, 0.05) for j in range(dim)] for i in range(dim)]
+        self.b = [0.0] * dim
+        self.rng = rng
+
+    def _hidden(self, h: int) -> list[float]:
+        e = self.E[h]
+        W, b, D = self.W, self.b, self.D
+        return [sum(W[i][j] * e[j] for j in range(D)) + b[i] for i in range(D)]
+
+    def train_pair(self, h: int, w: int, k: int = 5) -> None:
+        hid = self._hidden(h)
+        D, lr = self.D, self.lr
+        grad_h = [0.0] * D
+        negs = [self.rng.randrange(self.V) for _ in range(k)]
+        for tok, label in [(w, 1.0)] + [(n, 0.0) for n in negs]:
+            o = self.O[tok]
+            z = sum(o[i] * hid[i] for i in range(D))
+            p = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
+            g = (p - label) * lr
+            for i in range(D):
+                grad_h[i] += g * o[i]
+                o[i] -= g * hid[i]
+        # 隠れ層 → W, b, E (W は対角優位のまま小さく更新)
+        e = self.E[h]
+        for i in range(D):
+            gi = grad_h[i]
+            self.b[i] -= gi
+            Wi = self.W[i]
+            for j in range(D):
+                Wi[j] -= gi * e[j] * 0.1
+        for j in range(D):
+            e[j] -= sum(grad_h[i] * self.W[i][j] for i in range(D))
+
+    def logprob(self, h: int, w: int) -> float:
+        hid = self._hidden(h)
+        D = self.D
+        zs = [sum(o[i] * hid[i] for i in range(D)) for o in self.O]
+        m = max(zs)
+        lse = m + math.log(sum(math.exp(z - m) for z in zs))
+        return zs[w] - lse
+
+
+def exp_neural(train, hold, base: NGramLM, max_tokens: int = 40000, dim: int = 32, epochs: int = 2):
+    seqs = [[BOS] + base.ids(s) + [EOS] for s in train]
+    V = base.vocab_size
+    nn = TinyNeuralLM(V, dim=dim)
+    pairs = [(s[i - 1], s[i]) for s in seqs for i in range(1, len(s))][:max_tokens]
+    t = time.perf_counter()
+    for ep in range(epochs):
+        random.Random(ep).shuffle(pairs)
+        for h, w in pairs:
+            nn.train_pair(h, w)
+    train_s = time.perf_counter() - t
+    hs = [[BOS] + base.ids(s) + [EOS] for s in hold[:15]]
+    t = time.perf_counter()
+    logp = 0.0
+    n = 0
+    for s in hs:
+        for i in range(1, len(s)):
+            logp += nn.logprob(s[i - 1], s[i])
+            n += 1
+    ev_s = time.perf_counter() - t
+    ppl_nn = math.exp(-logp / max(n, 1))
+    bi = NGramLM(max_order=2)
+    for s in train:
+        bi.learn(s)
+    ppl_bi = bi.perplexity(hold[:15])
+    print("\n[4] 純 Python 小型ニューラル bigram LM (対数双線形, dim=%d, 負例サンプリング) vs KN bigram" % dim)
+    print(f"vocab={V} pairs={len(pairs)} epochs={epochs} 学習 {train_s:.1f}s ({len(pairs) * epochs / train_s:.0f} token/s)  評価 {ev_s:.1f}s (完全 softmax)")
+    print(f"ppl: neural={ppl_nn:.1f}  KN-bigram={ppl_bi:.1f}  (KN-trigram は上の表)")
+    print("→ 学習速度は n-gram の約 30 分の 1 (トークン単位) で、数万トークン規模では KN に遠く及ばない。純 Python では本体に採用しない (負の結果)。")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("corpus")
     ap.add_argument("--limit", type=int, default=4000)
-    ap.add_argument("--only", choices=["orders", "countmin", "suffix"], default=None)
+    ap.add_argument("--only", choices=["orders", "countmin", "suffix", "neural"], default=None)
     args = ap.parse_args()
     text = Path(args.corpus).read_text(encoding="utf-8", errors="replace")
     sents = [tokenize(s) for s in split_sentences(text)][: args.limit]
@@ -238,11 +322,14 @@ def main():
         exp_orders(train, hold)
     if args.only in (None, "countmin"):
         exp_countmin(train, hold)
-    if args.only in (None, "suffix"):
+    if args.only in (None, "suffix", "neural"):
         base = NGramLM(max_order=2)
         for s in train:
             base.learn(s)
-        exp_suffix(train, hold, base)
+        if args.only in (None, "suffix"):
+            exp_suffix(train, hold, base)
+        if args.only in (None, "neural"):
+            exp_neural(train, hold, base)
 
 
 if __name__ == "__main__":

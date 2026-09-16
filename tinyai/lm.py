@@ -361,3 +361,66 @@ class NGramLM:
             "prune_threshold": self.prune_threshold,
             "est_mb": round(self.estimated_bytes() / 1048576, 1),
         }
+
+
+class CacheLM:
+    """会話キャッシュ LM (Kuhn & De Mori 1990 の系譜)。直近のトークン列から減衰付きの
+    unigram / bigram 分布を持ち、静的な n-gram と補間して「今の会話の流れ」に沿った
+    確率を与える。数百トークンしか持たないので実質メモリゼロ。"""
+
+    def __init__(self, capacity: int = 300, decay: float = 0.995):
+        self.capacity = capacity
+        self.decay = decay
+        self.uni: dict[int, float] = {}
+        self.bi: dict[int, dict[int, float]] = {}
+        self.total = 0.0
+        self.last: int | None = None
+        self.n = 0
+
+    def push(self, ids) -> None:
+        for tok in ids:
+            self.uni[tok] = self.uni.get(tok, 0.0) + 1.0
+            self.total += 1.0
+            if self.last is not None:
+                d = self.bi.setdefault(self.last, {})
+                d[tok] = d.get(tok, 0.0) + 1.0
+            self.last = tok
+            self.n += 1
+            if self.n % 200 == 0:
+                self._decay()
+        if len(self.uni) > self.capacity * 3:
+            self._decay(hard=True)
+
+    def _decay(self, hard: bool = False) -> None:
+        f = self.decay ** 200 if not hard else 0.5
+        self.total *= f
+        for k in list(self.uni):
+            self.uni[k] *= f
+            if self.uni[k] < 0.05:
+                del self.uni[k]
+        for a in list(self.bi):
+            d = self.bi[a]
+            for b in list(d):
+                d[b] *= f
+                if d[b] < 0.05:
+                    del d[b]
+            if not d:
+                del self.bi[a]
+
+    def prob(self, prev: int | None, tok: int) -> float:
+        """キャッシュ内での P(tok | prev)。無ければ 0。"""
+        if self.total <= 0:
+            return 0.0
+        p_uni = self.uni.get(tok, 0.0) / self.total
+        if prev is not None:
+            d = self.bi.get(prev)
+            if d:
+                tot = sum(d.values())
+                return 0.6 * d.get(tok, 0.0) / tot + 0.4 * p_uni
+        return p_uni
+
+    def clear(self) -> None:
+        self.uni.clear()
+        self.bi.clear()
+        self.total = 0.0
+        self.last = None
