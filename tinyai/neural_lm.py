@@ -1,35 +1,43 @@
-"""Brain と Transformer をつなぐラッパー: 語彙の構築、学習データの供給、少しずつの学習 (継続学習)、
-チェックポイント、生成・採点。numpy が無ければ `available` が False になり、何もしない。
+"""Brain と Transformer をつなぐ層 (numpy が無ければ available=False で何もしない)。
 
-学習の方針 (人が寝ている間に復習するように):
-  * 応答の合間や自律ループの空き時間に数ステップずつ学習する (1 ステップ ≈ 0.1〜0.2 秒)
-  * 知識文 (最近学んだもの優先) と会話ペア (<usr> 発話 <bot> 応答 <eos>) を混ぜる。👍 のペアは 3 倍
-  * 取り置き文で ppl を測り、n-gram より良くなったら生成に使う (それまでは採点だけ)
+* トークナイザ: 知識文からサブワード語彙を学習 (十分な量が溜まってから固定)
+* 学習データ (再生バッファ):
+    平文      <bos> 文 <eos>
+    会話      <bos><usr> 発話 <bot> 応答 <eos>
+    RAG 会話  <bos><ctx> 検索で得た文 <usr> 発話 <bot> 応答 <eos>   ← 応答時と同じ形式
+    合成 QA   事実ストア (主語, 関係, 目的語) から質問と答えを作る = 記号処理系からの蒸留
+* 学習は空き時間に少しずつ (継続学習)。ウォームアップ + コサイン減衰
+* 応答: 検索した文を <ctx> に入れて生成 (RAG)。取り置き文の ppl が n-gram の閾値以内で「使用可」
 """
 from __future__ import annotations
 
 import logging
-import math
 import random
 import time
 from pathlib import Path
 
 from . import neural
-from .tokenizer import tokenize
+from .bpe import BOS, BOT, CTX, EOS, USR, SubwordTokenizer
 
 log = logging.getLogger("tinyai.neural")
 
+_QA_TEMPLATES = {
+    "definition": ["{s}とは？", "{s}って何？", "{s}について教えて"],
+    "is": ["{s}とは？", "{s}は何？"],
+    "location": ["{s}はどこ？", "{s}はどこにある？", "{s}の場所は？"],
+    "event": ["{s}はいつ？", "{s}はいつ頃？"],
+}
+
 
 class NeuralLM:
-    def __init__(self, data_dir: Path, vocab_size: int = 4096, d: int = 128, heads: int = 4, layers: int = 2, ctx: int = 64, seed: int = 0):
+    def __init__(self, data_dir: Path, size: str = "base", vocab_size: int = 6000, seed: int = 0):
         self.available = neural.available()
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / "neural.npz"
-        self.cfg = dict(vocab_size=vocab_size, d=d, heads=heads, layers=layers, ctx=ctx)
-        self.min_vocab = 1500      # 語彙を固定してよい最小の異なり語数
-        self.min_tokens = 20000    # 同、延べトークン数
+        self.size = size if size in neural.PRESETS else "base"
+        self.vocab_size = vocab_size
         self.model = None
-        self.vocab = None
+        self.tok: SubwordTokenizer | None = None
         self.pool = neural.SequencePool(seed=seed) if self.available else None
         self.rng = random.Random(seed)
         self.nprng = neural.np.random.default_rng(seed) if self.available else None
@@ -37,65 +45,114 @@ class NeuralLM:
         self.last_loss = None
         self.holdout_ppl = None
         self.ngram_ppl = None
-        self.ready = False        # 生成に使ってよいか (ppl が n-gram に近づいたら)
-        self.pending: list[list[int]] = []
-        self._last_save = 0.0
+        self.ready = False
+        self.min_sentences = 2000     # 語彙を固定してよい最小の文数
+        self.min_chars = 150_000      # 同、文字数
+        self.ready_ratio = 2.0        # 取り置き ppl が n-gram の何倍以内なら生成に使うか (サブワードと文字で単位が違うため緩め)
+        self.ready_abs = 40.0         # n-gram の取り置きが無い時: サブワード ppl がこれ以下なら生成に使う
+        self.total_steps = 30000      # コサイン減衰の想定総ステップ
         self._holdout: list[list[int]] = []
+        self._last_save = 0.0
+        self.batch = neural.PRESETS[self.size]["batch"] if self.available else 8
 
     # ------------------------------------------------------------ 構築
-    def ensure_model(self, unigram_counts: dict[str, int]) -> bool:
-        """語彙とモデルを用意する。既存のチェックポイントがあれば読む。"""
+    def ensure_model(self, texts=None) -> bool:
+        """トークナイザとモデルを用意する。チェックポイントがあれば読む。texts は語彙学習用の文の列。"""
         if not self.available:
             return False
         if self.model is not None:
             return True
         if self.path.exists():
             try:
-                self.model, self.vocab, meta = neural.TinyTransformer.load(self.path)
+                self.model, self.tok, meta = neural.TinyTransformer.load(self.path)
                 self.trained_tokens = int(meta.get("trained_tokens", 0))
                 self.holdout_ppl = meta.get("holdout_ppl")
                 self.ready = bool(meta.get("ready", False))
-                log.info("ニューラル LM を読込: %d params, step=%d", self.model.n_params(), self.model.step)
+                self.size = meta.get("size", self.size)
+                self._holdout = [list(x) for x in meta.get("holdout", [])][:300]
+                self.batch = neural.PRESETS.get(self.size, {}).get("batch", self.batch)
+                log.info("ニューラル LM を読込: %s %d params, step=%d", self.size, self.model.n_params(), self.model.step)
                 return True
-            except Exception as e:  # 壊れたチェックポイントは作り直す
+            except Exception as e:
                 log.warning("ニューラル LM の読込失敗 (作り直します): %s", e)
-        # 語彙は初期化時に固定されるので、十分な量の文を読んでから作る (小さすぎる語彙は後で困る)
-        if len(unigram_counts) < self.min_vocab or sum(unigram_counts.values()) < self.min_tokens:
+        texts = list(texts or [])
+        if len(texts) < self.min_sentences or sum(len(t) for t in texts) < self.min_chars:
             return False
-        self.vocab = neural.NeuralVocab.from_counts(unigram_counts, size=self.cfg["vocab_size"])
-        self.model = neural.TinyTransformer(len(self.vocab), d=self.cfg["d"], heads=self.cfg["heads"], layers=self.cfg["layers"], ctx=self.cfg["ctx"])
-        log.info("ニューラル LM を初期化: vocab=%d params=%d", len(self.vocab), self.model.n_params())
+        self.tok = SubwordTokenizer.train(texts, size=self.vocab_size)
+        self.model = neural.TinyTransformer.from_preset(len(self.tok), self.size)
+        log.info("ニューラル LM を初期化: %s vocab=%d params=%d", self.size, len(self.tok), self.model.n_params())
         return True
 
-    # ------------------------------------------------------------ データ
-    def encode_text(self, text: str) -> list[int]:
-        return [neural.BOS] + self.vocab.encode(tokenize(text)) + [neural.EOS]
+    # ------------------------------------------------------------ 系列の作り方
+    def seq_text(self, text: str) -> list[int]:
+        return [BOS] + self.tok.encode(text, max_tokens=self.model.T - 2) + [EOS]
 
-    def encode_dialog(self, user: str, bot: str) -> list[int]:
-        return [neural.BOS, neural.USR] + self.vocab.encode(tokenize(user))[:40] + [neural.BOT] + self.vocab.encode(tokenize(bot))[:80] + [neural.EOS]
+    def seq_dialog(self, user: str, bot: str, context: str | None = None) -> list[int]:
+        T = self.model.T
+        ctx_ids = self.tok.encode(context, max_tokens=T // 2) if context else []
+        u = self.tok.encode(user, max_tokens=T // 4)
+        room = T - len(ctx_ids) - len(u) - 5
+        b = self.tok.encode(bot, max_tokens=max(8, room))
+        seq = [BOS]
+        if ctx_ids:
+            seq += [CTX] + ctx_ids
+        return seq + [USR] + u + [BOT] + b + [EOS]
 
+    def prompt_dialog(self, user: str, context: str | None = None) -> list[int]:
+        T = self.model.T
+        ctx_ids = self.tok.encode(context, max_tokens=T // 2) if context else []
+        u = self.tok.encode(user, max_tokens=T // 4)
+        seq = [BOS]
+        if ctx_ids:
+            seq += [CTX] + ctx_ids
+        return seq + [USR] + u + [BOT]
+
+    # ------------------------------------------------------------ データ供給
     def add_text(self, text: str) -> None:
-        if self.vocab is None:
+        if self.model is None:
             return
-        ids = self.encode_text(text)
-        if len(ids) >= 4:
-            if self.rng.random() < 0.02 and len(self._holdout) < 300:
-                self._holdout.append(ids)
-            else:
-                self.pool.add(ids)
+        ids = self.seq_text(text)
+        if len(ids) < 4:
+            return
+        if self.rng.random() < 0.02 and len(self._holdout) < 300:
+            self._holdout.append(ids)
+        else:
+            self.pool.add(ids)
 
-    def add_dialog(self, user: str, bot: str, weight: float = 1.0) -> None:
-        if self.vocab is None:
+    def add_dialog(self, user: str, bot: str, context: str | None = None, weight: float = 1.0) -> None:
+        if self.model is None:
             return
-        ids = self.encode_dialog(user, bot)
+        ids = self.seq_dialog(user, bot, context)
         for _ in range(max(1, int(round(weight)))):
             self.pool.add(ids)
 
+    def add_synthetic_qa(self, subject: str, relation: str, obj: str, answer: str, context: str) -> int:
+        """事実から質問文を作り (テンプレート)、文脈付き/無しの両方で会話例にする。"""
+        if self.model is None:
+            return 0
+        if relation in _QA_TEMPLATES:
+            qs = [t.format(s=subject) for t in _QA_TEMPLATES[relation]]
+        else:
+            qs = [f"{subject}の{relation}は？", f"{subject}の{relation}を教えて"]
+        n = 0
+        for q in qs[:2]:
+            self.pool.add(self.seq_dialog(q, answer, context))
+            self.pool.add(self.seq_dialog(q, answer, None))
+            n += 2
+        return n
+
     # ------------------------------------------------------------ 学習
-    def train_some(self, steps: int = 4, batch: int = 32) -> dict | None:
+    def train_some(self, steps: int = 4, batch: int | None = None) -> dict | None:
         if self.model is None or len(self.pool) < 32:
             return None
-        r = neural.train_steps(self.model, self.pool, steps=steps, batch=batch)
+        batch = batch or self.batch
+        try:
+            r = neural.train_steps(self.model, self.pool, steps=steps, batch=batch, total=self.total_steps)
+        except MemoryError:
+            # メモリ上限に当たったらバッチを半分にして続ける
+            self.batch = max(2, batch // 2)
+            log.warning("ニューラル LM: メモリ不足のためバッチを %d に縮小", self.batch)
+            return None
         self.trained_tokens += steps * batch * self.model.T
         self.last_loss = r.get("loss")
         return r
@@ -105,53 +162,57 @@ class NeuralLM:
             return {}
         self.holdout_ppl = round(neural.perplexity(self.model, self._holdout), 2)
         self.ngram_ppl = ngram_ppl
-        # 生成に使う基準: n-gram の 1.5 倍以内に入ったら (それ以前は採点のみ)
-        if ngram_ppl is not None and self.holdout_ppl is not None:
-            self.ready = self.holdout_ppl <= ngram_ppl * 1.5
+        if self.holdout_ppl is not None:
+            if ngram_ppl is not None:
+                self.ready = self.holdout_ppl <= ngram_ppl * self.ready_ratio
+            else:
+                self.ready = self.holdout_ppl <= self.ready_abs  # n-gram の取り置きが無い時の絶対基準
         return {"neural_ppl": self.holdout_ppl, "ngram_ppl": ngram_ppl, "ready": self.ready}
 
     def save(self) -> None:
-        if self.model is None or self.vocab is None:
+        if self.model is None or self.tok is None:
             return
-        self.model.save(self.path, self.vocab, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready})
+        self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300]})
         self._last_save = time.time()
 
     # ------------------------------------------------------------ 利用
     def score(self, text: str) -> float | None:
         if self.model is None:
             return None
-        return self.model.logprob(self.encode_text(text))
+        return self.model.logprob(self.seq_text(text))
 
-    def generate_reply(self, user: str, max_new: int = 40, temperature: float = 0.8, n: int = 3) -> list[str]:
-        """会話形式で応答候補を n 本生成 (語列を文字列に戻す)。"""
+    def chat(self, user: str, context: str | None = None, n: int = 2, max_new: int = 48, temperature: float = 0.7) -> list[str]:
+        """RAG 形式で応答候補を n 本生成。"""
         if self.model is None:
             return []
-        prompt = [neural.BOS, neural.USR] + self.vocab.encode(tokenize(user))[:40] + [neural.BOT]
+        prompt = self.prompt_dialog(user, context)
         out = []
         for _ in range(n):
             ids = self.model.generate(prompt, max_new=max_new, temperature=temperature, rng=self.nprng)
-            words = self.vocab.decode(ids)
-            if words:
-                out.append(words)
+            text = self.tok.decode(ids).strip()
+            if len(text) >= 2:
+                out.append(text)
         return out
 
-    def continue_text(self, seed_tokens: list[str], max_new: int = 30, temperature: float = 0.8) -> list[str]:
+    def continue_text(self, seed_text: str, max_new: int = 40, temperature: float = 0.8) -> str:
         if self.model is None:
-            return []
-        prompt = [neural.BOS] + self.vocab.encode(seed_tokens)
+            return ""
+        prompt = [BOS] + self.tok.encode(seed_text, max_tokens=self.model.T // 2)
         ids = self.model.generate(prompt, max_new=max_new, temperature=temperature, rng=self.nprng)
-        return self.vocab.decode(ids)
+        return self.tok.decode(ids)
 
     def stats(self) -> dict:
         if not self.available:
             return {"available": False}
         return {
             "available": True,
+            "size": self.size,
             "params": self.model.n_params() if self.model else 0,
-            "vocab": len(self.vocab) if self.vocab else 0,
+            "vocab": len(self.tok) if self.tok else 0,
             "steps": self.model.step if self.model else 0,
             "trained_tokens": self.trained_tokens,
             "pool": len(self.pool),
+            "pool_tokens": self.pool.total_tokens,
             "holdout": len(self._holdout),
             "last_loss": round(self.last_loss, 3) if self.last_loss is not None else None,
             "holdout_ppl": self.holdout_ppl,

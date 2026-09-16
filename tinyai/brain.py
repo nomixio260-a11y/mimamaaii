@@ -108,6 +108,7 @@ def _cjk_ratio(text: str) -> float:
     return cjk / len(text)
 
 
+_GARBLED_RE = re.compile(r"[?？!！][^。！？!?]{2,}|」[^「]*」|\)[^(]*\)|<unk>|[、,]{2}|[。.]{2}")
 _MORE_RE = re.compile(r"^(もっと|詳しく|もっと詳しく|続けて|続き|他には|ほかには|それで|それから|more|tell me more|continue|go on|and\??)[。!！?？]*$", re.I)
 _FOLLOWUP_RE = re.compile(r"^(それ|これ|あれ|そこ|そいつ|彼|彼女|it|that|this|they|he|she)")
 
@@ -130,8 +131,10 @@ class Brain:
         self.cache_lm = CacheLM()                 # 会話キャッシュ LM
         self.reranker = Reranker()                # 👍/👎 から学ぶリランカー
         self.dialogs = DialogStore()              # 会話データ (自分の会話 + 公開データ)
-        self.neural = NeuralLM(self.cfg.data_dir, seed=self.cfg.seed or 0)  # numpy があれば本物の Transformer LM
+        self.neural = NeuralLM(self.cfg.data_dir, size=self.cfg.neural_size, seed=self.cfg.seed or 0)  # numpy があれば Transformer LM
         self._neural_pending_text: deque = deque(maxlen=5000)
+        self._neural_pending_dialog: deque = deque(maxlen=2000)   # (発話, 応答, 文脈, 重み)
+        self._qa_done: set[int] = set()                           # 合成 QA を作った文書 ID
         self._last_features: dict[int, dict] = {}  # 直前の候補 doc_id -> 特徴量 (学習用)
         self.timers: Counter = Counter()          # 段階ごとの累積秒 (コスト計測)
         self._docvec_cache: dict[int, tuple[int, list[float] | None]] = {}  # doc_id -> (世代, ベクトル)
@@ -306,22 +309,86 @@ class Brain:
             self.stats["semantic_docs"] += n
             return {"semantic_docs": n, "sketches": sk, "suffix_rebuilt": rebuilt}
 
+    def _neural_reply(self, text: str, hits, fallback: Reply) -> Reply | None:
+        """検索した文を文脈にして Transformer で応答を生成 (RAG)。知識に接地していない候補は捨てる。"""
+        ctx_docs = [d for c, d in hits[:3] if c >= self.params.answer_threshold * 0.5]
+        context = " ".join(d.text for d in ctx_docs)[:240] or None
+        cands = self.neural.chat(text, context, n=3)
+        if not cands:
+            return None
+        qphr = set(phrases(text))
+        cphr = set(phrases(context)) if context else set()
+        best, best_s = None, -1e9
+        for c in cands:
+            ph = set(phrases(c))
+            grounded = len(ph & (cphr | qphr)) / max(len(ph), 1) if ph else 0.0
+            fluency = self.neural.score(c)
+            # 受け入れ条件: 文脈/質問に接地 (句の 6 割以上)、モデル自身が自然だと思う (平均対数尤度)、文として終わる、崩れていない
+            if (context and grounded < 0.6) or fluency is None or fluency < -2.5:
+                continue
+            if len(c) < 6 or c in text or not c.endswith(("。", "！", "？", ".", "!", "?", "です", "ます", "である")):
+                continue
+            if _GARBLED_RE.search(c):
+                continue
+            sc = grounded + fluency / 5.0
+            if sc > best_s:
+                best, best_s = c, sc
+        if best is None:
+            self.stats["neural_rejected"] += 1
+            return None
+        self.stats["neural_replies"] += 1
+        conf = max(fallback.confidence, 0.6) if context else 0.5
+        return Reply(best, round(conf, 3), "neural", [d.source for d in ctx_docs], [d.id for d in ctx_docs], fallback.learned_topics)
+
+    def _context_for(self, doc_ids, max_chars: int = 240) -> str | None:
+        parts = []
+        for i in doc_ids[:3]:
+            d = self.kb.docs.get(i)
+            if d:
+                parts.append(d.text)
+        ctx = " ".join(parts)
+        return ctx[:max_chars] if ctx else None
+
+    def _feed_neural(self, max_qa_docs: int = 60) -> None:
+        """再生バッファへ: 平文、会話 (文脈付き)、事実からの合成 QA。"""
+        nl = self.neural
+        while self._neural_pending_text:
+            nl.add_text(self._neural_pending_text.popleft())
+        while self._neural_pending_dialog:
+            u, b, ctx, w = self._neural_pending_dialog.popleft()
+            nl.add_dialog(u, b, ctx, weight=w)
+        n = 0
+        for key, lst in self.facts.by_subject.items():
+            for rel, obj, doc_id in lst:
+                if doc_id in self._qa_done or doc_id not in self.kb.docs:
+                    continue
+                subj = key
+                answer = self.facts._render(subj, rel, obj, True)
+                nl.add_synthetic_qa(subj, rel, obj, answer, self.kb.docs[doc_id].text)
+                self._qa_done.add(doc_id)
+                n += 1
+                if n >= max_qa_docs:
+                    return
+        if len(self._qa_done) > 200000:
+            self._qa_done.clear()
+
     def neural_step(self, steps: int = 4, budget_seconds: float = 1.0) -> dict | None:
         """空き時間に呼ぶ: ニューラル LM の準備・データ供給・数ステップの学習。"""
         nl = self.neural
         if not nl.available:
             return None
         with self.lock:
-            if nl.model is None and not nl.ensure_model(dict((self.lm.words[t], c) for t, c in self.lm.ctx[0].items() if t >= 3)):
-                return None
-            while self._neural_pending_text:
-                nl.add_text(self._neural_pending_text.popleft())
-            if len(nl.pool) < 64 and len(self.kb) > 0:
-                # 再起動直後など: 知識文と会話ペアから学習データを積み直す
-                for d in self.kb.random_docs(min(1000, len(self.kb)), self.rng):
-                    nl.add_text(d.text)
-                for u, b, _, w in list(self.dialogs.pairs)[-2000:]:
-                    nl.add_dialog(u, b, weight=w)
+            if nl.model is None:
+                texts = [d.text for d in self.kb.docs.values()] if len(self.kb) >= nl.min_sentences else []
+                if not nl.ensure_model(texts):
+                    return None
+                if len(nl.pool) < 64:
+                    # 初期化直後・再起動直後: 知識文と会話から学習データを積み直す
+                    for d in self.kb.random_docs(min(3000, len(self.kb)), self.rng):
+                        nl.add_text(d.text)
+                    for u, b, _, w in list(self.dialogs.pairs)[-3000:]:
+                        nl.add_dialog(u, b, weight=w)
+            self._feed_neural()
         t0 = time.perf_counter()
         r = None
         while time.perf_counter() - t0 < budget_seconds:
@@ -374,7 +441,7 @@ class Brain:
                 for q, a in batch.dialogs:
                     if self.dialogs.add(q, a, source=batch.source or "web"):
                         n_d += 1
-                        self.neural.add_dialog(q, a)
+                        self._neural_pending_dialog.append((q, a, None, 1.0))
                 self.stats["dialogs_collected"] += n_d
         with self.lock:
             if batch.kind == "topic":
@@ -607,6 +674,12 @@ class Brain:
                 hits = self._search(query, exclude_id=new_doc.id if new_doc else None, qtype=qtype, subject=topics[0] if topics else None)
                 hits = self._guard_unknown(text, hits, ja)
                 reply = self._compose(text, hits, topics, ja, question, qtype)
+                # ニューラル生成が主経路になるのは「知識の検索が弱い」時。確信の高い想起 (正確な知識文) は残す。
+                weak = reply.mode in ("guess", "generate") or (reply.mode == "recall" and reply.confidence < self.cfg.neural_override_conf)
+                if self.cfg.neural_first and self.neural.ready and weak and self._guard_note is None:
+                    neural_reply = self._neural_reply(text, hits, reply)
+                    if neural_reply is not None:
+                        reply = neural_reply
             reply = self._attach_notices(reply, topics, ja)
             for t in topics:
                 if reply.confidence < 0.7 and (not t.isascii() or len(t) >= 4):
@@ -616,9 +689,9 @@ class Brain:
             self._said.extend(reply.doc_ids)
             self.last_mode = reply.mode
             self.cache_lm.push(self.lm.ids(tokenize(reply.text))[:60])
-            if reply.mode in ("fact", "recall", "summary") and reply.confidence >= 0.6:
+            if reply.mode in ("fact", "recall", "summary", "neural") and reply.confidence >= 0.6:
                 if self.dialogs.add(text, reply.text, source="chat"):
-                    self.neural.add_dialog(text, reply.text)
+                    self._neural_pending_dialog.append((text, reply.text, self._context_for(reply.doc_ids), 1.0))
             self._last_pair = (text, reply.text)
             self.last_question = text
             if topics:
@@ -728,8 +801,8 @@ class Brain:
         for conf, d in hits:
             if len(parts) >= max_sentences:
                 break
-            if conf < self.params.answer_threshold * 0.8 or d.id in ids:
-                continue
+            if conf < self.params.answer_threshold * 0.8 or d.id in ids or d.source == "chat":
+                continue  # 会話ログの文 (質問そのもの) は要約に入れない
             ph = set(phrases(d.text))
             if used_phr and len(ph & used_phr) / max(len(ph), 1) > 0.6:
                 continue  # 既に言った内容とほぼ同じ
@@ -1013,9 +1086,9 @@ class Brain:
                 cands.append(ids)
         if self.neural.ready:
             for _ in range(2):
-                words = self.neural.continue_text(seed_tokens, max_new=max_len)
-                if words:
-                    cands.append(seed_ids + lm.ids(words))
+                text_out = self.neural.continue_text("".join(seed_tokens), max_new=max_len)
+                if text_out:
+                    cands.append(seed_ids + lm.ids(tokenize(text_out)))
                     self.stats["neural_candidates"] += 1
         best, best_s = None, -1e9
         for ids in cands:
@@ -1037,7 +1110,7 @@ class Brain:
             if self._last_pair:
                 u, b = self._last_pair
                 self.dialogs.add(u, b, source="chat+", weight=3.0)
-                self.neural.add_dialog(u, b, weight=3.0)
+                self._neural_pending_dialog.append((u, b, self._context_for(self.last_docs), 3.0))
             for d in self.last_docs:
                 self.kb.feedback(d, +1.5)
                 if self.last_question:

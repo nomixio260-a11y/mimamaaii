@@ -38,6 +38,9 @@ class Config:
     prefetch_workers: int = field(default_factory=lambda: _env_int("TINYAI_WORKERS", 2))  # 先読みスレッド数
     prefetch_depth: int = 4            # 先読みして貯めておくバッチ数
     neural_seconds_per_cycle: float = 2.0  # 自律ループ 1 サイクルあたりニューラル LM の学習に使う秒数 (numpy がある時)
+    neural_size: str = field(default_factory=lambda: os.environ.get("TINYAI_NEURAL", "base"))  # small / base / large
+    neural_first: bool = True          # 学習が進んだら (ppl 基準) ニューラル生成を応答の主経路にする
+    neural_override_conf: float = 0.8  # 検索の確信度がこれ未満ならニューラル生成を優先 (これ以上は正確な知識文を返す)
     evolve_every: int = 3              # 何サイクルごとにパラメータ進化を試すか
     holdout_size: int = 300            # 自己評価用に取り置く文の数
     save_every: int = 5                # 何サイクルごとに保存するか

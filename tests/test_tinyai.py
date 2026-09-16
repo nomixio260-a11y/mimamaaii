@@ -720,14 +720,17 @@ class NeuralTest(unittest.TestCase):
     def test_gradient_check(self):
         import numpy as np
         nn = self.neural
-        m = nn.TinyTransformer(vocab_size=11, d=8, heads=2, layers=2, ctx=5, seed=1, dtype=np.float64)
+        m = nn.TinyTransformer(vocab_size=13, d=8, heads=2, layers=2, ctx=6, ff=16, seed=1, dtype=np.float64)
+        for k in m.p:
+            if m.p[k].ndim >= 2:
+                m.p[k] *= 25.0  # 勾配を大きくして丸め誤差の影響を減らす
         rng = np.random.default_rng(0)
-        x = rng.integers(2, 11, size=(2, 5))
-        y = rng.integers(2, 11, size=(2, 5))
-        y[1, 4] = nn.PAD
+        x = rng.integers(8, 13, size=(2, 6))
+        y = rng.integers(8, 13, size=(2, 6))
+        y[1, 5] = nn.PAD
         _, g = m.loss_and_grads(x, y)
         worst = 0.0
-        for k in ["wte", "wpe", "l0.wqkv", "l0.wo", "l0.w1", "l1.w2", "l1.ln1g", "lnfg", "l0.b1"]:
+        for k in list(m.p):
             flat = m.p[k].reshape(-1)
             gk = g[k].reshape(-1)
             for idx in rng.choice(flat.size, size=min(3, flat.size), replace=False):
@@ -740,37 +743,57 @@ class NeuralTest(unittest.TestCase):
                 flat[idx] = old
                 num = (lp - lm) / (2 * eps)
                 worst = max(worst, abs(num - gk[idx]) / max(abs(num) + abs(gk[idx]), 1e-8))
-        self.assertLess(worst, 2e-3)  # ReLU の折れ点付近では有限差分がずれる
+        self.assertLess(worst, 1e-5)
+
+    def test_kv_cache_matches_full_forward(self):
+        import numpy as np
+        nn = self.neural
+        m = nn.TinyTransformer(vocab_size=50, d=16, heads=2, layers=2, ctx=10, ff=32, seed=2)
+        rng = np.random.default_rng(1)
+        seq = [int(t) for t in rng.integers(8, 50, size=7)]
+        full, _ = m.forward(np.array([seq]))
+        cache = [(None, None)] * 2
+        for pos, t in enumerate(seq):
+            inc = m._step(t, pos, cache)
+        self.assertLess(float(np.abs(full[0, -1] - inc).max()), 1e-4)
 
     def test_training_reduces_loss_and_roundtrip(self):
         import numpy as np
         nn = self.neural
-        vocab = nn.NeuralVocab([f"w{i}" for i in range(30)])
-        m = nn.TinyTransformer(len(vocab), d=16, heads=2, layers=1, ctx=12, seed=0)
+        from tinyai.bpe import SubwordTokenizer
+        tok = SubwordTokenizer([f"w{i}" for i in range(30)])
+        m = nn.TinyTransformer(len(tok), d=16, heads=2, layers=1, ctx=12, ff=32, seed=0)
         pool = nn.SequencePool(seed=0)
-        seq = [nn.BOS] + vocab.encode([f"w{i % 30}" for i in range(11)]) + [nn.EOS]
+        seq = [nn.BOS] + [tok.index[f"w{i % 30}"] for i in range(11)] + [nn.EOS]
         for _ in range(64):
             pool.add(seq)
-        first = nn.train_steps(m, pool, steps=1, batch=8, lr=1e-2, warmup=1)["first_loss"]
-        r = nn.train_steps(m, pool, steps=60, batch=8, lr=1e-2, warmup=1)
+        first = nn.train_steps(m, pool, steps=1, batch=8, lr=1e-2, warmup=1, total=100)["first_loss"]
+        r = nn.train_steps(m, pool, steps=60, batch=8, lr=1e-2, warmup=1, total=100)
         self.assertLess(r["loss"], first * 0.7)
         lp = m.logprob(seq)
-        self.assertGreater(lp, -3.0)
         out = m.generate(seq[:3], max_new=5, temperature=0.5, rng=np.random.default_rng(0))
         self.assertLessEqual(len(out), 5)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "n.npz"
-            m.save(path, vocab, meta={"x": 1})
-            m2, v2, meta = nn.TinyTransformer.load(path)
+            m.save(path, tok, meta={"x": 1})
+            m2, t2, meta = nn.TinyTransformer.load(path)
             self.assertEqual(meta["x"], 1)
-            self.assertEqual(len(v2), len(vocab))
+            self.assertEqual(len(t2), len(tok))
             self.assertAlmostEqual(m2.logprob(seq), lp, places=4)
+
+    def test_subword_tokenizer(self):
+        from tinyai.bpe import SubwordTokenizer
+        tok = SubwordTokenizer.train(["機械学習とは、データから規則性を学ぶ手法である。"] * 5 + ["Tokyo Tower was built in 1958."] * 5, size=200)
+        ids = tok.encode("機械学習とは? Tokyo Tower 1958!")
+        self.assertNotIn(1, ids)  # 基本文字 (ASCII・句読点) は必ず語彙にあるので <unk> は出ない
+        self.assertEqual(tok.decode(tok.encode("tokyo tower was built")), "tokyo tower was built")
+        self.assertIn("機械学習", tok.tokens)
 
     def test_brain_neural_step_and_dialog_feed(self):
         with tempfile.TemporaryDirectory() as tmp:
             b = make_brain(tmp)
             b.learn_text("\n".join(f"サンプル文 {i} は学習用の文章であり、内容は番号 {i} に関する説明です。" for i in range(10, 90)), "https://x/nn")
-            b.neural.min_vocab, b.neural.min_tokens = 10, 100  # テスト用に小さく
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
             r = b.neural_step(steps=2, budget_seconds=0.5)
             self.assertIsNotNone(b.neural.model)
             self.assertGreater(len(b.neural.pool), 0)

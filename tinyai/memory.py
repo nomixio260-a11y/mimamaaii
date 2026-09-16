@@ -47,8 +47,13 @@ class MemoryGuard:
         except ImportError:
             return None
         # RLIMIT_DATA は Linux 4.7+ でヒープ + 匿名 mmap を含むので RSS に近い。
-        # スレッドスタック等のために余裕を持たせる。
+        # スレッドスタック等のために余裕を持たせる。numpy (ニューラル LM の学習バッファ) があれば更に広げる
         headroom = max(96 * MB, self.limit // 2)
+        try:
+            import numpy  # noqa: F401
+            headroom += 192 * MB
+        except ImportError:
+            pass
         for name in ("RLIMIT_DATA", "RLIMIT_AS"):
             lim = getattr(resource, name, None)
             if lim is None:

@@ -176,41 +176,66 @@ def cmd_evolve(args) -> int:
 
 
 def cmd_train(args) -> int:
-    """ニューラル LM を前面で学習する (numpy が必要)。"""
+    """ニューラル LM (Transformer) を前面で学習する (numpy が必要)。
+    --hours を付けると収集システムからデータを流し込みながら長時間学習する。"""
     cfg = _build_config(args)
+    if args.size:
+        cfg.neural_size = args.size
     _setup_logging(cfg, True)
     brain = _open_brain(cfg)
     if not brain.neural.available:
         print("numpy がありません: pip install numpy")
         return 1
-    # 知識文と会話ペアを学習データに積む
-    n = 0
+    brain.neural.min_sentences = min(brain.neural.min_sentences, max(200, len(brain.kb)))
+    brain.neural.min_chars = min(brain.neural.min_chars, max(20000, sum(len(d.text) for d in brain.kb.docs.values())))
     for d in list(brain.kb.docs.values()):
         brain._neural_pending_text.append(d.text)
-        n += 1
-    brain.neural_step(steps=1, budget_seconds=0.01)  # モデル準備 + 供給
-    for u, b, _, w in brain.dialogs.pairs:
-        brain.neural.add_dialog(u, b, weight=w)
-    print(f"学習データ: 文 {n}, 会話 {len(brain.dialogs)}, プール {len(brain.neural.pool)} 系列, パラメータ {brain.neural.model.n_params():,}")
+    if brain.neural_step(steps=1, budget_seconds=0.01) is None and brain.neural.model is None:
+        print("学習データが足りません (文が少なすぎます)。まず learn や evolve で集めてください。")
+        return 1
+    nl = brain.neural
+    print(f"モデル {nl.size}: パラメータ {nl.model.n_params():,}, 語彙 {len(nl.tok)}, プール {len(nl.pool)} 系列 / {nl.pool.total_tokens:,} トークン, 会話 {len(brain.dialogs)}")
+    collector = None
+    if args.hours and cfg.web_enabled:
+        from .collector import Collector
+        from .web import Fetcher
+
+        collector = Collector(Fetcher(cfg.user_agent, cfg.fetch_timeout, cfg.max_page_bytes), cfg.data_dir, cfg.languages, interest=brain.interest_score)
+        print("収集しながら学習します (Ctrl+C で停止)")
     t0 = time.time()
+    limit_s = (args.hours * 3600) if args.hours else args.seconds
     done = 0
+    last_log = 0
     try:
-        while done < args.steps and (args.seconds is None or time.time() - t0 < args.seconds):
-            r = brain.neural.train_some(steps=10)
+        while (limit_s is None or time.time() - t0 < limit_s) and (limit_s is not None or done < args.steps):
+            if collector is not None and done % 100 == 0:
+                batch = collector.collect_stream() or collector.collect_link()
+                if batch is None:
+                    topic = brain.next_topic()
+                    batch = collector.collect(topic) if topic else None
+                if batch is not None:
+                    n = brain.learn_batch(batch, collector)
+                    brain.background_step(budget_docs=400)
+                    print(f"  収集 [{batch.kind}] {batch.topic[:30]} : {n} 文, 会話 {len(batch.dialogs)}")
+            r = brain.neural_step(steps=10, budget_seconds=60)
             if r is None:
                 print("学習データが足りません")
                 break
-            done += 10
-            if done % 50 == 0:
-                ev = brain.neural.evaluate(brain.lm.perplexity(brain.holdout) if brain.holdout else None)
-                print(f"step {brain.neural.model.step} loss {r['loss']:.3f} {r['tokens_per_s']} tok/s  {ev}")
+            done += r["steps"]
+            if done - last_log >= 100:
+                last_log = done
+                ev = nl.evaluate(brain.lm.perplexity(brain.holdout) if brain.holdout else None)
+                print(f"step {nl.model.step} loss {r['loss']:.3f} {r['tokens_per_s']} tok/s  {ev}  経過 {(time.time() - t0) / 60:.1f} 分")
+                brain.enforce_memory()
     except KeyboardInterrupt:
         pass
-    brain.neural.evaluate(brain.lm.perplexity(brain.holdout) if brain.holdout else None)
-    brain.neural.save()
-    print(json.dumps(brain.neural.stats(), ensure_ascii=False))
-    for q in ("こんにちは", "機械学習とは？"):
-        print(q, "->", ["".join(w) for w in brain.neural.generate_reply(q, n=2)])
+    nl.evaluate(brain.lm.perplexity(brain.holdout) if brain.holdout else None)
+    brain.save()
+    print(json.dumps(nl.stats(), ensure_ascii=False))
+    for q in ("こんにちは", "機械学習とは？", "宇宙について教えて"):
+        hits = brain._search(q)
+        ctx = " ".join(d.text for _, d in hits[:2])[:200] or None
+        print(q, "->", nl.chat(q, ctx, n=2))
     return 0
 
 
@@ -335,6 +360,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("train", help="ニューラル LM (Transformer) を前面で学習 (numpy が必要)")
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--seconds", type=float, default=None)
+    p.add_argument("--hours", type=float, default=None, help="収集しながら長時間学習する")
+    p.add_argument("--size", choices=["small", "base", "large"], default=None)
     p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("stats", help="状態を表示")
