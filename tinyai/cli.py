@@ -228,17 +228,27 @@ def cmd_train(args) -> int:
     limit_s = (args.hours * 3600) if args.hours else args.seconds
     done = 0
     last_log = 0
+    rounds = 0
     try:
         while (limit_s is None or time.time() - t0 < limit_s) and (limit_s is not None or done < args.steps):
-            if collector is not None and done % 100 == 0:
-                batch = collector.collect_stream() or collector.collect_link()
+            if collector is not None:
+                # 1 分の学習ごとに 1 バッチ収集 (会話データの多いストリーム源を優先し、3 回に 1 回は話題探索)
+                rounds += 1
+                batch = None
+                if rounds % 3:
+                    for _ in range(3):   # 供給源はランダム選択なので、外れ (レート制限など) なら別の源を試す
+                        batch = collector.collect_stream()
+                        if batch is not None:
+                            break
+                if batch is None:
+                    batch = collector.collect_link()
                 if batch is None:
                     topic = brain.next_topic()
                     batch = collector.collect(topic) if topic else None
                 if batch is not None:
                     n = brain.learn_batch(batch, collector)
                     brain.background_step(budget_docs=400)
-                    print(f"  収集 [{batch.kind}] {batch.topic[:30]} : {n} 文, 会話 {len(batch.dialogs)}")
+                    print(f"  収集 [{batch.kind}] {batch.topic[:30]} : {n} 文, 会話 {len(batch.dialogs)} (会話計 {len(brain.dialogs)})")
             before = nl.model.step
             r = brain.neural_step(steps=10, budget_seconds=60)
             if r is None:
