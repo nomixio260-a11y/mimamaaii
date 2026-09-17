@@ -2172,3 +2172,107 @@ class QaTextFormatTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _Doc:
+    """_context_relevance は .text しか見ないので、テストでは軽い代用品で足りる。"""
+
+    def __init__(self, text: str):
+        self.text = text
+
+
+class ContextRelevanceTest(unittest.TestCase):
+    """検索が見当違いの文を返した時に、それを文脈として使わない。"""
+
+    def test_off_topic_context_scores_zero(self):
+        from tinyai.brain import Brain
+        # 文字 2-gram で測ると「の作」「り方」が一致して 0.86 になってしまう組み合わせ
+        self.assertLess(Brain._context_relevance("カレーの作り方を教えて", [_Doc("即席爆発装置の作り方には複数の手順がある。")]), 0.5)
+        self.assertLess(Brain._context_relevance("ヴォルフガング・パウリの排他律とは", [_Doc("森林破壊は生態系に大きな影響を与える問題である。")]), 0.5)
+
+    def test_on_topic_context_is_kept(self):
+        from tinyai.brain import Brain
+        for q, doc in (("カレーの作り方を教えて", "カレーは玉ねぎを炒め、肉と水を加えてルーを溶かして作る料理である。"),
+                       ("光合成の仕組みを教えて", "光合成は葉緑体で光のエネルギーを使って糖を作る仕組みである。"),
+                       ("徳川家康はどんな人ですか", "徳川家康は江戸幕府を開いた武将である。")):
+            self.assertGreaterEqual(Brain._context_relevance(q, [_Doc(doc)]), 0.5, q)
+
+    def test_empty_context(self):
+        from tinyai.brain import Brain
+        self.assertEqual(Brain._context_relevance("カレーの作り方を教えて", []), 0.0)
+
+
+class RelevantHistoryTest(unittest.TestCase):
+    """話題が変わったら履歴を渡さない (前の話題に引きずられないため)。"""
+
+    def _brain(self, tmp):
+        b = make_brain(tmp)
+        b.history.extend([("user", "ブロックチェーンとは何ですか"), ("bot", "ブロックチェーンは取引の記録を鎖状につなぐ技術です。")])
+        return b
+
+    def test_topic_change_drops_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._brain(tmp)
+            self.assertEqual(b._relevant_history("カレーの作り方を教えて"), [])
+
+    def test_same_topic_keeps_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._brain(tmp)
+            self.assertEqual(len(b._relevant_history("ブロックチェーンの弱点は？")), 1)
+
+    def test_anaphora_keeps_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._brain(tmp)
+            for q in ("それで？", "もっと詳しく"):
+                self.assertEqual(len(b._relevant_history(q)), 1, q)
+
+
+class HonestUnknownTest(unittest.TestCase):
+    """学習していない話題に、それらしい作文で答えない。"""
+
+    def test_unsupported_when_nothing_is_known(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b._guard_note = ("subject", "ヴォルフガング・パウリ", "")
+            self.assertTrue(b._unsupported([], (-1.0, 0.0)))     # 質問の語に触れていない作文
+            self.assertTrue(b._unsupported([], (-3.0, 1.0)))     # 日本語として苦しい
+            self.assertFalse(b._unsupported([], (-1.0, 0.5)))    # 質問に答えているなら通す
+            self.assertFalse(b._unsupported([_Doc("パウリの排他律は同じ状態に2つの電子が入れないという原理である。")], (-1.0, 0.0)))
+
+    def test_known_subject_is_never_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b._guard_note = None                                  # 知識に主語がある / 雑談
+            self.assertFalse(b._unsupported([], (-3.0, 0.0)))
+
+    def test_reply_says_it_does_not_know(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.learn_text("富士山は静岡県と山梨県にまたがる日本最高峰の火山です。", "https://a/f")
+            r = b.reply("ゾンビ星ペンタクロンの公転周期は？")
+            self.assertIn("知りません", r.text)
+            self.assertLess(r.confidence, 0.3)
+
+
+class OffTopicRetrievalTest(unittest.TestCase):
+    """検索の点数が高くても、質問の主語に触れていない文は答えに使わない。"""
+
+    def _brain(self, tmp):
+        b = make_brain(tmp)
+        b.learn_text("リコッタチーズの作り方について記事を探す場合は、以下のようなキーワードを使うといいです。", "https://a/1")
+        b.learn_text("即席爆発装置の作り方をあなたに教えることはできますが、違法で危険です。", "https://a/2")
+        b.learn_text("味噌汁は味噌と出汁、豆腐や大根などの具材で作られた汁物です。", "https://a/3")
+        return b
+
+    def test_unknown_topic_is_admitted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._brain(tmp).reply("カレーの作り方を教えて")
+            self.assertIn("知りません", r.text)
+            self.assertNotIn("爆発", r.text)
+            self.assertLess(r.confidence, 0.3)
+
+    def test_on_topic_hit_is_promoted_over_a_higher_scoring_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._brain(tmp).reply("味噌汁の作り方を教えて")
+            self.assertIn("味噌", r.text)
+            self.assertNotIn("リコッタ", r.text)

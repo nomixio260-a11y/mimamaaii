@@ -386,6 +386,93 @@ class Brain:
             return 0.0
         return min(1.0, (top - 3) / 3)
 
+    @staticmethod
+    def _longest_common_run(key: str, body: str) -> int:
+        """key の部分文字列のうち body に現れる最長のものの長さ。"""
+        best = 0
+        for i in range(len(key)):
+            for j in range(i + best + 1, len(key) + 1):
+                if key[i:j] in body:
+                    best = j - i
+                else:
+                    break
+        return best
+
+    @classmethod
+    def _key_match(cls, key: str, body: str) -> bool:
+        """肝になる語が文脈に「ほぼ」出てくるか。完全一致だと表記ゆれで落ちる
+        (「ヴォルフガング・パウリ」が本文では「パウリ」と略される)。3 文字以上 (短い語はその全部が)
+        連続して現れたら出てきたとみなす。割合で緩めると「カレー」が「レー」の 2 文字で通ってしまう。"""
+        return cls._longest_common_run(key, body) >= min(len(key), 3)
+
+    @staticmethod
+    def _question_keys(text: str) -> tuple[list[str], bool]:
+        """質問を決めている語と、それが主語かどうか。
+
+        「X の Y は?」の形なら X (主語) だけを見る。属性側の語 (作り方・仕組み・意味) は
+        どんな話題にも出てくるので、これを数に入れると「カレーの作り方」に
+        「即席爆発装置の作り方」が一致してしまう。形が取れない時は珍しい句を 2 つ使う。"""
+        parsed = parse_question(text)
+        if parsed:
+            subj_keys = [p for p in phrases(parsed[0]) if is_phrase(p)]
+            if subj_keys:
+                return sorted(subj_keys, key=lambda p: -term_weight(p))[:2], True
+        return sorted({p for p in phrases(text) if is_phrase(p)}, key=lambda p: -term_weight(p))[:2], False
+
+    @classmethod
+    def _context_relevance(cls, text: str, docs) -> float:
+        """質問の「肝になる語」が検索した文脈に現れるかどうか (0〜1)。
+
+        文字 2-gram で測ると「の作」「を教」のような助詞混じりの断片まで一致してしまい、
+        「カレーの作り方」に「即席爆発装置の作り方」が 0.86 で一致する。主語が分かる質問では
+        主語が出てくることを必須にし、分からない質問では珍しい句がいくつ出てくるかで測る。"""
+        keys, is_subject = cls._question_keys(text)
+        if not keys or not docs:
+            return 0.0
+        body = " ".join(d.text for d in docs)
+        hits = [cls._key_match(k, body) for k in keys]
+        if is_subject:                                  # 主語が 1 つも出てこない文脈は、その質問の答えではない
+            return 1.0 if any(hits) else 0.0
+        return sum(hits) / len(hits)
+
+    def _relevant_history(self, text: str, k: int = 2) -> list[tuple[str, str]]:
+        """直近のやり取りのうち、今の発話と関係のあるものだけを渡す。
+
+        話題が変わったのに履歴を渡すと、生成が前の話題に引きずられる
+        (実測: 「カレーの作り方を教えて」に「ブロックチェーンとは…」と答えた)。
+        今の発話に内容語があり、履歴とまったく重ならなければ「新しい話題」とみなして履歴を捨てる。
+        指示語で始まる発話 (「それで?」など) は内容語が無いので、そのまま履歴を渡す。"""
+        hist = self.recent_turns(k)
+        if not hist:
+            return hist
+        low = text.lower().strip()
+        if _MORE_RE.match(low) or _FOLLOWUP_RE.match(low):   # 「もっと詳しく」「それで?」は前の話の続き
+            return hist
+        now = {t for t in terms(text) if term_weight(t) >= 1.0}
+        if not now:                                  # 内容語が無い相槌も履歴が頼り
+            return hist
+        kept = []
+        for u, b in hist:
+            past = {t for t in terms(u + " " + b) if term_weight(t) >= 1.0}
+            if now & past:
+                kept.append((u, b))
+        return kept
+
+    def _unsupported(self, ctx_docs, info) -> bool:
+        """根拠の無い作文か (= 「知らない」と答えるべきか)。
+
+        学習していない話題を訊かれた時に、それらしい文を作って出すのが一番たちが悪い
+        (実測: 「ヴォルフガング・パウリの排他律とは」に森林破壊の話を返した)。
+        次の 3 つが揃った時だけ黙る:
+          (a) 使える文脈が無い (検索が空、または関連度の検査で捨てられた)
+          (b) 知識に質問の主語がまったく無い (_guard_unknown の判定)
+          (c) 出来た文が質問の語にほとんど触れていない、か日本語として苦しい
+        (c) を見るのは、知識が無くても答えられる問い (挨拶・言い換え・常識) まで塞がないため。"""
+        if ctx_docs or self._guard_note is None:
+            return False
+        fluency, q_overlap = info
+        return q_overlap < 0.34 or fluency < -2.0
+
     def recent_turns(self, k: int = 2) -> list[tuple[str, str]]:
         """直近のやり取りを (発話, 応答) の組で返す (会話のキャッチボール用)。"""
         pairs: list[tuple[str, str]] = []
@@ -406,14 +493,20 @@ class Brain:
         strict=True: 接地率と自然さで厳しく検査 (検索応答と併用する時)。
         strict=False: ニューラル専用モード。明らかに壊れた文だけ捨てる。過程は self.last_thought に残す (UI / API 用)。"""
         ctx_docs = [d for c, d in hits[:3] if c >= self.params.answer_threshold * 0.5]
+        # 検索は点数が付いていても見当違いのことがある (「カレーの作り方」に数列の説明が返る)。
+        # 質問の内容語が文脈にどれだけ出てくるかで確かめ、関係が薄ければ文脈として使わない。
+        # 無関係な文を写し取るくらいなら、何も見ずに書く方がまだ話が通じる。
+        relevance = self._context_relevance(text, ctx_docs)
+        if relevance < 0.5:                      # 肝になる語が 1 つも出てこない文脈は使わない
+            ctx_docs = []
         context = " ".join(d.text for d in ctx_docs)[:240] or None
-        history = self.recent_turns(2)
+        history = self._relevant_history(text)
         # 検索が弱い時は文脈への寄せを緩める (雑談まで検索文を写すと会話にならない)
         best_score = hits[0][0] if hits else 0.0
         base_bonus = self.neural.decode.get("copy_bonus", 0.0)
         weak = best_score < self.params.answer_threshold * 1.5 or getattr(self, "_followup", False)
         bonus = base_bonus * 0.3 if weak else base_bonus
-        n = 4 if not strict else 3
+        n = 8 if not strict else 6                  # 候補を増やして選ぶ幅を広げる
         # 検索が弱い = 雑談なので長く自由に書かせる。検索が効いている時は短く的確に答える
         max_new = 110 if weak else 60
         cands = self.neural.chat(text, context, n=n, history=history, copy_bonus=bonus, max_new=max_new)
@@ -438,7 +531,7 @@ class Brain:
         # 3. 検証
         qphr = set(phrases(text))
         cphr = set(phrases(context)) if context else set()
-        best, best_s = None, -1e9
+        best, best_s, best_info = None, -1e9, (0.0, 0.0)
         seen = set()
         for c in cands:
             if c in seen:
@@ -473,7 +566,14 @@ class Brain:
             thought["scores"].append((c[:60], round(sc, 3)))
             if sc > best_s:
                 best, best_s = c, sc
+                best_info = (fluency, len(ph & qphr) / max(len(qphr), 1))
         thought["best"] = best
+        # 根拠が無いのに作文していないか最後に確かめる (「知らない」と言う方が正しい場面)
+        if best is not None and self._unsupported(ctx_docs, best_info):
+            thought["best"], thought["unsupported"] = None, True
+            self.last_thought = thought
+            self.stats["neural_unknown"] += 1
+            return None
         self.last_thought = thought
         if best is None:
             self.stats["neural_rejected"] += 1
@@ -1213,6 +1313,21 @@ class Brain:
             ks = [k for k in keywords(text, limit=2) if is_phrase(k)]
             if ks and not any(self.kb.posting_ids(k) for k in ks):
                 subj_ok = False
+        # (c) 検索の点数は高いのに、出てきた文が質問の肝になる語に触れていない
+        # 転置索引の点数は助詞混じりの断片でも上がるので、点数だけ見ると見当違いの文を読み上げてしまう
+        # (実測: 「カレーの作り方を教えて」→ 爆発装置の作り方、「ゾンビ星ペンタクロンの公転周期は?」→ 月の公転周期)
+        keys, _ = self._question_keys(text)
+        if subj_ok and keys and is_question(text) and hits:
+            on_topic = [(c, d) for c, d in hits if any(self._key_match(k, d.text) for k in keys)]
+            if not on_topic:
+                self.stats["off_topic_hits"] += 1
+                self._guard_note = ("subject", subj or keys[0], "")
+                return [(min(c, 0.2), d) for c, d in hits]
+            if len(on_topic) < len(hits):
+                # 触れている文を前に出す (点数 1 位が見当違いでも、下位に本物があればそちらを使う)
+                off = [(min(c, self.params.answer_threshold * 0.5), d) for c, d in hits if (c, d) not in on_topic]
+                self.stats["off_topic_hits"] += 1
+                hits = on_topic + off
         if not subj_ok:
             self.stats["unknown_subject"] += 1
             self._guard_note = ("subject", subj or " ".join(keywords(text, limit=1)), "")
