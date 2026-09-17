@@ -18,6 +18,10 @@ _PII_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|\+?\d[\d\-() ]{8,}\d")
 _QUOTE_RE = re.compile(r"「([^「」]{2,80})」")
 # 中身のない前置き (これだけを学ぶと「以下のような質問があります」のような空の応答を返すようになる)
 _HOLLOW_RE = re.compile(r"(以下|次|下記)の(ような|とおり|点|よう)|以下に|ご紹介します|説明します$|挙げます$")
+# 前置きだけで終わる応答 (箇条書きが続かないまま切れたもの)。これを学ぶと中身のない返事を覚える
+# 「〜があります。」のような普通の結びは残す。前置きだと分かる形だけを落とす
+_HOLLOW_TAIL_RE = re.compile(r"(以下|次|下記)の(ような|とおり|点|よう|もの)[^。]*。?$|以下に[^。]*。?$"
+                             r"|ご紹介します。?$|(を|について)?説明します。?$|(を)?挙げます。?$")
 
 
 class DialogStore:
@@ -90,6 +94,10 @@ class DialogStore:
         if len(user) > 300:
             user = self._shorten(user, 300)
         if len(user) < 2 or len(bot) < 2:
+            return False
+        # 「以下のようなものが挙げられます。」だけの応答は、中身が無いまま「前置きを返す型」を教える。
+        # 短くて前置きで終わるものだけを落とす (長い応答は前置きの後に中身が入っている)。
+        if len(bot) < 60 and _HOLLOW_TAIL_RE.search(bot):
             return False
         if _PII_RE.search(user) or _PII_RE.search(bot):
             return False

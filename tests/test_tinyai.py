@@ -2063,6 +2063,25 @@ class TermOveruseTest(unittest.TestCase):
         self.assertEqual(Brain._term_overuse("犬です。"), 0.0)
 
 
+class HollowReplyTest(unittest.TestCase):
+    """前置きだけで終わる短い応答は学習データに入れない。"""
+
+    def test_rejects_lead_in_only(self):
+        from tinyai.dialog import DialogStore
+        d = DialogStore(20)
+        self.assertFalse(d.add("多汗症の治療法は?", "主なものとして、以下のようなものが挙げられます。"))
+        self.assertFalse(d.add("方法は?", "良い点をいくつか挙げます"))
+
+    def test_keeps_ordinary_replies(self):
+        from tinyai.dialog import DialogStore
+        d = DialogStore(20)
+        for a in ("日本には春夏秋冬の四季があります。",          # 「〜があります」は普通の結び
+                  "原因はストレスだと考えられます。",
+                  "3776メートルです。",
+                  "制汗剤や内服薬があります。症状が重い場合は手術も選択肢です。"):
+            self.assertTrue(d.add("質問 " + a[:4], a), a)
+
+
 class PassageReferenceTest(unittest.TestCase):
     """本文を指す応答は、文脈と一緒でなければ学ばない。"""
 
