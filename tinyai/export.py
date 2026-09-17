@@ -151,6 +151,9 @@ def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1
     nl = brain.neural
     if nl.model is None or nl.tok is None:
         raise RuntimeError("ニューラル LM がまだありません (train で学習してください)")
+    # どちらの重みを配るか決めるために、書き出す前に評価する (EMA が劣化していたら生の重みを配る)
+    if getattr(nl, "_holdout", None):
+        nl.evaluate()
     out_dir = Path(out_dir)
     docs = []
     total = 0
