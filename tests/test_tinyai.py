@@ -1145,6 +1145,28 @@ class RealtimeLearningTest(unittest.TestCase):
             self.assertGreater(len(b.neural.pool), before)
             self.assertTrue(any(w < 0 for _, w, _ in b.neural.pool.items), "再生バッファに負例が入る")
 
+    def test_dialog_shortening_and_language_preference(self):
+        from tinyai.dialog import DialogStore
+        d = DialogStore()
+        long_bot = "最初の文です。" + "続きの説明がここに入ります。" * 30
+        self.assertTrue(d.add("質問", long_bot))
+        _, bot, _, _ = d.pairs[-1]
+        self.assertLessEqual(len(bot), DialogStore.MAX_BOT + 40)
+        self.assertTrue(bot.endswith("。"))          # 途中で切れた文は残さない
+        self.assertTrue(d.add("問い", "短い答え。"))
+        self.assertFalse(d.add("あ", "い"))           # 短すぎるものは従来通り弾く
+        # 第 1 言語の供給源が優先される
+        with tempfile.TemporaryDirectory() as tmp:
+            col = Collector(object(), Path(tmp), languages=("ja", "en"))
+            ja = [s_ for s_ in col.streams if s_.lang == "ja"]
+            en = [s_ for s_ in col.streams if s_.lang == "en"]
+            if ja and en:
+                for s_ in col.streams:
+                    col._h(f"{s_.name}:{s_.lang}").record(True, 1.0, 0.5)
+                primary = col.languages[0]
+                w = {f"{s_.name}:{s_.lang}": col._h(f"{s_.name}:{s_.lang}").score * s_.weight * (1.0 if s_.lang == primary else 0.4) for s_ in col.streams}
+                self.assertGreater(sum(v for k, v in w.items() if k.endswith(":ja")), sum(v for k, v in w.items() if k.endswith(":en")) * 1.2)
+
 
 if __name__ == "__main__":
     unittest.main()

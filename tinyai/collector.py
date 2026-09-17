@@ -618,7 +618,9 @@ class Collector:
         """話題に依らない供給源 (ランダム記事・文学) から 1 つ。健全性 × 重み で選ぶ。"""
         if not self.streams:
             return None
-        weights = [max(0.05, self._h(f"{s.name}:{s.lang}").score * s.weight) for s in self.streams]
+        primary = self.languages[0] if self.languages else "ja"
+        # 第 1 言語を優先 (小さなモデルの容量を分散させない)。第 2 言語以降は半分の重み
+        weights = [max(0.05, self._h(f"{s.name}:{s.lang}").score * s.weight * (1.0 if s.lang == primary else 0.4)) for s in self.streams]
         src = random.choices(self.streams, weights=weights)[0]
         name = f"{src.name}:{src.lang}"
         t0 = time.time()

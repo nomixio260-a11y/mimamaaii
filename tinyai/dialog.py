@@ -23,9 +23,28 @@ class DialogStore:
         self.pairs: deque = deque(maxlen=capacity)   # (user, bot, source, weight)
         self.seen: set[int] = set()
 
+    MAX_BOT = 220      # 小さなモデルは長い応答を覚えきれない: 先頭の数文に切り詰めて学ぶ
+
+    @staticmethod
+    def _shorten(text: str, limit: int) -> str:
+        """句点・改行の区切りで limit 文字以内に切り詰める (途中で切れた文は捨てる)。"""
+        if len(text) <= limit:
+            return text
+        cut = text[: limit + 40]
+        best = -1
+        for mark in ("。", "！", "？", ".", "!", "?", "\n"):
+            i = cut.rfind(mark)
+            if i > best:
+                best = i
+        return cut[: best + 1].strip() if best >= 20 else text[:limit].rstrip()
+
     def add(self, user: str, bot: str, source: str = "chat", weight: float = 1.0) -> bool:
         user, bot = user.strip(), bot.strip()
-        if len(user) < 2 or len(bot) < 2 or len(user) > 300 or len(bot) > 600:
+        if len(bot) > self.MAX_BOT:
+            bot = self._shorten(bot, self.MAX_BOT)
+        if len(user) > 300:
+            user = self._shorten(user, 300)
+        if len(user) < 2 or len(bot) < 2:
             return False
         if _PII_RE.search(user) or _PII_RE.search(bot):
             return False
