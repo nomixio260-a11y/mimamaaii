@@ -784,6 +784,56 @@ class SequencePool:
     def __len__(self) -> int:
         return len(self.items)
 
+    # ------------------------------------------------------------ 保存と復元
+    def save(self, path) -> None:
+        """再生バッファを 1 つの npz に保存する (系列は連結した int32 配列 + 区切り位置)。
+        学習を再開するたびに作り直していると、貯水池抽出で残した古い系列も、優先度も、
+        混ざり具合も毎回失われる。バッファごと持ち越せば再開のたびに同じ状態から続けられる。"""
+        path = Path(path)
+        if not self.items:
+            return
+        ids = np.concatenate([it[0] for it in self.items]).astype(np.int32)
+        lens = np.array([len(it[0]) for it in self.items], dtype=np.int32)
+        weights = np.array([it[1] for it in self.items], dtype=np.float32)
+        loss_from = np.array([it[2] for it in self.items], dtype=np.int32)
+        tmp = Path(str(path) + ".tmp.npz")
+        np.savez(tmp, ids=ids, lens=lens, weights=weights, loss_from=loss_from,
+                 kinds=np.array([str(k) for k in self.kinds]),
+                 priority=self.priority[: len(self.items)],
+                 meta=np.array([self.capacity, self.pos, self.seen, self.reservoir], dtype=np.int64))
+        os.replace(tmp, path)
+
+    def load(self, path) -> int:
+        """save() で書いたバッファを読み戻す。容量が変わっていても入るだけ入れる。"""
+        path = Path(path)
+        if not path.exists():
+            return 0
+        z = np.load(path, allow_pickle=False)
+        ids, lens = z["ids"], z["lens"]
+        weights, loss_from = z["weights"], z["loss_from"]
+        kinds = [str(k) for k in z["kinds"]] if "kinds" in z.files else ["text"] * len(lens)
+        prio = z["priority"] if "priority" in z.files else None
+        cap, pos, seen, reservoir = (int(x) for x in z["meta"]) if "meta" in z.files else (self.capacity, 0, 0, self.reservoir)
+        self.items, self.kinds, self.kind_counts = [], [], {}
+        self.total_tokens = 0
+        off = 0
+        for i, n in enumerate(lens):
+            n = int(n)
+            if len(self.items) >= self.capacity:
+                break
+            seq = ids[off : off + n].astype(np.int32)
+            off += n
+            kind = kinds[i] if i < len(kinds) else "text"
+            self.items.append((seq, float(weights[i]), int(loss_from[i])))
+            self.kinds.append(kind)
+            self.kind_counts[kind] = self.kind_counts.get(kind, 0) + 1
+            self.total_tokens += n
+            self.priority[len(self.items) - 1] = float(prio[i]) if prio is not None and i < len(prio) else self.init_priority
+        self.pos = pos % max(1, self.capacity - self.reservoir)
+        self.seen = max(seen, len(self.items))
+        self._cum_n = -1
+        return len(self.items)
+
 
 def lr_at(step: int, base_lr: float, warmup: int, total: int, min_ratio: float = 0.1, schedule: str = "wsd") -> float:
     """学習率。既定は WSD (warmup-stable-decay): ウォームアップの後は一定に保つ。

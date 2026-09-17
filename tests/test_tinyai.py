@@ -1404,5 +1404,47 @@ class ReplayReservoirTest(unittest.TestCase):
             self.assertGreater(len(nl.pool), before)
 
 
+class PoolPersistenceTest(unittest.TestCase):
+    """再生バッファを保存して復元する (再起動のたびに作り直さない)。"""
+
+    def test_pool_round_trip(self):
+        import numpy as np
+        from pathlib import Path
+        from tinyai.neural import SequencePool
+        with tempfile.TemporaryDirectory() as tmp:
+            p = SequencePool(300, seed=2)
+            for i in range(700):
+                p.add(np.array([8, 9, 10, 11, 12], dtype=np.int32), weight=float(i), loss_from=2,
+                      kind="dialog" if i % 3 else "text")
+            f = Path(tmp) / "pool.npz"
+            p.save(f)
+            q = SequencePool(300, seed=2)
+            self.assertEqual(q.load(f), len(p))
+            self.assertEqual(q.kind_counts, p.kind_counts)
+            self.assertEqual(q.total_tokens, p.total_tokens)
+            self.assertEqual(q.seen, p.seen)                 # 貯水池抽出の確率は見た総数で決まる
+            x, y, w = q.batch(2, 16)
+            self.assertEqual(x.shape, (2, 16))
+            self.assertEqual(w.shape, (2, 16))
+            self.assertEqual(SequencePool(300, seed=2).load(Path(tmp) / "無い.npz"), 0)
+
+    def test_neural_lm_keeps_pool_across_restart(self):
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            nl = NeuralLM(d, size="small")
+            nl.min_sentences, nl.min_chars = 4, 40
+            nl.ensure_model(["こんにちは。今日はいい天気です。散歩に行きましょう。%d" % i for i in range(60)])
+            for i in range(200):
+                nl.add_text("学習用の文です。番号は %d 番になります。" % i)
+            before = len(nl.pool)
+            self.assertGreater(before, 50)
+            nl.save()
+            nl2 = NeuralLM(d, size="small")
+            nl2.ensure_model()
+            self.assertEqual(len(nl2.pool), before)          # 再開しても同じ系列が残っている
+
+
 if __name__ == "__main__":
     unittest.main()

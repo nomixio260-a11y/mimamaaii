@@ -55,6 +55,7 @@ class NeuralLM:
         self.lock = threading.RLock()
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / "neural.npz"
+        self.pool_path = self.data_dir / "neural.pool.npz"   # 再生バッファ (再起動しても作り直さない)
         self.size = size if size in neural.PRESETS else "base"
         # 進化する復号パラメータ (👍/👎 の割合で山登り)
         self.decode = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.3, "copy_bonus": 1.0,
@@ -128,7 +129,11 @@ class NeuralLM:
                 self.online_steps = int(meta.get("online_steps", 0))
                 self.batch = neural.PRESETS.get(self.size, {}).get("batch", self.batch)
                 self.lr = neural.PRESETS.get(self.size, {}).get("lr", self.lr)
-                log.info("ニューラル LM を読込: %s %d params, step=%d", self.size, self.model.n_params(), self.model.step)
+                try:
+                    n_pool = self.pool.load(self.pool_path)
+                except Exception as e:
+                    n_pool, _ = 0, log.warning("再生バッファの読込失敗 (作り直します): %s", e)
+                log.info("ニューラル LM を読込: %s %d params, step=%d, 再生バッファ %d 系列", self.size, self.model.n_params(), self.model.step, n_pool)
                 return True
             except Exception as e:
                 log.warning("ニューラル LM の読込失敗 (作り直します): %s", e)
@@ -437,6 +442,10 @@ class NeuralLM:
         with self.lock:
             if self.model is None or self.tok is None:
                 return
+            try:
+                self.pool.save(self.pool_path)      # 再生バッファごと持ち越す (再開しても混ざり具合を失わない)
+            except Exception as e:
+                log.warning("再生バッファの保存に失敗: %s", e)
             self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300], "holdout_recent": [list(x) for x in self._holdout_recent],
                                                        "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
             self._last_save = time.time()
