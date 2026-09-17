@@ -52,7 +52,7 @@ class NeuralLM:
         self.path = self.data_dir / "neural.npz"
         self.size = size if size in neural.PRESETS else "base"
         # 進化する復号パラメータ (👍/👎 の割合で山登り)
-        self.decode = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.3, "copy_bonus": 3.0}
+        self.decode = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.3, "copy_bonus": 1.0}
         self._decode_trial: dict | None = None
         self._fb = [0, 0]           # 現在の設定での (👍, 👎)
         self._fb_best = 0.5         # 採用済み設定の 👍 率

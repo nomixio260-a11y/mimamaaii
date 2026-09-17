@@ -145,6 +145,7 @@ class Brain:
         self.neural = NeuralLM(self.cfg.data_dir, size=size, seed=self.cfg.seed or 0)  # Transformer LM (numpy, dropout=cfg.neural_dropout)
         self.last_self_eval: dict | None = None
         self.dialog_holdout: list = []             # 評価用に固定した会話 (比較できるように)
+        self._followup = False                     # 直前の発話が指示語・情報量の乏しい問いか
         self.last_thought: dict | None = None      # 直近のニューラル応答の思考過程 (下書き → 再検索 → 検証)
         self._neural_pending_text: deque = deque(maxlen=5000)
         self._neural_pending_dialog: deque = deque(maxlen=2000)   # (発話, 応答, 文脈, 重み)
@@ -361,7 +362,8 @@ class Brain:
         # 検索が弱い時は文脈への寄せを緩める (雑談まで検索文を写すと会話にならない)
         best_score = hits[0][0] if hits else 0.0
         base_bonus = self.neural.decode.get("copy_bonus", 0.0)
-        bonus = base_bonus if best_score >= self.params.answer_threshold else base_bonus * 0.3
+        weak = best_score < self.params.answer_threshold * 1.5 or getattr(self, "_followup", False)
+        bonus = base_bonus * 0.3 if weak else base_bonus
         n = 4 if not strict else 3
         cands = self.neural.chat(text, context, n=n, history=history, copy_bonus=bonus)
         thought = {"query": text, "context": [d.text[:80] for d in ctx_docs], "draft": list(cands), "rethink": [], "context2": [], "scores": [],
@@ -849,6 +851,8 @@ class Brain:
             query = text
             # 引き継ぎは「指示語で始まる」か「情報量のある語がほとんど無い」時だけ (「光の速さは？」には不要)
             info = sum(term_weight(t) for t in set(terms(text)))
+            # 指示語で始まる・情報量が乏しい発話は検索が当てにならない (生成を文脈に寄せすぎない)
+            self._followup = bool(_FOLLOWUP_RE.match(text.lower()) or (question and not topics and info < 1.5))
             if self.last_topics and (_FOLLOWUP_RE.match(text.lower()) or (question and not topics and info < 1.5)):
                 query = text + " " + " ".join(self.last_topics)
                 topics = topics or list(self.last_topics)

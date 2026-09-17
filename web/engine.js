@@ -546,8 +546,8 @@
       this.model = new Model(meta, bin);
       this.kb = new Retriever(kb && kb.docs);
       this.replay = (kb && kb.replay) ? kb.replay.slice() : [];
-      this.decode = Object.assign({ temperature: 0.7, top_p: 0.9, repetition_penalty: 1.3, copy_bonus: 3.0 }, meta.decode || {});
-      if (this.decode.copy_bonus === undefined) this.decode.copy_bonus = 3.0;
+      this.decode = Object.assign({ temperature: 0.7, top_p: 0.9, repetition_penalty: 1.3, copy_bonus: 1.0 }, meta.decode || {});
+      if (this.decode.copy_bonus === undefined) this.decode.copy_bonus = 1.0;
       this.lr = 3e-4;
       this.stats = { onlineSteps: 0, onlineTokens: 0, idleSteps: 0, turns: 0, good: 0, bad: 0, taught: 0, vocabAdded: 0, lossHist: [], learnedDocs: 0 };
       this.history = []; // [user, bot]
