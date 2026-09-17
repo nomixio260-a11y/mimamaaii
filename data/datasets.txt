@@ -1,5 +1,14 @@
 # Hugging Face datasets-server から読む公開データセット (dataset <TAB> config <TAB> split <TAB> 形式)
-# 形式: conversations / instruction / qa / text。ライセンスは各データセットのページを確認すること。
+# 形式: conversations / instruction / qa / squad / text。ライセンスは各データセットのページを確認すること。
 llm-jp/oasst1-21k-ja	default	train	conversations
+llm-jp/oasst2-33k-ja	default	train	conversations
+llm-jp/magpie-sft-v1.0	default	train	conversations
+Aratako/Magpie-Tanuki-8B-97k	default	train	instruction
 kunishou/databricks-dolly-15k-ja	default	train	instruction
+kunishou/hh-rlhf-49k-ja	default	train	instruction
+saillab/alpaca-japanese-cleaned	default	train	instruction
+Kendamarron/jimba-instuction-1k-beta	default	train	instruction
+izumi-lab/llm-japanese-dataset	default	train	instruction
+SkelterLabsInc/JaQuAD	default	train	squad
 databricks/databricks-dolly-15k	default	train	instruction
+llm-jp/oasst1-21k-en	default	train	conversations

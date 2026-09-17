@@ -705,7 +705,12 @@ class DialogTest(unittest.TestCase):
     def test_hf_row_parsing(self):
         from tinyai.collector import HuggingFaceDatasets
         conv = {"conversations": [{"from": "human", "value": "こんにちは"}, {"from": "gpt", "value": "こんにちは！"}, {"from": "human", "value": "元気？"}, {"from": "gpt", "value": "元気です"}]}
-        self.assertEqual(HuggingFaceDatasets._pairs_from_row(conv, "conversations"), [("こんにちは", "こんにちは！"), ("元気？", "元気です")])
+        # 複数ターンは直前の応答を文脈にする
+        self.assertEqual(HuggingFaceDatasets._pairs_from_row(conv, "conversations"), [("こんにちは", "こんにちは！"), ("元気？", "元気です", "こんにちは！")])
+        squad = {"question": "富士山の高さは？", "context": "富士山は日本一高い山である。標高は3776メートルで、静岡県と山梨県にまたがる。", "answers": {"text": ["3776メートル"], "answer_start": [17]}}
+        (q, a, ctx), = HuggingFaceDatasets._pairs_from_row(squad, "squad")
+        self.assertEqual((q, a), ("富士山の高さは？", "3776メートル。"))
+        self.assertIn("3776メートル", ctx)
         inst = {"instruction": "首都は？", "input": "日本", "output": "東京"}
         self.assertEqual(HuggingFaceDatasets._pairs_from_row(inst, "instruction"), [("首都は？\n日本", "東京")])
 
@@ -1001,6 +1006,89 @@ class RealtimeLearningTest(unittest.TestCase):
             self.assertGreater(test["train"]["loss"], 0)
             vocab = json.loads((Path(tmp) / "vocab.json").read_text(encoding="utf-8"))
             self.assertEqual(vocab[:8], ["<pad>", "<unk>", "<bos>", "<eos>", "<usr>", "<bot>", "<ctx>", "<sep>"])
+
+    def test_prioritized_replay_and_worker_sync(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        pool = nn.SequencePool(seed=0)
+        for i in range(40):
+            pool.add([2] + [10 + (i % 5)] * 6 + [3])
+        m = nn.TinyTransformer(60, d=32, heads=2, layers=1, ctx=8)
+        x, y, w = pool.batch(4, 7)
+        self.assertEqual(len(pool.last_rows), 4)
+        m.loss_and_grads(x, y, w)
+        self.assertEqual(m.last_row_loss.shape, (4,))
+        pool.update(m.last_row_loss)
+        touched = {i for rows in pool.last_rows for i in rows}
+        self.assertTrue(any(abs(pool.priority[i] - pool.init_priority) > 1e-6 for i in touched))  # 優先度が更新された
+        # 優先度の高い系列ほど多く出る
+        pool.priority[:40] = 0.05
+        pool.priority[7] = 50.0
+        nn.SequencePool.PRIORITY_MIX, mix = 0.0, nn.SequencePool.PRIORITY_MIX
+        try:
+            picks = [pool._pick() for _ in range(300)]
+        finally:
+            nn.SequencePool.PRIORITY_MIX = mix
+        self.assertGreater(picks.count(7), 100)
+        # ワーカー同期: journal に記録され、sync でワーカーに届く
+        from tinyai.neural_parallel import ParallelTrainer
+        pt = ParallelTrainer(m, pool, workers=2)
+        if pt.start():
+            try:
+                pool.add([2, 20, 21, 22, 23, 3])
+                self.assertEqual(len(pool.journal), 1)
+                self.assertEqual(pt.sync(), 1)
+                self.assertEqual(len(pool.journal), 0)
+                r = pt.train(steps=2, batch=4, lr=1e-3, total=100)
+                self.assertEqual(r["workers"], 2)
+            finally:
+                pt.stop()
+            self.assertIsNone(pool.journal)
+
+    def test_dropout_and_surprise_and_thinking(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        import numpy as np
+        m = nn.TinyTransformer(60, d=32, heads=2, layers=1, ctx=8, dropout=0.5)
+        x = np.array([[2, 10, 11, 12, 13, 14, 15, 3]])
+        a, _ = m.forward(x, train=True)
+        b, _ = m.forward(x, train=True)
+        c, _ = m.forward(x, train=False)
+        d, _ = m.forward(x, train=False)
+        self.assertGreater(float(np.abs(a - b).max()), 0.0)   # 学習時はマスクが違う
+        self.assertEqual(float(np.abs(c - d).max()), 0.0)     # 推論時は決定的
+        with tempfile.TemporaryDirectory() as tmp:
+            b_ = make_brain(tmp)
+            b_.learn_text("\n".join(f"サンプル文 {i} は学習用の文章であり、内容は番号 {i} に関する説明です。" for i in range(10, 90)), "https://x/nn")
+            b_.neural.min_sentences, b_.neural.min_chars, b_.neural.size = 10, 100, "small"
+            b_.neural_step(steps=2, budget_seconds=0.5)
+            self.assertIsNotNone(b_.neural.model)
+            self.assertEqual(b_.neural.model.dropout, b_.cfg.neural_dropout)
+            s1 = b_.neural.surprise(["サンプル文 12 は学習用の文章であり、内容は番号 12 に関する説明です。"])
+            s2 = b_.neural.surprise(["zzqx wvv kkjjl pqrst mnbvc lkjhg"])
+            self.assertIsNotNone(s1)
+            self.assertGreater(s2, 0)
+            # 収集ソースの価値: 驚きが評価表に入る
+            from tinyai.collector import Batch, Collector
+            col = Collector(None, Path(tmp), ["ja"])
+            b_.learn_batch(Batch("t", "topic", [("https://src/a", "新しい文 1 は説明である。新しい文 2 も説明である。新しい文 3 は違う説明である。", [])], "srcA", 0.1), col)
+            h = col.health["srcA"].to_dict()
+            self.assertIn("surprise", h)
+            self.assertIn("value", h)
+            # 思考: 2 段階生成の記録
+            b_.neural.ready = True
+            r = b_.reply("サンプル文 12 について教えて")
+            self.assertIsNotNone(b_.last_thought)
+            self.assertIn("draft", b_.last_thought)
+            self.assertIn("scores", b_.last_thought)
 
 
 if __name__ == "__main__":

@@ -103,8 +103,10 @@ def _rope_backward(d, cos, sin):
 
 # ---------------------------------------------------------------- モデル
 class TinyTransformer:
-    def __init__(self, vocab_size: int, d: int = 192, heads: int = 6, layers: int = 4, ctx: int = 128, ff: int | None = None, seed: int = 0, dtype=None):
+    def __init__(self, vocab_size: int, d: int = 192, heads: int = 6, layers: int = 4, ctx: int = 128, ff: int | None = None, seed: int = 0, dtype=None, dropout: float = 0.0):
         assert np is not None, "numpy が必要です"
+        self.dropout = float(dropout)          # 残差ブロック出力のドロップアウト率 (学習時のみ、過学習の抑制)
+        self._drop_rng = np.random.default_rng(seed + 99)
         assert d % heads == 0 and (d // heads) % 2 == 0
         self.V, self.d, self.h, self.L, self.T = vocab_size, d, heads, layers, ctx
         self.ff = ff or (8 * d // 3 // 64 * 64 or 64)
@@ -190,16 +192,25 @@ class TinyTransformer:
             v = v.reshape(B, T, self.h, dh).transpose(0, 2, 1, 3)
             att = _softmax(q @ k.transpose(0, 1, 3, 2) / math.sqrt(dh) + mask)
             a = (att @ v).transpose(0, 2, 1, 3).reshape(B, T, self.d)
-            x2 = x + a @ p[f"l{i}.wo"]
+            ao = a @ p[f"l{i}.wo"]
+            m1 = m2 = None
+            if train and self.dropout > 0:
+                m1 = (self._drop_rng.random(ao.shape) >= self.dropout).astype(self.dtype) * (1.0 / (1.0 - self.dropout))
+                ao *= m1
+            x2 = x + ao
             h2, c2 = _rms_forward(x2, p[f"l{i}.rms2"])
             u = h2 @ p[f"l{i}.w1"]
             gt = h2 @ p[f"l{i}.wg"]
             sig = _sigmoid(gt)
             silu = gt * sig
             act = silu * u
-            x3 = x2 + act @ p[f"l{i}.w2"]
+            mo = act @ p[f"l{i}.w2"]
+            if train and self.dropout > 0:
+                m2 = (self._drop_rng.random(mo.shape) >= self.dropout).astype(self.dtype) * (1.0 / (1.0 - self.dropout))
+                mo *= m2
+            x3 = x2 + mo
             if train:
-                caches.append((h, c1, q, k, v, att, a, h2, c2, u, gt, sig, silu, act))
+                caches.append((h, c1, q, k, v, att, a, h2, c2, u, gt, sig, silu, act, m1, m2))
             x = x3
         xf, cf = _rms_forward(x, p["rmsf"])
         logits = xf @ p["wte"].T
@@ -244,10 +255,11 @@ class TinyTransformer:
         dxf = dlogits @ p["wte"]
         dx, g["rmsf"] = _rms_backward(dxf, cf)
         for i in reversed(range(self.L)):
-            h, c1, q, k, v, att, a, h2, c2, u, gt, sig, silu, act = caches[i]
+            h, c1, q, k, v, att, a, h2, c2, u, gt, sig, silu, act, m1, m2 = caches[i]
             # MLP (SwiGLU)
-            g[f"l{i}.w2"] = act.reshape(-1, self.ff).T @ dx.reshape(-1, self.d)
-            dact = dx @ p[f"l{i}.w2"].T
+            dmo = dx * m2 if m2 is not None else dx
+            g[f"l{i}.w2"] = act.reshape(-1, self.ff).T @ dmo.reshape(-1, self.d)
+            dact = dmo @ p[f"l{i}.w2"].T
             du = dact * silu
             dgt = dact * u * _silu_grad_from_sig(gt, sig)
             g[f"l{i}.w1"] = h2.reshape(-1, self.d).T @ du.reshape(-1, self.ff)
@@ -256,8 +268,9 @@ class TinyTransformer:
             dx2, g[f"l{i}.rms2"] = _rms_backward(dh2, c2)
             dx2 = dx2 + dx
             # Attention
-            g[f"l{i}.wo"] = a.reshape(-1, self.d).T @ dx2.reshape(-1, self.d)
-            da = (dx2 @ p[f"l{i}.wo"].T).reshape(B, T, self.h, dh).transpose(0, 2, 1, 3)
+            dao = dx2 * m1 if m1 is not None else dx2
+            g[f"l{i}.wo"] = a.reshape(-1, self.d).T @ dao.reshape(-1, self.d)
+            da = (dao @ p[f"l{i}.wo"].T).reshape(B, T, self.h, dh).transpose(0, 2, 1, 3)
             datt = da @ v.transpose(0, 1, 3, 2)
             dv = att.transpose(0, 1, 3, 2) @ da
             dscore = att * (datt - (datt * att).sum(-1, keepdims=True)) / math.sqrt(dh)
@@ -273,9 +286,12 @@ class TinyTransformer:
             dx1, g[f"l{i}.rms1"] = _rms_backward(dh1, c1)
             dx = dx1 + dx2
         flat = ids.reshape(-1)
-        onehot = np.zeros((self.V, flat.size), self.dtype)
-        onehot[flat, np.arange(flat.size)] = 1.0
-        g["wte"] += onehot @ dx.reshape(-1, self.d)
+        order = np.argsort(flat, kind="stable")
+        uniq, start = np.unique(flat[order], return_index=True)
+        g["wte"][uniq] += np.add.reduceat(dx.reshape(-1, self.d)[order], start, axis=0)
+        # 系列 (行) ごとの平均損失: 再生バッファの優先度 (難しい系列を多く出す) に使う
+        row_valid = valid.sum(1)
+        self.last_row_loss = (np.where(pos, loss_pos, loss_neg) * valid).sum(1) / np.maximum(row_valid, 1)
         return loss, g
 
     def adamw(self, grads, lr: float = 3e-4, beta1=0.9, beta2=0.99, wd=0.05, clip=1.0) -> float:
@@ -455,7 +471,7 @@ class TinyTransformer:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, **{f"p.{k}": v for k, v in self.p.items()}, **{f"m.{k}": v for k, v in self.m.items()}, **{f"v.{k}": v for k, v in self.v.items()},
-                            step=np.array(self.step), shape=np.array([self.V, self.d, self.h, self.L, self.T, self.ff]))
+                            step=np.array(self.step), shape=np.array([self.V, self.d, self.h, self.L, self.T, self.ff]), dropout=np.array(self.dropout))
         tokenizer.save(Path(str(path) + ".vocab.json"))
         Path(str(path) + ".meta.json").write_text(json.dumps(meta or {}, ensure_ascii=False), encoding="utf-8")
 
@@ -464,7 +480,7 @@ class TinyTransformer:
         path = Path(path)
         z = np.load(path)
         V, d, h, L, T, ff = [int(x) for x in z["shape"]]
-        model = cls(V, d, h, L, T, ff=ff)
+        model = cls(V, d, h, L, T, ff=ff, dropout=float(z["dropout"]) if "dropout" in z else 0.0)
         for k in list(model.p):
             model.p[k] = z[f"p.{k}"]
             model.m[k] = z[f"m.{k}"]
@@ -485,6 +501,8 @@ class SequencePool:
     会話の質が上がり、プロンプト部にも弱い言語モデル信号を残すので文脈の読みは壊れない。"""
 
     PROMPT_WEIGHT = 0.2
+    PRIORITY_ALPHA = 0.6      # 優先度の鋭さ (0 で一様)
+    PRIORITY_MIX = 0.5        # 一様サンプリングと混ぜる割合 (過学習と忘却の両方を避ける)
 
     def __init__(self, capacity: int = 30000, seed: int = 0):
         self.capacity = capacity
@@ -492,6 +510,13 @@ class SequencePool:
         self.pos = 0
         self.rng = np.random.default_rng(seed) if np is not None else None
         self.total_tokens = 0
+        # 優先再生: 系列ごとの直近の損失 (未学習は大きめの初期値)。損失の大きい = まだ覚えていない系列を多く出す
+        self.priority = np.zeros(capacity, dtype=np.float32) if np is not None else None
+        self.init_priority = 3.0
+        self.last_rows: list[list[int]] = []   # 直近のバッチで各行に入った系列の添字 (優先度更新用)
+        self._cum = None
+        self._cum_n = -1
+        self.journal: list | None = None       # ワーカー同期用: None なら記録しない
 
     def add(self, ids: list[int], weight: float = 1.0, loss_from: int = 0) -> None:
         """weight < 0 は負例 (unlikelihood)。負例は詰め込まず単独の系列として学習する。
@@ -500,12 +525,39 @@ class SequencePool:
             return
         item = (ids, float(weight), int(loss_from))
         if len(self.items) < self.capacity:
+            self.priority[len(self.items)] = self.init_priority
             self.items.append(item)
         else:
             self.total_tokens -= len(self.items[self.pos][0])
             self.items[self.pos] = item
+            self.priority[self.pos] = self.init_priority
             self.pos = (self.pos + 1) % self.capacity
         self.total_tokens += len(ids)
+        self._cum_n = -1
+        if self.journal is not None:
+            self.journal.append(item)
+
+    def _pick(self) -> int:
+        """優先度 ∝ (損失)^α と一様の混合でサンプリング。"""
+        n = len(self.items)
+        if self.PRIORITY_ALPHA <= 0 or self.rng.random() < self.PRIORITY_MIX or n < 8:
+            return int(self.rng.integers(n))
+        if self._cum_n != n:
+            pr = np.power(np.maximum(self.priority[:n], 0.05), self.PRIORITY_ALPHA)
+            self._cum = np.cumsum(pr)
+            self._cum_n = n
+        r = self.rng.random() * self._cum[-1]
+        return min(int(np.searchsorted(self._cum, r)), n - 1)
+
+    def update(self, row_loss) -> None:
+        """直近のバッチの行ごとの損失で優先度を更新 (指数移動平均)。"""
+        if not self.last_rows or row_loss is None:
+            return
+        for idxs, l in zip(self.last_rows, row_loss):
+            for i in idxs:
+                if i < len(self.items):
+                    self.priority[i] = 0.7 * self.priority[i] + 0.3 * float(l)
+        self._cum_n = -1
 
     @classmethod
     def token_weights(cls, length: int, loss_from: int, weight: float = 1.0):
@@ -522,8 +574,12 @@ class SequencePool:
         y = np.full((B, T), PAD, dtype=np.int64)
         w = np.ones((B, T), dtype=np.float32)
         n = len(self.items)
+        self.last_rows = []
         for b in range(B):
-            seq, wt, lf = self.items[int(self.rng.integers(n))]
+            j = self._pick()
+            seq, wt, lf = self.items[j]
+            rows = [j]
+            self.last_rows.append(rows)
             if wt < 0:
                 seq = seq[: T + 1]
                 L = len(seq) - 1
@@ -542,9 +598,12 @@ class SequencePool:
                 tw.append(self.token_weights(len(seq) - 1, lf, max(wt, 0.1)))
                 tw.append(np.array([max(wt, 0.1)], dtype=np.float32))  # 系列末 <eos> から次系列先頭への予測
                 if len(buf) < T + 1:
-                    seq, wt, lf = self.items[int(self.rng.integers(n))]
+                    j = self._pick()
+                    seq, wt, lf = self.items[j]
                     while wt < 0:
-                        seq, wt, lf = self.items[int(self.rng.integers(n))]
+                        j = self._pick()
+                        seq, wt, lf = self.items[j]
+                    rows.append(j)
             buf = buf[: T + 1]
             x[b] = buf[:-1]
             y[b] = buf[1:]
@@ -572,6 +631,7 @@ def train_steps(model: TinyTransformer, pool: SequencePool, steps: int, batch: i
     for _ in range(steps):
         x, y, w = pool.batch(batch, model.T)
         loss, g = model.loss_and_grads(x, y, w)
+        pool.update(model.last_row_loss)
         model.adamw(g, lr=lr_at(model.step, lr, warmup, total))
         losses.append(loss)
         if log and model.step % 50 == 0:

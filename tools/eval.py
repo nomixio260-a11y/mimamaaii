@@ -1,11 +1,14 @@
 """総合評価: 会話評価セット (data/eval/*.tsv) + 検索 (MRR / Recall@3) + LM (ppl) + 生成 (多様性・接地率・繰り返し)
-+ 遅延 (p50 / p95) + メモリ。結果は eval/results.jsonl に追記し、前回と比較する。
++ 遅延 (p50 / p95) + メモリ + ニューラル LM (学習効率・取り置き ppl・RAG 忠実性・リアルタイム学習・思考)
++ 収集システム (ソースごとの収穫・新規性・情報量・価値)。結果は eval/results.jsonl に追記し、前回と比較して退行を警告する。
 
-    python tools/eval.py                      # 全部
+    python tools/eval.py                      # 会話評価 + 遅延
     python tools/eval.py --verbose            # 失敗と各問の出力を表示
     python tools/eval.py --paraphrase         # 言い換えを自動生成して頑健性も測る
     python tools/eval.py --corpus corpus.txt  # 検索/LM/生成の指標をこのコーパスで測る
-    python tools/eval.py --compare            # 前回の結果との差分を表示
+    python tools/eval.py --corpus corpus.txt --neural   # 同じコーパスで小型 Transformer を固定ステップ学習し、学習効率と生成品質を測る
+    python tools/eval.py --data ~/.tinyai     # 学習済みの Brain を評価 (ニューラル LM の実力 + 収集ソースの評価表)
+    python tools/eval.py --compare            # 前回の結果との差分と退行 (5% 以上悪化) を表示
 """
 from __future__ import annotations
 
@@ -222,6 +225,150 @@ def run_corpus_metrics(corpus: Path | None) -> dict:
         }
 
 
+# ---------------------------------------------------------------- ニューラル LM
+def _neural_metrics(b: Brain, hold_sents: list[str], verbose: bool = False) -> dict:
+    """学習済み (または学習したばかりの) ニューラル LM を測る:
+    holdout ppl / RAG 忠実性 (文脈の文をどれだけ使うか) / リアルタイム学習 (教えた答えの対数確率の伸び、👎 の抑制)
+    / 思考 (再検索で文脈が増えた割合) / 生成速度。"""
+    import numpy as np
+    from tinyai import neural as nn
+    from tinyai.tokenizer import phrases as _phr
+
+    nl = b.neural
+    out: dict = {}
+    if nl.model is None:
+        return out
+    drop, nl.model.dropout = nl.model.dropout, 0.0
+    try:
+        hold_ids = [nl.seq_text(s) for s in hold_sents[:200]]
+        out["neural_holdout_ppl"] = round(nn.perplexity(nl.model, hold_ids), 2) if hold_ids else None
+        # RAG 忠実性: 文脈 = 取り置き文、質問 = その文のキーワード → 生成が文脈の句をどれだけ含むか
+        grounded, copied, n, gen_ms = 0.0, 0, 0, []
+        for s_ in hold_sents[:30]:
+            ks = [k for k in keywords(s_, limit=1) if is_phrase(k)]
+            if not ks:
+                continue
+            t0 = time.perf_counter()
+            cands = nl.chat(f"{ks[0]}について教えて", s_, n=2, max_new=40)
+            gen_ms.append((time.perf_counter() - t0) * 1000)
+            if not cands:
+                continue
+            cph = set(_phr(s_))
+            best = max(cands, key=lambda c: len(set(_phr(c)) & cph))
+            ph = set(_phr(best))
+            grounded += len(ph & cph) / max(len(ph), 1)
+            copied += ks[0] in best
+            n += 1
+            if verbose:
+                print(f"   RAG: {ks[0]!r} -> {best[:60]!r}")
+        out["rag_grounded"] = round(grounded / max(n, 1), 3)
+        out["rag_keyword_rate"] = round(copied / max(n, 1), 3)
+        out["neural_gen_ms"] = round(statistics.median(gen_ms), 1) if gen_ms else None
+        # リアルタイム学習: 架空の事実を 3 ステップ教え、答えの対数確率がどれだけ上がるか
+        q, a = "ゾルグ星の首都は？", "ゾルグ星の首都はカルドラである。"
+        seq = nl.seq_dialog(q, a)
+        lp0 = nl.model.logprob(seq)
+        nl.learn_turn(q, a, None, weight=1.0, steps=3)
+        lp1 = nl.model.logprob(seq)
+        out["online_gain_nat"] = round(lp1 - lp0, 3)
+        # 👎: その答えを出しにくくする
+        nl.learn_turn(q, a, None, weight=-1.0, steps=2)
+        lp2 = nl.model.logprob(seq)
+        out["unlearn_drop_nat"] = round(lp1 - lp2, 3)
+        # 思考: 再検索で文脈が増えた割合 (neural_only で応答した時)
+        if b.cfg.neural_rethink and hold_sents:
+            rethink = 0
+            m = 0
+            for s_ in hold_sents[:10]:
+                ks = [k for k in keywords(s_, limit=1) if is_phrase(k)]
+                if not ks:
+                    continue
+                b.neural.ready = True
+                b.reply(f"{ks[0]}とは？")
+                m += 1
+                if b.last_thought and b.last_thought.get("context2"):
+                    rethink += 1
+            out["think_rethink_rate"] = round(rethink / max(m, 1), 3)
+    finally:
+        nl.model.dropout = drop
+    return out
+
+
+def run_neural_budget(corpus: Path, steps: int = 300, verbose: bool = False) -> dict:
+    """同じコーパス・同じ乱数・同じステップ数で小型 Transformer を学習し、到達した損失と速度を測る = 学習効率の回帰テスト。"""
+    text = corpus.read_text(encoding="utf-8", errors="replace")
+    sents = split_sentences(text)
+    rng = random.Random(0)
+    rng.shuffle(sents)
+    hold = sents[: max(20, len(sents) // 20)]
+    train = sents[len(hold):]
+    with tempfile.TemporaryDirectory() as tmp:
+        b = make_brain(tmp)
+        if not b.neural.available:
+            return {}
+        nl = b.neural
+        nl.size, nl.min_sentences, nl.min_chars = "small", 10, 100
+        nl.batch, nl.lr = 16, 1e-3
+        if not nl.ensure_model(train):
+            return {}
+        b.learn_text("\n".join(train), source="https://eval/corpus")
+        for s_ in train:
+            nl.add_text(s_)
+        nl._holdout = [nl.seq_text(s_) for s_ in hold[:200]]
+        t0 = time.perf_counter()
+        losses = []
+        done = 0
+        while done < steps:
+            r = nl.train_some(steps=25)
+            if r is None:
+                break
+            done += r["steps"]
+            losses.append(r["loss"])
+        dt = time.perf_counter() - t0
+        out = {
+            "neural_budget_steps": done,
+            "neural_budget_loss": round(losses[-1], 3) if losses else None,
+            "neural_budget_first_loss": round(losses[0], 3) if losses else None,
+            "neural_tokens_per_s": round(done * nl.batch * nl.model.T / max(dt, 1e-9)),
+            "neural_params": nl.model.n_params(),
+        }
+        out.update(_neural_metrics(b, hold, verbose))
+        if verbose:
+            print("   budget 学習:", out)
+        return out
+
+
+def run_brain_eval(data_dir: Path, verbose: bool = False) -> dict:
+    """学習済みの Brain を評価: ニューラル LM の実力と収集ソースの評価表。"""
+    cfg = Config(data_dir=data_dir, memory_mb=1024, hard_limit=False, web_enabled=False, tools=True)
+    b = Brain(cfg)
+    b.load()
+    b.neural.ensure_model()
+    out: dict = {"kb_docs": len(b.kb), "dialogs": len(b.dialogs), "dialogs_by_source": b.dialogs.by_source(), "facts": b.facts.count}
+    st = b.stats
+    for k in ("docs_learned", "dups_dropped", "junk_dropped", "dialogs_collected", "new_terms", "neural_steps", "online_turns", "unlearned_turns"):
+        if k in st:
+            out["stat_" + k] = st[k]
+    if b.neural.model is not None:
+        out["neural"] = b.neural.stats()
+        hold = [d.text for d in b.kb.random_docs(min(200, len(b.kb)), random.Random(1))]
+        out.update(_neural_metrics(b, hold, verbose))
+    # 収集ソースの評価表 (Collector の健全性は Brain の状態に保存されている場合のみ)
+    sources = (b.agent_state.get("sources") if hasattr(b, "agent_state") else None) or {}
+    try:
+        from tinyai.collector import Collector
+        col = Collector(None, cfg.data_dir, cfg.languages)
+        sources = {k: v.to_dict() for k, v in col.health.items()} or sources
+    except Exception:
+        pass
+    if sources:
+        out["sources"] = sources
+        print("== 収集ソースの評価 (成功率 / 収穫 / 新規性 / 情報量 nat / 価値 / 点数)")
+        for name, h in sorted(sources.items(), key=lambda kv: -kv[1].get("score", 0))[:15]:
+            print(f"   {name:<22} {h.get('ok', 0)}/{h.get('tries', 0)}  gain {h.get('avg_gain', 0)}  nov {h.get('avg_novelty', 0)}  surprise {h.get('surprise', '-')}  value {h.get('value', '-')}  score {h.get('score', 0)}")
+    return out
+
+
 # ---------------------------------------------------------------- 記録・比較
 def git_rev() -> str:
     try:
@@ -245,6 +392,9 @@ def main() -> None:
     ap.add_argument("--paraphrase", action="store_true")
     ap.add_argument("--compare", action="store_true")
     ap.add_argument("--no-save", action="store_true")
+    ap.add_argument("--neural", action="store_true", help="--corpus で小型 Transformer を固定ステップ学習して学習効率を測る")
+    ap.add_argument("--steps", type=int, default=300)
+    ap.add_argument("--data", default=None, help="学習済み Brain のデータディレクトリを評価する")
     args = ap.parse_args()
     paths = [Path(p) for p in args.set] if args.set else sorted(EVAL_DIR.glob("*.tsv"))
     sets = load_sets(paths)
@@ -260,25 +410,39 @@ def main() -> None:
         "latency_ms": {"p50": round(lat_sorted[len(lat_sorted) // 2], 2), "p95": round(lat_sorted[int(len(lat_sorted) * 0.95)], 2), "max": round(lat_sorted[-1], 2)} if lat_sorted else {},
     }
     result.update(run_corpus_metrics(Path(args.corpus) if args.corpus else None))
+    if args.neural and args.corpus:
+        result.update(run_neural_budget(Path(args.corpus), steps=args.steps, verbose=args.verbose))
+    if args.data:
+        result["brain"] = run_brain_eval(Path(args.data), verbose=args.verbose)
     print("\n== 会話評価: %d/%d = %.3f" % (total_ok, total_n, result["conversation"]["acc"]))
     for k, v in sorted(per_cat.items()):
         print(f"   {k:<12} {v['ok']}/{v['n']} = {v['acc']}")
     print("== 遅延 ms:", result["latency_ms"])
-    for k in ("learn_sents_per_s", "rss_mb", "retrieval_mrr", "retrieval_recall3", "perplexity", "gen_distinct2", "gen_grounded4", "gen_repetition"):
+    for k in ("learn_sents_per_s", "rss_mb", "retrieval_mrr", "retrieval_recall3", "perplexity", "gen_distinct2", "gen_grounded4", "gen_repetition",
+              "neural_budget_steps", "neural_budget_loss", "neural_tokens_per_s", "neural_holdout_ppl", "rag_grounded", "rag_keyword_rate", "neural_gen_ms",
+              "online_gain_nat", "unlearn_drop_nat", "think_rethink_rate"):
         if k in result:
             print(f"== {k}: {result[k]}")
+    if "brain" in result:
+        br = result["brain"]
+        print("== 学習済み Brain:", {k: v for k, v in br.items() if k not in ("sources", "neural", "dialogs_by_source")})
+        if "neural" in br:
+            print("   ニューラル LM:", br["neural"])
     if "gen_samples" in result:
         for g in result["gen_samples"]:
             print("   生成例:", g)
     last = load_last()
     if args.compare and last:
         print("\n== 前回 (%s, %s) との比較" % (last.get("rev"), last.get("time")))
-        for k in ("conversation", "retrieval_mrr", "retrieval_recall3", "perplexity", "gen_grounded4", "learn_sents_per_s"):
+        higher_better = {"conversation": True, "retrieval_mrr": True, "retrieval_recall3": True, "perplexity": False, "gen_grounded4": True, "learn_sents_per_s": True,
+                         "neural_budget_loss": False, "neural_tokens_per_s": True, "neural_holdout_ppl": False, "rag_grounded": True, "online_gain_nat": True, "unlearn_drop_nat": True}
+        for k, hb in higher_better.items():
             a, b_ = last.get(k), result.get(k)
             if isinstance(a, dict):
                 a, b_ = a.get("acc"), b_.get("acc")
             if a is not None and b_ is not None:
-                print(f"   {k:<20} {a} -> {b_}")
+                worse = (b_ < a * 0.95) if hb else (b_ > a * 1.05)
+                print(f"   {k:<20} {a} -> {b_}{'   ⚠ 退行' if worse else ''}")
     if not args.no_save:
         RESULTS.parent.mkdir(parents=True, exist_ok=True)
         with RESULTS.open("a", encoding="utf-8") as f:

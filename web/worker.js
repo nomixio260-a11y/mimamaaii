@@ -15,6 +15,7 @@ function handle(msg) {
   if (op === 'learnText') return { result: engine.learnText(msg.text, msg.weight), summary: engine.summary() };
   if (op === 'feedback') return { result: engine.feedback(msg.positive), summary: engine.summary() };
   if (op === 'evolveVocab') { const added = engine.evolveVocab(msg.texts); return { added, summary: engine.summary(), tokens: added ? engine.tok.tokens.slice(8) : null }; }
+  if (op === 'idle') return { result: engine.idleStep(), summary: engine.summary() };
   if (op === 'snapshot') return engine.snapshot();
   if (op === 'summary') return engine.summary();
   throw new Error('unknown op ' + op);

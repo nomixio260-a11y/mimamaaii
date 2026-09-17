@@ -518,7 +518,7 @@
       this.replay = (kb && kb.replay) ? kb.replay.slice() : [];
       this.decode = Object.assign({ temperature: 0.7, top_p: 0.9, repetition_penalty: 1.3 }, meta.decode || {});
       this.lr = 3e-4;
-      this.stats = { onlineSteps: 0, onlineTokens: 0, turns: 0, good: 0, bad: 0, taught: 0, vocabAdded: 0, lossHist: [], learnedDocs: 0 };
+      this.stats = { onlineSteps: 0, onlineTokens: 0, idleSteps: 0, turns: 0, good: 0, bad: 0, taught: 0, vocabAdded: 0, lossHist: [], learnedDocs: 0 };
       this.history = []; // [user, bot]
       this._fb = [0, 0]; this._fbBest = 0.5; this._trial = null;
     }
@@ -543,27 +543,57 @@
       const ctx = hits.map((h) => h.text).join(' ').slice(0, 200);
       return { hits, context: ctx || null };
     }
-    // 応答: 検索 → n 本生成 → 平均対数確率で選ぶ。思考の記録を返す
-    reply(user, opts) {
-      opts = opts || {};
-      const n = opts.candidates || 3, t0 = Date.now();
-      const { hits, context } = this.retrieve(user, 3);
+    _generateCands(user, context, n, maxNew, pass) {
       const prompt = this.promptDialog(user, context);
       const cands = [];
       for (let i = 0; i < n; i++) {
-        const g = this.model.generate(prompt, { maxNew: opts.maxNew || 48, temperature: this.decode.temperature, topP: this.decode.top_p, repetitionPenalty: this.decode.repetition_penalty });
+        const g = this.model.generate(prompt, { maxNew, temperature: this.decode.temperature, topP: this.decode.top_p, repetitionPenalty: this.decode.repetition_penalty });
         const text = this.tok.decode(g.tokens).trim();
-        // 候補の点数: 平均対数確率 + 長さと文脈との重なりの補正
+        // 候補の点数: 平均対数確率 + 長さと文脈との重なりの補正 (接地)
         let overlap = 0;
         if (context) { const cg = new Set(Retriever.grams(context)); for (const g2 of Retriever.grams(text)) if (cg.has(g2)) overlap++; }
         const score = g.meanLogp + Math.min(text.length, 30) * 0.02 + Math.min(overlap, 10) * 0.05;
-        cands.push({ text, tokens: g.tokens, trace: g.trace, attention: g.attention, meanLogp: g.meanLogp, score, promptLength: g.promptLength });
+        cands.push({ text, tokens: g.tokens, trace: g.trace, attention: g.attention, meanLogp: g.meanLogp, score, promptLength: g.promptLength, pass, prompt });
+      }
+      return cands;
+    }
+    // 応答 = 考える: 1) 検索して下書きを生成 2) 下書きの語で再検索し文脈を広げてもう一度生成 3) 全候補を採点して選ぶ
+    reply(user, opts) {
+      opts = opts || {};
+      const n = opts.candidates || 3, t0 = Date.now(), maxNew = opts.maxNew || 48;
+      const { hits, context } = this.retrieve(user, 3);
+      let cands = this._generateCands(user, context, n, maxNew, 1);
+      let rethink = null;
+      if (opts.rethink !== false) {
+        const draft = cands.slice().sort((a, b) => b.score - a.score)[0];
+        if (draft && draft.text.length >= 4) {
+          const hits2 = this.kb.search(user + ' ' + draft.text, 4).filter((h) => !hits.some((x) => x.id === h.id)).slice(0, 2);
+          if (hits2.length) {
+            const context2 = (hits.slice(0, 2).map((h) => h.text).join(' ') + ' ' + hits2.map((h) => h.text).join(' ')).slice(0, 220);
+            const more = this._generateCands(user, context2, Math.max(2, n - 1), maxNew, 2);
+            rethink = { hits: hits2, context: context2, candidates: more.length };
+            cands = cands.concat(more);
+          }
+        }
       }
       cands.sort((a, b) => b.score - a.score);
       const best = cands.find((c) => c.text.length >= 2) || cands[0];
+      const ctxUsed = best.pass === 2 && rethink ? rethink.context : context;
       this.history.push([user, best.text]);
       this.stats.turns += 1;
-      return { text: best.text, hits, context, prompt, promptPieces: prompt.map((i) => this.tok.piece(i)), candidates: cands, best, ms: Date.now() - t0 };
+      return { text: best.text, hits, context: ctxUsed, rethink, prompt: best.prompt, promptPieces: best.prompt.map((i) => this.tok.piece(i)), candidates: cands, best, ms: Date.now() - t0 };
+    }
+    // 常時学習: 会話の合間に再生バッファの会話か知識文を 1 系列だけ学ぶ (数百 ms)。忘却を防ぎつつ少しずつ賢くなる
+    idleStep() {
+      const useDialog = this.replay.length && Math.random() < 0.5;
+      let seq, lf = 0, kind;
+      if (useDialog) { const [u, b] = this.replay[Math.floor(Math.random() * this.replay.length)]; seq = this.seqDialog(u, b, null); lf = seq.indexOf(BOT) + 1; kind = 'dialog'; }
+      else if (this.kb.docs.length) { const t = this.kb.docs[Math.floor(Math.random() * this.kb.docs.length)]; seq = [BOS].concat(this.tok.encode(t, this.model.T - 2), [EOS]); kind = 'text'; }
+      else return null;
+      if (seq.length < 4) return null;
+      const r = this._trainSeq(seq, lf, 0.5);
+      this.stats.idleSteps = (this.stats.idleSteps || 0) + 1;
+      return Object.assign(r, { kind });
     }
     // 1 ターンを即座に学習 (weight > 0: 正例、< 0: unlikelihood)。再生バッファから 1 本混ぜて忘却を防ぐ
     learnTurn(user, bot, context, weight, steps) {

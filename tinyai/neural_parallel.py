@@ -51,9 +51,14 @@ def _worker_main(model, pool, grad_names, grad_shapes, conn, seed):
             msg = conn.recv()
             if msg is None:
                 break
+            if msg[0] == "add":                       # 親で新しく加わった系列 (継続学習: 収集したデータを即座に反映)
+                for ids, wt, lf in msg[1]:
+                    pool.add(ids, wt, lf)
+                continue
             batch, T = msg
             x, y, w = pool.batch(batch, T)
             loss, g = model.loss_and_grads(x, y, w)
+            pool.update(model.last_row_loss)          # 優先再生の更新はワーカーごと
             for k, gk in g.items():
                 grads[k][0][...] = gk
             conn.send(loss)
@@ -102,8 +107,20 @@ class ParallelTrainer:
             self._procs.append(proc)
             self._conns.append(parent)
         self.started = True
+        self.pool.journal = []      # ここから先に加わった系列はワーカーへ送る
         log.info("データ並列学習: %d ワーカー", self.workers)
         return True
+
+    def sync(self) -> int:
+        """親の再生バッファに新しく加わった系列をワーカーへ送る (パイプ、数千系列でも数十 ms)。"""
+        j = self.pool.journal
+        if not j:
+            return 0
+        chunk = j[:5000]
+        del j[:len(chunk)]
+        for c in self._conns:
+            c.send(("add", chunk))
+        return len(chunk)
 
     def stop(self) -> None:
         for c in self._conns:
@@ -115,6 +132,7 @@ class ParallelTrainer:
             p.join(timeout=5)
             if p.is_alive():
                 p.terminate()
+        self.pool.journal = None
         # パラメータを通常メモリに戻す
         for k in list(self.model.p):
             self.model.p[k] = np.array(self.model.p[k], copy=True)
@@ -134,6 +152,7 @@ class ParallelTrainer:
         t0 = time.perf_counter()
         losses = []
         T = self.model.T
+        self.sync()
         for _ in range(steps):
             for c in self._conns:
                 c.send((batch, T))

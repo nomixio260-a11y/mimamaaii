@@ -134,7 +134,8 @@ class Brain:
         self.dialogs = DialogStore()              # 会話データ (自分の会話 + 公開データ)
         self.agent = Agent(self)                  # 道具 (計算・日付・換算・比較・列挙・要約・調査・プロファイル)
         size = self.cfg.neural_size if self.cfg.neural_size != "auto" else NeuralLM.size_for_memory(self.cfg.memory_mb)
-        self.neural = NeuralLM(self.cfg.data_dir, size=size, seed=self.cfg.seed or 0)  # Transformer LM (numpy)
+        self.neural = NeuralLM(self.cfg.data_dir, size=size, seed=self.cfg.seed or 0)  # Transformer LM (numpy, dropout=cfg.neural_dropout)
+        self.last_thought: dict | None = None      # 直近のニューラル応答の思考過程 (下書き → 再検索 → 検証)
         self._neural_pending_text: deque = deque(maxlen=5000)
         self._neural_pending_dialog: deque = deque(maxlen=2000)   # (発話, 応答, 文脈, 重み)
         self._qa_done: set[int] = set()                           # 合成 QA を作った文書 ID
@@ -326,22 +327,47 @@ class Brain:
         return f"{reply.text}（出典: {', '.join(hosts[:2])}）" if hosts else reply.text
 
     def _neural_reply(self, text: str, hits, fallback: Reply, strict: bool = True) -> Reply | None:
-        """検索した文を文脈にして Transformer で応答を生成 (RAG)。
+        """検索した文を文脈にして Transformer で応答を生成 (RAG)。「考える」= 2 段階:
+          1. 下書き: 検索文脈で候補を生成
+          2. 読み直し: 下書きの語で検索をやり直して文脈を広げ、もう一度候補を生成 (自分の答えを手掛かりにした再検索)
+          3. 検証: 全候補を 接地率 (文脈・質問との句の重なり) + 自然さ (自己対数確率) + 文末の整い で採点し最良を返す
         strict=True: 接地率と自然さで厳しく検査 (検索応答と併用する時)。
-        strict=False: ニューラル専用モード。候補の中から接地率 + 自然さが最良のものを返し、明らかに壊れた文だけ捨てる。"""
+        strict=False: ニューラル専用モード。明らかに壊れた文だけ捨てる。過程は self.last_thought に残す (UI / API 用)。"""
         ctx_docs = [d for c, d in hits[:3] if c >= self.params.answer_threshold * 0.5]
         context = " ".join(d.text for d in ctx_docs)[:240] or None
-        cands = self.neural.chat(text, context, n=4 if not strict else 3)
+        n = 4 if not strict else 3
+        cands = self.neural.chat(text, context, n=n)
+        thought = {"query": text, "context": [d.text[:80] for d in ctx_docs], "draft": list(cands), "rethink": [], "context2": [], "scores": []}
+        # 2. 読み直し: 下書きに出てきた句で再検索 (質問だけでは引けなかった文が見つかる)
+        if self.cfg.neural_rethink and cands:
+            extra_terms = [p for c in cands[:2] for p in phrases(c) if is_phrase(p) and p not in text][:4]
+            if extra_terms:
+                hits2 = self._search(text + " " + " ".join(extra_terms))
+                new_docs = [d for c, d in hits2[:3] if d not in ctx_docs and c >= self.params.answer_threshold * 0.5]
+                if new_docs:
+                    ctx_docs = (ctx_docs + new_docs)[:4]
+                    context2 = " ".join(d.text for d in ctx_docs)[:240]
+                    more = self.neural.chat(text, context2, n=max(2, n - 1))
+                    thought["rethink"], thought["context2"] = list(more), [d.text[:80] for d in new_docs]
+                    cands = cands + more
+                    context = context2
         if not cands:
+            self.last_thought = thought
             return None
+        # 3. 検証
         qphr = set(phrases(text))
         cphr = set(phrases(context)) if context else set()
         best, best_s = None, -1e9
+        seen = set()
         for c in cands:
+            if c in seen:
+                continue
+            seen.add(c)
             ph = set(phrases(c))
             grounded = len(ph & (cphr | qphr)) / max(len(ph), 1) if ph else 0.0
             fluency = self.neural.score(c)
             if fluency is None or len(c) < 4 or _GARBLED_RE.search(c):
+                thought["scores"].append((c[:60], None))
                 continue
             if strict:
                 if (context and grounded < 0.6) or fluency < -2.5:
@@ -349,8 +375,11 @@ class Brain:
                 if len(c) < 6 or c in text or not c.endswith(("。", "！", "？", ".", "!", "?", "です", "ます", "である")):
                     continue
             sc = grounded + fluency / 5.0 + (0.3 if c.endswith(("。", "！", "？", ".", "!", "?")) else 0.0)
+            thought["scores"].append((c[:60], round(sc, 3)))
             if sc > best_s:
                 best, best_s = c, sc
+        thought["best"] = best
+        self.last_thought = thought
         if best is None:
             self.stats["neural_rejected"] += 1
             return None
@@ -455,12 +484,13 @@ class Brain:
         best: tuple[int, str, str] | None = None
         for src, text, anchors in batch.pages:
             before = len(self.kb.index)
+            surprise = self.neural.surprise(split_sentences(text)[:40:7]) if self.neural.model is not None else None
             n = self.learn_text(text, source=src)
             novelty = len(self.kb.index) - before
             total += n
             self.stats["new_terms"] += novelty
             if collector is not None:
-                collector.report(batch.source or src, n, novelty)
+                collector.report(batch.source or src, n, novelty, surprise)
                 if anchors:
                     collector.push_links(anchors, depth=1, base_url=src)
             if n and (best is None or n > best[0]):
@@ -469,10 +499,12 @@ class Brain:
         if getattr(batch, "dialogs", None):
             with self.lock:
                 n_d = 0
-                for q, a in batch.dialogs:
+                for item in batch.dialogs:
+                    q, a = item[0], item[1]
+                    ctx = item[2] if len(item) > 2 else None   # (発話, 応答, 文脈) = 読解データは文脈付きで学ぶ (RAG の練習)
                     if self.dialogs.add(q, a, source=batch.source or "web"):
                         n_d += 1
-                        self._neural_pending_dialog.append((q, a, None, 1.0))
+                        self._neural_pending_dialog.append((q, a, ctx, 1.0))
                 self.stats["dialogs_collected"] += n_d
         with self.lock:
             if batch.kind == "topic":

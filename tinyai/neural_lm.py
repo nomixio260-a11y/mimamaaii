@@ -42,8 +42,9 @@ class NeuralLM:
             return "base"
         return "small"
 
-    def __init__(self, data_dir: Path, size: str = "base", vocab_size: int = 6000, seed: int = 0):
+    def __init__(self, data_dir: Path, size: str = "base", vocab_size: int = 6000, seed: int = 0, dropout: float = 0.1):
         self.available = neural.available()
+        self.dropout = float(dropout)
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / "neural.npz"
         self.size = size if size in neural.PRESETS else "base"
@@ -89,6 +90,7 @@ class NeuralLM:
         if self.path.exists():
             try:
                 self.model, self.tok, meta = neural.TinyTransformer.load(self.path)
+                self.model.dropout = self.dropout
                 self.trained_tokens = int(meta.get("trained_tokens", 0))
                 self.holdout_ppl = meta.get("holdout_ppl")
                 self.ready = bool(meta.get("ready", False))
@@ -109,6 +111,7 @@ class NeuralLM:
             return False
         self.tok = SubwordTokenizer.train(texts, size=self.vocab_size)
         self.model = neural.TinyTransformer.from_preset(len(self.tok), self.size)
+        self.model.dropout = self.dropout
         log.info("ニューラル LM を初期化: %s vocab=%d params=%d", self.size, len(self.tok), self.model.n_params())
         return True
 
@@ -346,6 +349,22 @@ class NeuralLM:
                                                    "decode": self.decode, "grown": self.grown, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
         self._last_save = time.time()
 
+    # ------------------------------------------------------------ データの価値 (驚き)
+    def surprise(self, texts, max_texts: int = 6) -> float | None:
+        """文の集合の平均トークン損失 (nat)。モデルにとって新しい情報ほど大きい。
+        収集ソースの評価に使う: 低すぎる = 既知 (学ぶ価値が低い)、極端に高い = ジャンクや別言語。"""
+        if self.model is None or self.tok is None:
+            return None
+        texts = [t for t in texts if len(t) >= 8][:max_texts]
+        if not texts:
+            return None
+        drop, self.model.dropout = self.model.dropout, 0.0
+        try:
+            lp = [self.model.logprob(self.seq_text(t)) for t in texts]
+        finally:
+            self.model.dropout = drop
+        return round(-sum(lp) / len(lp), 3)
+
     # ------------------------------------------------------------ 利用
     def score(self, text: str) -> float | None:
         if self.model is None:
@@ -394,4 +413,6 @@ class NeuralLM:
             "vocab_added": self.vocab_added,
             "online_steps": self.online_steps,
             "decode": dict(self.decode),
+            "dropout": self.model.dropout if self.model else self.dropout,
+            "priority_mean": round(float(self.pool.priority[: len(self.pool)].mean()), 3) if len(self.pool) else None,
         }

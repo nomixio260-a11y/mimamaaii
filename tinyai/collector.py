@@ -44,7 +44,7 @@ class Batch:
 
 
 class SourceHealth:
-    __slots__ = ("tries", "ok", "gain", "novelty", "latency")
+    __slots__ = ("tries", "ok", "gain", "novelty", "latency", "surprise", "surprise_n")
 
     def __init__(self):
         self.tries = 0
@@ -52,6 +52,8 @@ class SourceHealth:
         self.gain = 0.0
         self.novelty = 0.0
         self.latency = 0.0
+        self.surprise = 0.0     # ニューラル LM から見た情報量 (平均トークン損失 nat) の移動平均
+        self.surprise_n = 0
 
     def record(self, ok: bool, gain: float, latency: float) -> None:
         self.tries += 1
@@ -61,14 +63,27 @@ class SourceHealth:
         self.latency = 0.8 * self.latency + 0.2 * latency if self.latency else latency
 
     @property
+    def value(self) -> float:
+        """データの学習価値 (0〜1): 驚きが 2〜6 nat のとき高い。低すぎる = 既知、高すぎる = ジャンク/別言語。"""
+        if self.surprise_n == 0:
+            return 0.5
+        s = self.surprise
+        if s < 1.0:
+            return 0.2
+        if s <= 6.0:
+            return 1.0 if 2.0 <= s <= 5.0 else 0.7
+        return 0.3
+
+    @property
     def score(self) -> float:
-        # 成功率 × (文の収穫 + 新規性)。試行が少ないうちは楽観的
+        # 成功率 × (文の収穫 + 新規性) × 学習価値。試行が少ないうちは楽観的
         t = max(self.tries, 1)
-        return (self.ok + 1) / (self.tries + 2) * (self.gain / t + self.novelty / t + 0.5)
+        return (self.ok + 1) / (self.tries + 2) * (self.gain / t + self.novelty / t + 0.5) * (0.5 + self.value)
 
     def to_dict(self) -> dict:
         t = max(self.tries, 1)
-        return {"tries": self.tries, "ok": self.ok, "avg_gain": round(self.gain / t, 2), "avg_novelty": round(self.novelty / t, 2), "latency": round(self.latency, 2), "score": round(self.score, 3)}
+        return {"tries": self.tries, "ok": self.ok, "avg_gain": round(self.gain / t, 2), "avg_novelty": round(self.novelty / t, 2), "latency": round(self.latency, 2),
+                "surprise": round(self.surprise, 2), "value": round(self.value, 2), "score": round(self.score, 3)}
 
 
 class Source:
@@ -306,7 +321,10 @@ class HuggingFaceDatasets(Source):
         return out
 
     @staticmethod
-    def _pairs_from_row(row: dict, fmt: str) -> list[tuple[str, str]]:
+    def _pairs_from_row(row: dict, fmt: str) -> list[tuple]:
+        """行から (発話, 応答) または (発話, 応答, 文脈) を作る。
+        conversations: from/value or role/content の配列 (複数ターンは直前の応答を文脈にする)
+        instruction: instruction, input, output / qa: question, answer / squad: question, context, answers.text[0]"""
         pairs = []
         if fmt == "conversations":
             conv = row.get("conversations") or row.get("messages") or []
@@ -317,7 +335,8 @@ class HuggingFaceDatasets(Source):
                 if role in ("human", "user", "prompter"):
                     prev = val
                 elif role in ("gpt", "assistant", "bot") and prev:
-                    pairs.append((prev, val))
+                    last_bot = pairs[-1][1] if pairs else None
+                    pairs.append((prev, val, last_bot[:200]) if last_bot else (prev, val))
                     prev = None
         elif fmt == "instruction":
             q = (row.get("instruction") or "").strip()
@@ -330,6 +349,17 @@ class HuggingFaceDatasets(Source):
             a = (row.get("answer") or row.get("answers") or "").strip() if isinstance(row.get("answer") or row.get("answers"), str) else ""
             if q and a:
                 pairs.append((q, a))
+        elif fmt == "squad":   # 読解: 文脈の中から答える練習 (RAG と同じ形)
+            q = (row.get("question") or "").strip()
+            ctx = (row.get("context") or "").strip()
+            ans = row.get("answers") or {}
+            texts = ans.get("text") if isinstance(ans, dict) else ans
+            a = (texts[0] if isinstance(texts, list) and texts else texts if isinstance(texts, str) else "").strip()
+            if q and a and ctx:
+                # 答えを含む文を中心に文脈を切り出す (最大 240 文字)
+                i = ctx.find(a)
+                lo = max(0, i - 100) if i >= 0 else 0
+                pairs.append((q, a + ("" if a.endswith(("。", ".")) else "。"), ctx[lo : lo + 240]))
         return pairs
 
     def stream(self):
@@ -359,7 +389,7 @@ class HuggingFaceDatasets(Source):
             pairs.extend(self._pairs_from_row(row, fmt))
         self.last_dialogs = pairs
         # 応答文は知識としても学ぶ (説明文であることが多い)
-        body = "\n".join(texts) + "\n" + "\n".join(a for _, a in pairs if len(a) >= 20)
+        body = "\n".join(texts) + "\n" + "\n".join(p[1] for p in pairs if len(p[1]) >= 20) + "\n" + "\n".join(p[2] for p in pairs if len(p) > 2 and fmt == "squad")
         src = f"hf:{ds}#{off}"
         return [(src, body, [])] if len(body) > 40 else []
 
@@ -489,11 +519,14 @@ class Collector:
 
     _mark_seen = mark_seen
 
-    def report(self, source: str, learned: int, novelty: int = 0) -> None:
-        """学習側からの収穫報告 (文数と新しい語の数)。"""
+    def report(self, source: str, learned: int, novelty: int = 0, surprise: float | None = None) -> None:
+        """学習側からの収穫報告 (文数、新しい語の数、ニューラル LM の驚き = 情報量)。"""
         h = self._h(source)
         h.gain += min(learned, 400) / 100.0
         h.novelty += min(novelty, 2000) / 200.0
+        if surprise is not None:
+            h.surprise = surprise if h.surprise_n == 0 else 0.8 * h.surprise + 0.2 * surprise
+            h.surprise_n += 1
 
     # ------------------------------------------------------------ フロンティア
     def push_links(self, anchors: Iterable[tuple[str, str]], depth: int = 1, base_url: str = "") -> int:

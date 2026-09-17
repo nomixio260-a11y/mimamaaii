@@ -199,12 +199,15 @@ def cmd_train(args) -> int:
         return 1
     brain.neural.min_sentences = min(brain.neural.min_sentences, max(200, len(brain.kb)))
     brain.neural.min_chars = min(brain.neural.min_chars, max(20000, sum(len(d.text) for d in brain.kb.docs.values())))
-    for d in list(brain.kb.docs.values()):
-        brain._neural_pending_text.append(d.text)
     if brain.neural_step(steps=1, budget_seconds=0.01) is None and brain.neural.model is None:
         print("学習データが足りません (文が少なすぎます)。まず learn や evolve で集めてください。")
         return 1
     nl = brain.neural
+    # 知識文と会話を全部プールへ (再生バッファの容量まで。pending の上限を迂回)
+    for d in list(brain.kb.docs.values()):
+        nl.add_text(d.text)
+    for u, b, _, w in list(brain.dialogs.pairs):
+        nl.add_dialog(u, b, weight=w)
     nl.set_workers(args.workers if args.workers is not None else cfg.neural_workers)
     print(f"モデル {nl.size}: パラメータ {nl.model.n_params():,}, 語彙 {len(nl.tok)}, プール {len(nl.pool)} 系列 / {nl.pool.total_tokens:,} トークン, 会話 {len(brain.dialogs)}, 並列 {nl.workers}")
     collector = None

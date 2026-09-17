@@ -136,7 +136,7 @@ details.about p { margin: 6px 0; }
     <div class="metric"><span class="k">層 / 語彙</span><span class="v" id="mLayers">–</span><span class="s" id="mVocabAdded">–</span></div>
     <div class="metric"><span class="k">事前学習</span><span class="v" id="mPre">–</span><span class="s" id="mPreTok">–</span></div>
     <div class="metric"><span class="k">取り置き PPL</span><span class="v" id="mPpl">–</span><span class="s">低いほど文を予測できる</span></div>
-    <div class="metric"><span class="k">あなたとの学習</span><span class="v" id="mOnline">–</span><span class="s" id="mOnlineTok">–</span></div>
+    <div class="metric"><span class="k">この端末での学習</span><span class="v" id="mOnline">–</span><span class="s" id="mOnlineTok">–</span></div>
     <div class="metric"><span class="k">直近の損失</span><span class="v" id="mLoss">–</span><span class="s" id="mLossTrend">–</span></div>
     <div class="metric"><span class="k">知識文</span><span class="v" id="mDocs">–</span><span class="s" id="mReplay">–</span></div>
     <div class="metric"><span class="k">評価 👍 / 👎</span><span class="v" id="mFb">–</span><span class="s" id="mDecode">–</span></div>
@@ -160,6 +160,7 @@ details.about p { margin: 6px 0; }
         <button type="button" data-q="宇宙について教えて">宇宙について教えて</button>
         <button type="button" data-q="覚えて: 私の好きな色は青です">覚えて: 私の好きな色は青です</button>
         <button type="button" id="resetBtn" title="この端末での学習内容を消して配布時の重みに戻す">学習をリセット</button>
+        <label style="margin-left:auto;display:flex;gap:4px;align-items:center;cursor:pointer"><input type="checkbox" id="idleToggle" checked> 常時学習 <span id="idleInfo" style="font-family:var(--mono)"></span></label>
       </div>
       <form class="inputrow" id="form">
         <input id="input" type="text" placeholder="話しかける…" autocomplete="off" disabled>
@@ -169,7 +170,8 @@ details.about p { margin: 6px 0; }
 
     <section class="panel think" aria-label="思考">
       <h2>いま何を考えたか <span class="hint" id="thinkTime"></span></h2>
-      <div class="sec"><h3>1. 思い出した知識 <span class="n" id="hitN"></span></h3><div id="hits" class="empty">まだ会話がありません。</div></div>
+      <div class="sec"><h3>1. 思い出した知識 <span class="n" id="hitN"></span></h3><div id="hits" class="empty">まだ会話がありません。</div>
+        <div id="rethink" hidden><h3 style="margin-top:8px">1b. 下書きを手掛かりに読み直した知識 <span class="n">下書きの語で再検索 → 文脈を広げてもう一度生成</span></h3><div id="rethinkHits"></div></div></div>
       <div class="sec"><h3>2. 読んだプロンプト <span class="n">色の濃さ = 応答生成中に注意を向けた強さ (最終層平均)</span></h3><div id="prompt" class="tokens empty">–</div></div>
       <div class="sec"><h3>3. 考えた候補 <span class="n">平均対数確率 + 長さ・文脈との重なり</span></h3><div id="cands" class="empty">–</div></div>
       <div class="sec"><h3>4. 一語ごとの確信度 <span class="n">クリックで他の候補を表示</span></h3><div id="gen" class="tokens empty">–</div><div id="alts"></div>
@@ -210,6 +212,7 @@ details.about p { margin: 6px 0; }
     if (msg.op === 'learnText') return { result: E.learnText(msg.text, msg.weight), summary: E.summary() };
     if (msg.op === 'feedback') return { result: E.feedback(msg.positive), summary: E.summary() };
     if (msg.op === 'evolveVocab') { const added = E.evolveVocab(msg.texts); return { added, summary: E.summary(), tokens: added ? E.tok.tokens.slice(8) : null }; }
+    if (msg.op === 'idle') return { result: E.idleStep(), summary: E.summary() };
     if (msg.op === 'snapshot') return E.snapshot();
     if (msg.op === 'summary') return E.summary();
   }
@@ -270,7 +273,7 @@ details.about p { margin: 6px 0; }
     $('mPreTok').textContent = `${((m.trained_tokens || 0) / 1e6).toFixed(1)}M トークン`;
     $('mPpl').textContent = m.holdout_ppl ? Number(m.holdout_ppl).toFixed(2) : '–';
     $('mOnline').textContent = fmt(st.onlineSteps) + ' step';
-    $('mOnlineTok').textContent = `${fmt(st.onlineTokens)} トークン / ${fmt(st.turns)} ターン`;
+    $('mOnlineTok').textContent = `会話 ${fmt(st.turns)} ターン + 常時学習 ${fmt(st.idleSteps || 0)} step / ${fmt(st.onlineTokens)} トークン`;
     const lh = st.lossHist || [];
     $('mLoss').textContent = lh.length ? lh[lh.length - 1].toFixed(3) : (m.last_loss ? Number(m.last_loss).toFixed(3) : '–');
     if (lh.length >= 6) { const a = avg(lh.slice(-3)), b = avg(lh.slice(-6, -3)); $('mLossTrend').textContent = a < b ? `↓ 下がっている (${(b - a).toFixed(3)})` : `↑ 上がっている (${(a - b).toFixed(3)})`; } else $('mLossTrend').textContent = lh.length ? '学習中' : '事前学習の最終値';
@@ -309,6 +312,8 @@ details.about p { margin: 6px 0; }
     const hits = $('hits'); hits.innerHTML = ''; hits.className = r.hits.length ? '' : 'empty';
     if (!r.hits.length) hits.textContent = '関連する知識は見つからず、モデルの記憶だけで答えました。';
     for (const h of r.hits) { const el = document.createElement('div'); el.className = 'hit'; el.innerHTML = `<div class="bar"><i style="width:${Math.round(h.rel * 100)}%"></i></div><div></div>`; el.lastChild.textContent = `${h.text} (BM25 ${h.score.toFixed(1)})`; hits.appendChild(el); }
+    const RT = $('rethink'); RT.hidden = !r.rethink; const RH = $('rethinkHits'); RH.innerHTML = '';
+    if (r.rethink) for (const h of r.rethink.hits) { const el = document.createElement('div'); el.className = 'hit'; el.innerHTML = `<div class="bar"><i style="width:${Math.round(h.rel * 100)}%"></i></div><div></div>`; el.lastChild.textContent = `${h.text} (BM25 ${h.score.toFixed(1)})`; RH.appendChild(el); }
     // プロンプト: 注意の平均で着色
     const best = r.best; const P = $('prompt'); P.innerHTML = ''; P.className = 'tokens';
     const att = best.attention && best.attention.length ? best.attention : null;
@@ -318,7 +323,7 @@ details.about p { margin: 6px 0; }
     r.promptPieces.forEach((pc, i) => { const s = document.createElement('span'); s.className = 'tk' + (pc.startsWith('<') ? ' sp' : ''); s.textContent = pc; if (att) { const a = mean[i] / mx; s.style.background = `color-mix(in srgb, var(--heat) ${Math.round(a * 85)}%, var(--surface2))`; s.title = `注意 ${(mean[i] * 100).toFixed(1)}%`; } P.appendChild(s); });
     // 候補
     const C = $('cands'); C.innerHTML = ''; C.className = '';
-    r.candidates.forEach((c) => { const el = document.createElement('div'); el.className = 'cand' + (c === best ? ' best' : ''); el.innerHTML = '<div></div><div class="sc"></div>'; el.firstChild.textContent = c.text || '(空)'; el.lastChild.textContent = `${c.score.toFixed(2)} (logp ${c.meanLogp.toFixed(2)}, ${c.tokens.length}語)`; C.appendChild(el); });
+    r.candidates.forEach((c) => { const el = document.createElement('div'); el.className = 'cand' + (c === best ? ' best' : ''); el.innerHTML = '<div></div><div class="sc"></div>'; el.firstChild.textContent = (c.pass === 2 ? '読み直し: ' : '下書き: ') + (c.text || '(空)'); el.lastChild.textContent = `${c.score.toFixed(2)} (logp ${c.meanLogp.toFixed(2)}, ${c.tokens.length}語)`; C.appendChild(el); });
     // 一語ごとの確信度
     const G = $('gen'); G.innerHTML = ''; G.className = 'tokens'; $('alts').innerHTML = '';
     best.trace.forEach((t, i) => { const s = document.createElement('span'); s.className = 'tk gen'; s.textContent = pieceOf(t.token); const p = t.p; s.style.background = `color-mix(in srgb, ${p > 0.5 ? 'var(--accent)' : 'var(--heat)'} ${Math.round((p > 0.5 ? (p - 0.5) * 2 : (1 - p * 2)) * 70 + 10)}%, var(--surface2))`; s.title = `p=${(p * 100).toFixed(1)}%`; s.addEventListener('click', () => showAlts(i)); G.appendChild(s); });
@@ -443,6 +448,23 @@ details.about p { margin: 6px 0; }
       $('loadText').textContent = '読み込みに失敗しました: ' + e.message; setStatus('エラー', '');
     }
   }
+  // 常時学習: 会話していない間も 3 秒ごとに 1 系列学ぶ (Worker があれば画面は止まらない)
+  let idleCount = 0, idleLossSum = 0;
+  async function idleTick() {
+    if (!state.summary || state.busy || !$('idleToggle').checked || document.hidden) return;
+    state.busy = true;
+    try {
+      const r = await call({ op: 'idle' });
+      if (r.result) {
+        idleCount += 1; idleLossSum += r.result.loss;
+        $('idleInfo').textContent = `${r.result.kind === 'dialog' ? '会話' : '知識'} loss ${r.result.loss.toFixed(2)}`;
+        renderSummary(r.summary);
+        if (idleCount % 20 === 0) { addEvent(`常時学習 ${idleCount} step (平均 loss ${(idleLossSum / 20).toFixed(3)})`); idleLossSum = 0; scheduleSave(); }
+      }
+    } catch (e) { $('idleInfo').textContent = 'エラー'; }
+    state.busy = false;
+  }
+  setInterval(idleTick, 3000);
   $('form').addEventListener('submit', (ev) => { ev.preventDefault(); send($('input').value); });
   document.querySelectorAll('.tools button[data-q]').forEach((b) => b.addEventListener('click', () => { $('input').value = b.dataset.q; send(b.dataset.q); }));
   $('resetBtn').addEventListener('click', async () => {

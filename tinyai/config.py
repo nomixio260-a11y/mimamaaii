@@ -39,6 +39,8 @@ class Config:
     prefetch_depth: int = 4            # 先読みして貯めておくバッチ数
     neural_seconds_per_cycle: float = 2.0  # 自律ループ 1 サイクルあたりニューラル LM の学習に使う秒数 (numpy がある時)
     neural_size: str = field(default_factory=lambda: os.environ.get("TINYAI_NEURAL", "auto"))  # auto / small / base / large / xl (auto はメモリ上限から)
+    neural_dropout: float = field(default_factory=lambda: float(os.environ.get("TINYAI_NEURAL_DROPOUT", "0.1")))  # 学習時のドロップアウト率 (過学習の抑制)
+    neural_rethink: bool = True        # ニューラル応答の 2 段階生成 (下書きの語で再検索してから答える)
     neural_first: bool = True          # 学習が進んだら (ppl 基準) ニューラル生成を応答の主経路にする
     neural_only: bool = True           # 準備が整ったら応答は常にニューラル生成 (検索は文脈の供給に回る、事実の即答も使わない)
     tools: bool = False                # 計算・日付・単位換算などの道具を使う (既定オフ: 応答はネットワークが担う)
