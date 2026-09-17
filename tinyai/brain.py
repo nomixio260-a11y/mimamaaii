@@ -986,6 +986,22 @@ class Brain:
         return total
 
     # ------------------------------------------------------------ 話題選択
+    def gap_first(self, topic: str) -> bool:
+        """「知らない」と答えた語を、調べる順番の先頭に置く。
+
+        普通の add_gap は末尾に積むので、雑談で拾った話題に埋もれて何時間も後回しになる。
+        知らないと**言ってしまった**話題は、次に同じことを訊かれた時に答えられるべき最優先の宿題。"""
+        topic = topic.strip()
+        if len(topic) < 2 or not self._good_topic(topic):
+            return False
+        if time.time() - self.explored.get(topic, 0) < 86400:
+            return False
+        if topic in self.gaps:
+            self.gaps.remove(topic)
+        self.gaps.appendleft(topic)
+        self._topic_strategy[topic] = "gap"
+        return True
+
     def add_gap(self, topic: str) -> None:
         topic = topic.strip()
         if len(topic) < 2 or topic in self.gaps:
@@ -1424,6 +1440,8 @@ class Brain:
             # 知らないことは知らないと言う (それでも知っていることがあれば添える)
             kind, subj, attr = note
             self.stats["honest_unknown"] += 1
+            if self.gap_first(subj):            # 知らないと答えた話題を次に調べる (宿題の先頭へ)
+                self.stats["unknown_queued"] += 1
             if kind == "attr":
                 known = self.facts.lookup(subj)[:1]
                 extra = ""

@@ -2291,3 +2291,17 @@ class GunzipPrefixTest(unittest.TestCase):
         self.assertGreater(len(part), 1000)                 # 圧縮バイト列ではなく本文が返る
         self.assertTrue(body.startswith(part))
         self.assertEqual(gunzip_prefix(b"not gzip at all"), b"")
+
+
+class UnknownBecomesHomeworkTest(unittest.TestCase):
+    """「知らない」と答えた話題は、次に調べる話題の先頭に入る。"""
+
+    def test_unknown_topic_is_queued_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.learn_text("富士山は静岡県と山梨県にまたがる日本最高峰の火山です。", "https://a/f")
+            b.add_gap("別の話題")
+            r = b.reply("ゾンビ星ペンタクロンの公転周期は？")
+            self.assertIn("知りません", r.text)
+            self.assertEqual(b.next_topic(), "ゾンビ星ペンタクロン")   # 先に積んだ話題より優先
+            self.assertGreaterEqual(b.stats["unknown_queued"], 1)
