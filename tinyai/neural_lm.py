@@ -52,7 +52,7 @@ class NeuralLM:
         self.path = self.data_dir / "neural.npz"
         self.size = size if size in neural.PRESETS else "base"
         # 進化する復号パラメータ (👍/👎 の割合で山登り)
-        self.decode = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.3}
+        self.decode = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.3, "copy_bonus": 3.0}
         self._decode_trial: dict | None = None
         self._fb = [0, 0]           # 現在の設定での (👍, 👎)
         self._fb_best = 0.5         # 採用済み設定の 👍 率
@@ -301,8 +301,10 @@ class NeuralLM:
         # 次の試行: 1 つのパラメータを少し動かす
         cand = dict(self.decode)
         key = self.rng.choice(list(cand))
-        step = {"temperature": 0.1, "top_p": 0.05, "repetition_penalty": 0.1}[key]
-        cand[key] = round(min({"temperature": 1.2, "top_p": 0.99, "repetition_penalty": 2.0}[key], max({"temperature": 0.3, "top_p": 0.5, "repetition_penalty": 1.0}[key], cand[key] + self.rng.choice([-step, step]))), 3)
+        step = {"temperature": 0.1, "top_p": 0.05, "repetition_penalty": 0.1, "copy_bonus": 0.5}[key]
+        hi = {"temperature": 1.2, "top_p": 0.99, "repetition_penalty": 2.0, "copy_bonus": 5.0}[key]
+        lo = {"temperature": 0.3, "top_p": 0.5, "repetition_penalty": 1.0, "copy_bonus": 0.0}[key]
+        cand[key] = round(min(hi, max(lo, cand[key] + self.rng.choice([-step, step]))), 3)
         self._decode_trial = dict(self.decode)
         self.decode = cand
         self._fb = [0, 0]
@@ -398,8 +400,11 @@ class NeuralLM:
             prompt = self.prompt_dialog(user, context)
             out = []
             dec = self.decode
+            # 文脈に出てくるトークンを少し出やすくする (検索した文を実際に使わせる)
+            copy_ids = self.tok.encode(context, max_tokens=self.model.T) if context else None
             with self.model.use_ema():
-                gens = self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=dec["temperature"], top_p=dec["top_p"], repetition_penalty=dec["repetition_penalty"], rng=self.nprng)
+                gens = self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=dec["temperature"], top_p=dec["top_p"], repetition_penalty=dec["repetition_penalty"], rng=self.nprng,
+                                                 copy_ids=copy_ids, copy_bonus=dec.get("copy_bonus", 0.0))
             for ids in gens:
                 text = self.tok.decode(ids).strip()
                 if len(text) >= 2:

@@ -435,14 +435,24 @@ class TinyTransformer:
         xf, _ = _rms_forward(x, p["rmsf"])
         return xf @ p["wte"].T  # (B, V)
 
-    def generate_batch(self, prompt: list[int], n: int = 3, max_new: int = 40, temperature: float = 0.8, top_k: int = 40, top_p: float = 0.9, repetition_penalty: float = 1.3, rng=None, stop=(EOS,)) -> list[list[int]]:
-        """同じプロンプトから n 本の候補を同時に生成 (1 本ずつより約 n 倍速い)。"""
+    def generate_batch(self, prompt: list[int], n: int = 3, max_new: int = 40, temperature: float = 0.8, top_k: int = 40, top_p: float = 0.9, repetition_penalty: float = 1.3, rng=None, stop=(EOS,),
+                       copy_ids=None, copy_bonus: float = 0.0) -> list[list[int]]:
+        """同じプロンプトから n 本の候補を同時に生成 (1 本ずつより約 n 倍速い)。
+        copy_ids / copy_bonus: 文脈 (検索した文) に現れるトークンの対数確率を少し持ち上げる = 写し取りの手掛かり。
+        小さなモデルは文脈を無視して「それらしい文」を作りがちなので、復号の時点で文脈側に寄せる
+        (Context-aware decoding の簡易版。追加の順伝播は不要)。"""
         rng = rng or np.random.default_rng()
         prompt = prompt[-(self.T - 1):]
         cache = [(None, None) for _ in range(self.L)]
         logits = None
         for pos, tok in enumerate(prompt):
             logits = self._step_batch(np.full(n, tok, dtype=np.int64), pos, cache)
+        copy_vec = None
+        if copy_bonus and copy_ids:
+            copy_vec = np.zeros(self.V, dtype=np.float64)
+            uniq = np.unique(np.asarray([i for i in copy_ids if 0 <= i < self.V], dtype=np.int64))
+            if uniq.size:
+                copy_vec[uniq] = copy_bonus
         outs: list[list[int]] = [[] for _ in range(n)]
         alive = np.ones(n, dtype=bool)
         pos = len(prompt)
@@ -452,6 +462,8 @@ class TinyTransformer:
             z = logits.astype(np.float64)
             z[:, PAD] = -1e9
             z[:, UNK] = -1e9
+            if copy_bonus and copy_vec is not None:
+                z += copy_vec
             next_toks = np.zeros(n, dtype=np.int64)
             for b in range(n):
                 if not alive[b]:

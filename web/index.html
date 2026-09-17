@@ -311,7 +311,7 @@ details.about p { margin: 6px 0; }
     if (lh.length >= 6) { const a = avg(lh.slice(-3)), b = avg(lh.slice(-6, -3)); $('mLossTrend').textContent = a < b ? `↓ 下がっている (${(b - a).toFixed(3)})` : `↑ 上がっている (${(a - b).toFixed(3)})`; } else $('mLossTrend').textContent = lh.length ? '学習中' : '事前学習の最終値';
     $('mReplay').textContent = `配布 ${fmt(m.exported_docs || s.docs)} 文 + 覚えた文 ${fmt(st.learnedDocs)}`;
     $('mFb').textContent = `${fmt(st.good)} / ${fmt(st.bad)}`;
-    $('mDecode').textContent = `温度 ${s.decode.temperature} top-p ${s.decode.top_p} 反復 ${s.decode.repetition_penalty}`;
+    $('mDecode').textContent = `温度 ${s.decode.temperature} top-p ${s.decode.top_p} 反復 ${s.decode.repetition_penalty} 文脈 ${s.decode.copy_bonus ?? 0}`;
     // 進化度: 事前学習ステップ・オンライン学習・評価・語彙拡張から作る連続値 (対数)
     const score = Math.log10(1 + s.pretrainStep) * 20 + Math.log10(1 + st.onlineSteps * 10) * 15 + Math.log10(1 + (st.good + st.learnedDocs) * 5) * 10 + (m.grown_layers || 0) * 5 + Math.log10(1 + st.vocabAdded) * 5;
     const lvl = Math.floor(score / 10);

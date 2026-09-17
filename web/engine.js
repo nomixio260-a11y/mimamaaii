@@ -440,6 +440,8 @@
     generate(prompt, opts) {
       opts = opts || {};
       const maxNew = opts.maxNew || 40, temperature = opts.temperature || 0.7, topK = opts.topK || 40, topP = opts.topP || 0.9, rep = opts.repetitionPenalty || 1.3;
+      // 文脈 (検索した文) のトークンを少し出やすくする = 写し取りの手掛かり (Context-aware decoding の簡易版)
+      const copyBonus = opts.copyBonus || 0, copySet = copyBonus && opts.copyIds ? new Set(opts.copyIds) : null;
       const stop = opts.stop || [EOS];
       const rand = opts.rand || Math.random;
       prompt = prompt.slice(-(this.T - 1));
@@ -453,6 +455,7 @@
         if (pos >= this.T) break;
         const z = new Float64Array(out.logits);
         z[PAD] = -1e9; z[UNK] = -1e9;
+        if (copySet) for (const t of copySet) if (t >= 8 && t < V) z[t] += copyBonus;
         if (rep > 1 && tokens.length) { const recent = new Set(tokens.slice(-20)); for (const t of recent) z[t] = z[t] > 0 ? z[t] / rep : z[t] * rep; }
         for (let i = 0; i < V; i++) z[i] /= Math.max(temperature, 1e-3);
         // top-k (部分選択: 全体をソートしない)
@@ -543,7 +546,8 @@
       this.model = new Model(meta, bin);
       this.kb = new Retriever(kb && kb.docs);
       this.replay = (kb && kb.replay) ? kb.replay.slice() : [];
-      this.decode = Object.assign({ temperature: 0.7, top_p: 0.9, repetition_penalty: 1.3 }, meta.decode || {});
+      this.decode = Object.assign({ temperature: 0.7, top_p: 0.9, repetition_penalty: 1.3, copy_bonus: 3.0 }, meta.decode || {});
+      if (this.decode.copy_bonus === undefined) this.decode.copy_bonus = 3.0;
       this.lr = 3e-4;
       this.stats = { onlineSteps: 0, onlineTokens: 0, idleSteps: 0, turns: 0, good: 0, bad: 0, taught: 0, vocabAdded: 0, lossHist: [], learnedDocs: 0 };
       this.history = []; // [user, bot]
@@ -572,9 +576,11 @@
     }
     _generateCands(user, context, n, maxNew, pass) {
       const prompt = this.promptDialog(user, context);
+      const copyIds = context ? this.tok.encode(context, this.model.T) : null;
       const cands = [];
       for (let i = 0; i < n; i++) {
-        const g = this.model.generate(prompt, { maxNew, temperature: this.decode.temperature, topP: this.decode.top_p, repetitionPenalty: this.decode.repetition_penalty });
+        const g = this.model.generate(prompt, { maxNew, temperature: this.decode.temperature, topP: this.decode.top_p, repetitionPenalty: this.decode.repetition_penalty,
+                                                copyIds, copyBonus: this.decode.copy_bonus || 0 });
         const text = this.tok.decode(g.tokens).trim();
         // 候補の点数: 平均対数確率 + 長さと文脈との重なりの補正 (接地)
         let overlap = 0;
