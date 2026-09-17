@@ -370,6 +370,11 @@ class HuggingFaceDatasets(Source):
             return []
         ds, cfg, split, fmt = random.choice(specs)
         key = f"{ds}/{cfg}/{split}"
+        if key not in self.offsets:
+            # 起動ごとに同じ先頭の行を読まないよう、総行数を聞いてランダムな位置から始める
+            js0 = self.f.get_json(f"https://datasets-server.huggingface.co/rows?dataset={urllib.parse.quote(ds, safe='')}&config={urllib.parse.quote(cfg)}&split={split}&offset=0&length=1")
+            total = int((js0 or {}).get("num_rows_total") or 0)
+            self.offsets[key] = random.randrange(0, total - self.PAGE) if total > self.PAGE * 2 else 0
         off = self.offsets.get(key, 0)
         url = (f"https://datasets-server.huggingface.co/rows?dataset={urllib.parse.quote(ds, safe='')}&config={urllib.parse.quote(cfg)}"
                f"&split={split}&offset={off}&length={self.PAGE}")
