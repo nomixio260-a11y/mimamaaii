@@ -337,6 +337,17 @@ class Brain:
                     hosts.append(h)
         return f"{reply.text}（出典: {', '.join(hosts[:2])}）" if hosts else reply.text
 
+    @staticmethod
+    def _repeat_ratio(text: str) -> float:
+        """繰り返しの割合 (0〜1)。小さなモデルは「〜は、〜は、〜は」と壊れやすいので、
+        句 (名詞句) と文字 3-gram の両方で見て、繰り返しの多い方を返す。"""
+        ph = phrases(text)
+        by_phrase = 1.0 - len(set(ph)) / len(ph) if len(ph) >= 3 else 0.0
+        t = "".join(text.split())
+        grams = [t[i : i + 3] for i in range(len(t) - 2)]
+        by_gram = 1.0 - len(set(grams)) / len(grams) if len(grams) >= 6 else 0.0
+        return max(by_phrase, by_gram)
+
     def recent_turns(self, k: int = 2) -> list[tuple[str, str]]:
         """直近のやり取りを (発話, 応答) の組で返す (会話のキャッチボール用)。"""
         pairs: list[tuple[str, str]] = []
@@ -404,7 +415,17 @@ class Brain:
                     continue
                 if len(c) < 6 or c in text or not c.endswith(("。", "！", "？", ".", "!", "?", "です", "ます", "である")):
                     continue
-            sc = grounded + fluency / 5.0 + (0.3 if c.endswith(("。", "！", "？", ".", "!", "?")) else 0.0)
+            rep_ratio = self._repeat_ratio(c)
+            if rep_ratio > 0.5:                    # 同じ句の繰り返しだらけの候補は捨てる
+                thought["scores"].append((c[:60], None))
+                continue
+            # 検索が弱い (雑談・指示語) 時は接地率より自然さを見る: 検索文の寄せ集めを選ばないため
+            if weak:
+                sc = fluency / 3.0 + min(len(c), 40) * 0.01 + grounded * 0.3
+            else:
+                sc = grounded + fluency / 5.0
+            sc += 0.3 if c.endswith(("。", "！", "？", ".", "!", "?")) else 0.0
+            sc -= rep_ratio * 0.5
             thought["scores"].append((c[:60], round(sc, 3)))
             if sc > best_s:
                 best, best_s = c, sc

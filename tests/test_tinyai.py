@@ -1230,6 +1230,31 @@ class RealtimeLearningTest(unittest.TestCase):
             # 作り直された EMA は重みと一致する
             self.assertLess(float(max(np.abs(nl.model.ema[k] - nl.model.p[k]).max() for k in nl.model.p)), 1e-6)
 
+    def test_free_chat_scoring_and_repetition(self):
+        from tinyai.brain import Brain
+        self.assertGreater(Brain._repeat_ratio("これはこれはこれは良い例です"), 0.3)
+        self.assertGreater(Brain._repeat_ratio("宇宙は宇宙において宇宙の膨張が宇宙で起きる"), 0.4)
+        self.assertLess(Brain._repeat_ratio("人工知能とは、人間の知的な振る舞いを実現する技術です。"), 0.2)
+        self.assertEqual(Brain._repeat_ratio("はい。"), 0.0)
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            return
+        if not nn.available():
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.learn_text("\n".join(f"文 {i} は自由な会話のテストであり、番号 {i} を説明する。" for i in range(10, 160)), "https://x/fc")
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
+            b.neural_step(steps=2, budget_seconds=0.5)
+            b.neural.ready = True
+            b.reply("文 12 について教えて")          # 知識の質問: 文脈に寄せる
+            strong = (b.last_thought or {}).get("copy_bonus")
+            b.reply("それはどういう意味ですか")        # 指示語: 寄せを緩める
+            weak = (b.last_thought or {}).get("copy_bonus")
+            if strong is not None and weak is not None:
+                self.assertLessEqual(weak, strong)
+
 
 if __name__ == "__main__":
     unittest.main()
