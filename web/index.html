@@ -154,7 +154,8 @@ details.about p { margin: 6px 0; }
       <div class="chartbox"><h3>サーバーでの学習 <span id="preLossLast"></span></h3><canvas id="preChart" height="104"></canvas>
         <div class="legend"><span><i style="background:var(--accent)"></i>学習損失</span><span><i style="background:var(--heat)"></i>取り置き PPL (未知の文の予測しにくさ)</span><span><i style="background:var(--accent);opacity:.55"></i>破線 = 進化 (層・中間次元の追加)</span></div></div>
       <div class="chartbox" id="qualityBox" hidden><h3>サーバーでの自動評価 <span id="qualityLast"></span></h3><canvas id="qChart" height="104"></canvas>
-        <div class="legend"><span><i style="background:var(--accent)"></i>RAG 忠実性 (文脈の語をどれだけ使うか)</span><span><i style="background:var(--heat)"></i>会話 PPL</span></div></div>
+        <div class="legend"><span><i style="background:var(--accent)"></i>検索文への忠実性</span><span><i style="background:var(--ink2)"></i>会話の予測力 (文字頻度のみの状態からの削減率)</span><span><i style="background:var(--heat)"></i>ビット/文字 (低いほど良い)</span></div>
+</div>
       <div class="chartbox"><h3>この端末での学習 <span id="onLossLast"></span></h3><canvas id="onChart" height="104"></canvas>
         <div class="legend"><span><i style="background:var(--accent)"></i>会話・常時学習の損失</span></div></div>
     </div>
@@ -388,7 +389,9 @@ details.about p { margin: 6px 0; }
     c.fillStyle = getCss('--accent'); c.beginPath(); c.arc(x(log.length - 1), y(last.loss), 2.5, 0, Math.PI * 2); c.fill();
     $('preLossLast').textContent = `step ${fmt(last.step)} · loss ${last.loss.toFixed(3)} · PPL ${last.ppl != null ? last.ppl.toFixed(1) : '–'} · ${fmt(last.tok_s)} トークン/秒`;
   }
-  // サーバーでの自動評価: RAG 忠実性 (左軸 0〜1) と会話 PPL (右軸)
+  // サーバーでの自動評価: RAG 忠実性と「会話の予測力」(どちらも 0〜1、左軸) と 1 文字あたりのビット数 (右軸)。
+  // PPL は語彙が変わると比較できないので、文字あたりのビット数と、文字の出現頻度だけを知っている場合
+  // (= 何も学んでいない状態) からの削減率で見る。削減率 1.0 が完全予測、0.0 が頻度のみ。
   function drawQuality(cv, log) {
     const box = $('qualityBox'); box.hidden = !(log && log.length >= 2);
     if (box.hidden) return;
@@ -397,24 +400,31 @@ details.about p { margin: 6px 0; }
     c.font = '10px ' + getCss('--mono'); c.strokeStyle = getCss('--line2');
     const pad = { l: 32, r: 42, t: 8, b: 16 };
     const gvals = log.map((r) => r.rag_grounded).filter((v) => v != null);
-    const pvals = log.map((r) => r.dialog_ppl).filter((v) => v != null);
+    const bvals = log.map((r) => r.dialog_bpc_fresh != null ? r.dialog_bpc_fresh : r.dialog_bpc).filter((v) => v != null);
+    const pvals = bvals.length ? bvals : log.map((r) => r.dialog_ppl).filter((v) => v != null);
+    const useBpc = bvals.length > 0;
     const gmax = Math.max(0.2, gvals.length ? Math.max.apply(null, gvals) : 1);
     const plo = pvals.length ? Math.min.apply(null, pvals) : 0, phi = pvals.length ? Math.max.apply(null, pvals) : 1, pspan = (phi - plo) || 1;
     const x = (i) => pad.l + (i / Math.max(log.length - 1, 1)) * (W - pad.l - pad.r);
     const yg = (v) => pad.t + (1 - v / gmax) * (H - pad.t - pad.b);
     const yp = (v) => pad.t + (1 - (v - plo) / pspan) * (H - pad.t - pad.b);
     for (const v of [0, gmax / 2, gmax]) { c.beginPath(); c.moveTo(pad.l, yg(v)); c.lineTo(W - pad.r, yg(v)); c.stroke(); c.fillStyle = getCss('--ink3'); c.fillText(v.toFixed(2), 2, yg(v) + 3); }
-    if (pvals.length) { c.fillStyle = getCss('--heat'); for (const v of [plo, phi]) c.fillText(v.toFixed(0), W - pad.r + 4, yp(v) + 3); }
+    if (pvals.length) { c.fillStyle = getCss('--heat'); for (const v of [plo, phi]) c.fillText(useBpc ? v.toFixed(2) : v.toFixed(0), W - pad.r + 4, yp(v) + 3); }
     const line = (get, yf, color) => {
       c.strokeStyle = color; c.lineWidth = 1.7; c.beginPath(); let started = false;
       log.forEach((r, i) => { const v = get(r); if (v == null) return; started ? c.lineTo(x(i), yf(v)) : c.moveTo(x(i), yf(v)); started = true; });
       c.stroke();
     };
-    if (pvals.length) line((r) => r.dialog_ppl, yp, getCss('--heat'));
+    if (pvals.length) line((r) => (useBpc ? (r.dialog_bpc_fresh != null ? r.dialog_bpc_fresh : r.dialog_bpc) : r.dialog_ppl), yp, getCss('--heat'));
     line((r) => r.rag_grounded, yg, getCss('--accent'));
+    line((r) => (r.dialog_gain_fresh != null ? r.dialog_gain_fresh : r.dialog_bpc_gain), yg, getCss('--ink2'));
     const last = log[log.length - 1];
     c.fillStyle = getCss('--ink3'); c.fillText('step ' + fmt(log[0].step), pad.l, H - 3);
-    $('qualityLast').textContent = `忠実性 ${last.rag_grounded != null ? last.rag_grounded.toFixed(2) : '–'} · 会話 PPL ${last.dialog_ppl != null ? last.dialog_ppl.toFixed(0) : '–'} · 文 PPL ${last.ppl != null ? last.ppl.toFixed(1) : '–'}`;
+    const gain = last.dialog_gain_fresh != null ? last.dialog_gain_fresh : last.dialog_bpc_gain;
+    const bpc = last.dialog_bpc_fresh != null ? last.dialog_bpc_fresh : last.dialog_bpc;
+    $('qualityLast').textContent = `忠実性 ${last.rag_grounded != null ? last.rag_grounded.toFixed(2) : '–'}`
+      + (gain != null ? ` · 会話の予測力 ${(gain * 100).toFixed(1)}%` : '')
+      + (bpc != null ? ` · ${bpc.toFixed(2)} ビット/文字` : '');
   }
   // サーバーが読んで学んだもの (収集の記録)
   function renderCollect(meta) {
