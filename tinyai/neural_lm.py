@@ -359,6 +359,16 @@ class NeuralLM:
 
     GROW_WARMUP = 400            # 成長直後に学習率を戻していくステップ数
 
+    def _depth_lr(self) -> float:
+        """層数に応じた学習率。プリセットの学習率は「その層数」で調整した値なので、
+        成長して深くなったらそのままでは大きすぎる (実測: 4 層想定の 6e-4 のまま 9 層まで増やしたら、
+        対話 ppl 75 → 118、接地率 0.95 → 0.83 と崩れた)。深さの平方根に反比例させる
+        (層が増えるほど残差の重なりが深くなり、同じ更新幅でも出力の変化が大きくなるため)。"""
+        base_layers = neural.PRESETS.get(self.size, {}).get("layers", self.model.L if self.model else 4)
+        if self.model is None or self.model.L <= base_layers:
+            return self.lr
+        return self.lr * (base_layers / self.model.L) ** 0.5
+
     def _effective_lr(self) -> float:
         """成長直後は学習率を下げてから戻す。
 
@@ -366,12 +376,13 @@ class NeuralLM:
         かけると既に学んだ重みの方が崩れ、取り置き ppl と対話 ppl が悪化する
         (実測: 12 分で 3 層追加した後、対話 ppl 75 → 98、損失 1.93 → 2.04)。
         0.3 倍から始めて 400 ステップかけて戻す。"""
+        lr = self._depth_lr()
         if not self.grown or self.model is None:
-            return self.lr
+            return lr
         since = self.model.step - self._last_grow_step
         if since >= self.GROW_WARMUP or since < 0:
-            return self.lr
-        return self.lr * (0.3 + 0.7 * since / self.GROW_WARMUP)
+            return lr
+        return lr * (0.3 + 0.7 * since / self.GROW_WARMUP)
 
     def growth_bytes(self) -> int:
         """次の成長で増えるメモリの見積り (重み + Adam の 1 次/2 次 + EMA)。"""
