@@ -489,7 +489,7 @@ class Brain:
                 if added:
                     self.stats["neural_vocab_added"] += added
                 log.info("ニューラル LM: step=%d loss=%.3f %s", nl.model.step, r["loss"], nl.stats())
-            if time.time() - nl._last_save > 300:
+            if time.time() - nl._last_save > 60:   # 強制終了されても失う学習は 1 分以内
                 nl.save()
         return r
 

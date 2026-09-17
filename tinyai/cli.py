@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
 import threading
 import time
@@ -232,8 +233,18 @@ def cmd_train(args) -> int:
 
         collector = Collector(Fetcher(cfg.user_agent, cfg.fetch_timeout, cfg.max_page_bytes), cfg.data_dir, cfg.languages, interest=brain.interest_score)
         print("収集しながら学習します (Ctrl+C で停止)")
+    # SIGTERM (コンテナの停止など) でも保存して終われるように KeyboardInterrupt へ変換する
+    def _on_term(signum, frame):
+        raise KeyboardInterrupt
+
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(_sig, _on_term)
+        except (ValueError, OSError):
+            pass
     t0 = time.time()
     limit_s = (args.hours * 3600) if args.hours else args.seconds
+    last_brain_save = time.time()
     done = 0
     last_log = 0
     last_eval = time.time()
@@ -271,6 +282,9 @@ def cmd_train(args) -> int:
             done += nl.model.step - before
             if state is not None:
                 state.update(step=nl.model.step, loss=round(r["loss"], 3), tok_s=r.get("tokens_per_s"), ppl=nl.holdout_ppl)
+            if time.time() - last_brain_save > 300:    # 知識・会話も定期保存
+                last_brain_save = time.time()
+                brain.save()
             if args.eval_every and time.time() - last_eval >= args.eval_every:
                 last_eval = time.time()
                 ev = brain.self_evaluate()
