@@ -1922,5 +1922,29 @@ class VocabGrowthTest(unittest.TestCase):
             self.assertGreater(len(tok.encode(c)), 1)
 
 
+class GrowthLogTest(unittest.TestCase):
+    """学習ログから進化の記録を取り出す (UI で学習曲線の上に印を出すため)。"""
+
+    def test_parses_growth_events(self):
+        from pathlib import Path
+        from tinyai.export import history_from_logs
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "train.log"
+            log.write_text(
+                "step 100 loss 2.000 7000 tok/s  {'neural_ppl': 30.0}  経過 1.0 分\n"
+                "2026-01-01 00:00:00 tinyai.neural INFO ニューラル LM: 層を追加 -> 7 層 (4306752 params)\n"
+                "step 200 loss 1.900 7000 tok/s  {'neural_ppl': 29.0}  経過 2.0 分\n"
+                "2026-01-01 00:01:00 tinyai.neural INFO ニューラル LM: 中間次元を拡張 -> ff=640 (5898432 params)\n"
+                "2026-01-01 00:02:00 tinyai.neural WARNING 成長が裏目に出たため取り消し (ppl 20.0 -> 40.0、6 層へ戻す)\n",
+                encoding="utf-8")
+            h = history_from_logs([log])
+            kinds = [g["kind"] for g in h["growth_log"]]
+            self.assertEqual(kinds, ["layer", "width", "rollback"])
+            self.assertEqual(h["growth_log"][0]["value"], 7)
+            self.assertEqual(h["growth_log"][0]["step"], 100)     # 直前の step に結び付ける
+            self.assertEqual(h["growth_log"][1]["value"], 640)
+            self.assertEqual(h["growth_log"][2]["value"], 6)
+
+
 if __name__ == "__main__":
     unittest.main()

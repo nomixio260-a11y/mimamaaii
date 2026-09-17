@@ -152,7 +152,7 @@ details.about p { margin: 6px 0; }
     <div class="levelbar"><span>進化度</span><div class="bar"><i id="levelFill"></i></div><b id="levelText">Lv 0</b></div>
     <div class="chart">
       <div class="chartbox"><h3>サーバーでの学習 <span id="preLossLast"></span></h3><canvas id="preChart" height="104"></canvas>
-        <div class="legend"><span><i style="background:var(--accent)"></i>学習損失</span><span><i style="background:var(--heat)"></i>取り置き PPL (未知の文の予測しにくさ)</span></div></div>
+        <div class="legend"><span><i style="background:var(--accent)"></i>学習損失</span><span><i style="background:var(--heat)"></i>取り置き PPL (未知の文の予測しにくさ)</span><span><i style="background:var(--accent);opacity:.55"></i>破線 = 進化 (層・中間次元の追加)</span></div></div>
       <div class="chartbox" id="qualityBox" hidden><h3>サーバーでの自動評価 <span id="qualityLast"></span></h3><canvas id="qChart" height="104"></canvas>
         <div class="legend"><span><i style="background:var(--accent)"></i>RAG 忠実性 (文脈の語をどれだけ使うか)</span><span><i style="background:var(--heat)"></i>会話 PPL</span></div></div>
       <div class="chartbox"><h3>この端末での学習 <span id="onLossLast"></span></h3><canvas id="onChart" height="104"></canvas>
@@ -343,6 +343,25 @@ details.about p { margin: 6px 0; }
   }
 
   // サーバー側の学習: 学習損失 (左軸) と取り置き PPL (右軸) を同じ時間軸で描く
+  // 進化の印: 層の追加・中間次元の拡張・成長の取り消しを学習曲線の上に立てる
+  function drawGrowthMarks(c, growth, log, x, W, H, pad) {
+    if (!growth || !growth.length || !log.length) return;
+    const first = log[0].step, last = log[log.length - 1].step, span = (last - first) || 1;
+    c.save();
+    for (const g of growth) {
+      if (g.step < first || g.step > last) continue;
+      const gx = pad.l + ((g.step - first) / span) * (W - pad.l - pad.r);
+      c.strokeStyle = g.kind === 'rollback' ? getCss('--bad') : getCss('--accent');
+      c.globalAlpha = 0.55; c.lineWidth = 1; c.setLineDash([3, 3]);
+      c.beginPath(); c.moveTo(gx, pad.t); c.lineTo(gx, H - pad.b); c.stroke();
+      c.setLineDash([]); c.globalAlpha = 1;
+      c.fillStyle = g.kind === 'rollback' ? getCss('--bad') : getCss('--accent');
+      const label = g.kind === 'layer' ? g.value + '層' : g.kind === 'width' ? 'ff' + g.value : '取消';
+      c.fillText(label, Math.min(gx + 2, W - pad.r - 22), pad.t + 8);
+    }
+    c.restore();
+  }
+
   function drawServer(cv, log) {
     const dpr = window.devicePixelRatio || 1; const W = cv.clientWidth || 300, H = cv.clientHeight || 104;
     cv.width = W * dpr; cv.height = H * dpr; const c = cv.getContext('2d'); c.scale(dpr, dpr); c.clearRect(0, 0, W, H);
@@ -364,6 +383,7 @@ details.about p { margin: 6px 0; }
     if (ppl.length) { c.strokeStyle = getCss('--heat'); c.lineWidth = 1.4; c.beginPath(); let started = false; log.forEach((r, i) => { if (r.ppl == null) return; started ? c.lineTo(x(i), yp(r.ppl)) : c.moveTo(x(i), yp(r.ppl)); started = true; }); c.stroke(); }
     c.strokeStyle = getCss('--accent'); c.lineWidth = 1.8; c.beginPath();
     log.forEach((r, i) => { i ? c.lineTo(x(i), y(r.loss)) : c.moveTo(x(i), y(r.loss)); }); c.stroke();
+    drawGrowthMarks(c, (state.meta && state.meta.growth_log) || [], log, x, W, H, pad);
     const last = log[log.length - 1];
     c.fillStyle = getCss('--accent'); c.beginPath(); c.arc(x(log.length - 1), y(last.loss), 2.5, 0, Math.PI * 2); c.fill();
     $('preLossLast').textContent = `step ${fmt(last.step)} · loss ${last.loss.toFixed(3)} · PPL ${last.ppl != null ? last.ppl.toFixed(1) : '–'} · ${fmt(last.tok_s)} トークン/秒`;
