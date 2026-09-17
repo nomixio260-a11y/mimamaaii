@@ -55,8 +55,25 @@ class DialogStore:
             out.append((self._shorten(u, self.MAX_HISTORY_CHARS), self._shorten(b, self.MAX_HISTORY_CHARS)))
         return tuple(out)
 
+    @staticmethod
+    def clean_reply(text: str) -> str:
+        """応答から書式の記号を落とし、箇条書きが始まる手前までにする。
+
+        指示データの応答は「説明文 + 番号つきの箇条書き」が多い。応答は 220 字で切り詰めるので、
+        そのままだと「1. **バッテリーの温度管理**」のような途中で切れた断片を学ぶことになり、
+        生成にも「1.**…**」という壊れた書式が現れる (実測: 会話の 8% に書式混入、6% が途中で終了)。
+        小さなモデルには書式より地の文を学ばせる。"""
+        t = re.sub(r"\*\*|__|`+", "", text)
+        t = re.sub(r"^\s*#{1,6}\s*", "", t, flags=re.M)
+        m = re.search(r"\n\s*(?:\d+[.)]|[-*・])\s*", t)
+        if m and m.start() >= 30:            # 箇条書きの手前に十分な説明文があれば、そこまでを学ぶ
+            t = t[: m.start()]
+        t = re.sub(r"[ \t]+", " ", t)
+        t = re.sub(r"\n{2,}", "\n", t).strip()
+        return t or text.strip()
+
     def add(self, user: str, bot: str, source: str = "chat", weight: float = 1.0, history=None) -> bool:
-        user, bot = user.strip(), bot.strip()
+        user, bot = user.strip(), self.clean_reply(bot)
         if len(bot) > self.MAX_BOT:
             bot = self._shorten(bot, self.MAX_BOT)
         if len(user) > 300:

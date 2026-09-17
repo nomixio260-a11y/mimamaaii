@@ -1315,6 +1315,22 @@ class DecodeQualityTest(unittest.TestCase):
 class DialogHistoryTest(unittest.TestCase):
     """会話の履歴を保存し、再生バッファに履歴つきで戻せること (会話のキャッチボールの学習)。"""
 
+    def test_reply_markdown_is_cleaned(self):
+        """応答の書式記号を落とし、箇条書きの手前までを学習対象にする。"""
+        from tinyai.dialog import DialogStore
+        long_md = ("ノートPCのバッテリー寿命を保つ方法はいくつかあります。以下の点に注意してください。"
+                   "\n\n1. **温度管理**\n高温だと劣化が早まります。\n2. **充電**\n満充電を避けます。")
+        cleaned = DialogStore.clean_reply(long_md)
+        self.assertNotIn("**", cleaned)
+        self.assertNotIn("1.", cleaned)
+        self.assertIn("温度", long_md)                       # 元には箇条書きがある
+        self.assertTrue(cleaned.endswith("ください。"))        # 地の文だけが残る
+        self.assertEqual(DialogStore.clean_reply("**太字**と`コード`"), "太字とコード")
+        self.assertEqual(DialogStore.clean_reply("- 箇条書きだけ"), "- 箇条書きだけ")   # 短すぎる時は残す
+        d = DialogStore(5)
+        d.add("質問", long_md)
+        self.assertNotIn("**", d.pairs[-1][1])
+
     def test_history_is_stored_and_trimmed(self):
         from tinyai.dialog import DialogStore
         d = DialogStore(10)
