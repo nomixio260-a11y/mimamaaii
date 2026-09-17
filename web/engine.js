@@ -600,10 +600,38 @@
       for (let i = seq.length - 1; i >= 0; i--) if (seq[i] === BOT) return i + 1;
       return 0;
     }
+    // 質問の肝になる語 (漢字・カタカナ・英数の連続)。属性側の語は話題を決めないので外す
+    static keyRuns(text) {
+      const generic = /^(作り方|仕組み|意味|方法|理由|違い|使い方|特徴|説明|定義|種類|場所|時間|関係)$/;
+      const re = /[一-鿿㐀-䶿]{2,}|[゠-ヿー]{2,}|[a-z0-9]{3,}/g;
+      const out = [];
+      let m;
+      while ((m = re.exec(text.toLowerCase())) !== null) if (!generic.test(m[0])) out.push(m[0]);
+      return out;
+    }
+    // 肝になる語が本文に出てくるか。語そのもの、または中黒で区切った部分 (「ヴォルフガング・パウリ」の
+    // 「パウリ」) が丸ごと現れた時だけ一致とする。部分一致を緩めると「ペンタクロン」が「クロン」で通る。
+    static keyMatch(key, body) {
+      if (body.indexOf(key) >= 0) return true;
+      return key.split('・').some((part) => part.length >= 2 && body.indexOf(part) >= 0);
+    }
+    // 検索は点数が高くても見当違いのことがある (「カレーの作り方」に爆発装置の作り方が返る)。
+    // 質問の語に触れている文を前に出し、どれも触れていなければ文脈として使わない。
     retrieve(user, k) {
       const hits = this.kb.search(user, k || 3);
-      const ctx = hits.map((h) => h.text).join(' ').slice(0, 200);
-      return { hits, context: ctx || null };
+      const keys = Engine.keyRuns(user);
+      let use = hits, offTopic = false;
+      if (keys.length && hits.length) {
+        // 一番長い語 (たいてい話題の主語) が 4 文字以上ならそれを必須にする
+        const main = keys.slice().sort((a, b) => b.length - a.length)[0];
+        const on = main.length >= 4
+          ? hits.filter((h) => Engine.keyMatch(main, h.text))
+          : hits.filter((h) => keys.some((key) => Engine.keyMatch(key, h.text)));
+        if (!on.length) { use = []; offTopic = true; }
+        else if (on.length < hits.length) use = on.concat(hits.filter((h) => on.indexOf(h) < 0));
+      }
+      const ctx = use.map((h) => h.text).join(' ').slice(0, 200);
+      return { hits, context: ctx || null, keys, offTopic };
     }
     _generateCands(user, context, n, maxNew, pass, history, copyBonus) {
       const prompt = this.promptDialog(user, context, history);
@@ -626,10 +654,10 @@
     reply(user, opts) {
       opts = opts || {};
       const n = opts.candidates || 3, t0 = Date.now(), maxNew = opts.maxNew || 48;
-      const { hits, context } = this.retrieve(user, 3);
+      const { hits, context, keys, offTopic } = this.retrieve(user, 3);
       const history = this.history.slice(-2);                 // 直前のやり取りを覚えて答える
       // 検索が弱い時は文脈への寄せを緩める (雑談で検索文を写すと会話にならない)
-      const strong = hits.length && hits[0].score >= 8;
+      const strong = !offTopic && hits.length && hits[0].score >= 8;
       const copyBonus = (this.decode.copy_bonus || 0) * (strong ? 1 : 0.3);
       let cands = this._generateCands(user, context, n, maxNew, 1, history, copyBonus);
       let rethink = null;
@@ -648,10 +676,17 @@
       cands.sort((a, b) => b.score - a.score);
       const best = cands.find((c) => c.text.length >= 2) || cands[0];
       const ctxUsed = best.pass === 2 && rethink ? rethink.context : context;
-      this.history.push([user, best.text]);
+      // 知らない話題に、根拠なく作文しない: 使える文脈が無く、出来た文も質問の語に触れていない時は素直に言う
+      const topic = keys.slice().sort((a, b) => b.length - a.length)[0] || '';
+      // 知っている文が 1 つも無い話題は、作文せず知らないと言う。候補が話題の語を含むかどうかは見ない
+      // (質問の語をそのまま写した候補が「答えている」ように見えてしまうため)。
+      // 3 文字以上の語の時だけ言う (「元気ですか」に「知りません」と言い出さないため)。
+      const unknown = offTopic && topic.length >= 3;
+      const text = unknown ? `「${topic}」はまだ学んでいません。教えてもらえれば覚えます。` : best.text;
+      this.history.push([user, text]);
       if (this.history.length > 20) this.history.shift();
       this.stats.turns += 1;
-      return { text: best.text, hits, context: ctxUsed, rethink, history, copyBonus: Math.round(copyBonus * 100) / 100,
+      return { text, hits, context: ctxUsed, rethink, history, copyBonus: Math.round(copyBonus * 100) / 100, offTopic, unknown, keys,
                prompt: best.prompt, promptPieces: best.prompt.map((i) => this.tok.piece(i)), candidates: cands, best, ms: Date.now() - t0 };
     }
     // 常時学習: 会話の合間に再生バッファの会話か知識文を 1 系列だけ学ぶ (数百 ms)。忘却を防ぎつつ少しずつ賢くなる

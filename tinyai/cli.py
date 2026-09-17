@@ -329,7 +329,7 @@ def cmd_export(args) -> int:
     from .export import export_brain
 
     try:
-        meta = export_brain(brain, Path(args.out), max_docs=args.max_docs, logs=args.log)
+        meta = export_brain(brain, Path(args.out), max_docs=args.max_docs, max_chars=args.max_chars, logs=args.log)
     except RuntimeError as e:
         print(e)
         return 1
@@ -512,6 +512,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("export", help="ブラウザ版 (web/) 用にモデルを int8 で書き出す")
     p.add_argument("--out", default="web/dist")
     p.add_argument("--max-docs", type=int, default=12000)
+    p.add_argument("--max-chars", type=int, default=1_500_000, help="配る知識文の総文字数 (増やすとブラウザの知識は増えるが読み込みが重くなる)")
     p.add_argument("--log", action="append", help="train のログ (学習曲線と収集の記録をページに載せる)")
     p.set_defaults(func=cmd_export)
 

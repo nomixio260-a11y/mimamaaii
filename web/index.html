@@ -470,6 +470,11 @@ details.about p { margin: 6px 0; }
     $('hitN').textContent = `${r.hits.length} 件`;
     const hits = $('hits'); hits.innerHTML = ''; hits.className = r.hits.length ? '' : 'empty';
     if (!r.hits.length) hits.textContent = '関連する知識は見つからず、モデルの記憶だけで答えました。';
+    if (r.offTopic) {
+      const note = document.createElement('div'); note.className = 'empty';
+      note.textContent = `検索結果はどれも「${(r.keys || []).join('・')}」に触れていないので、文脈として使いませんでした。`;
+      hits.appendChild(note);
+    }
     for (const h of r.hits) { const el = document.createElement('div'); el.className = 'hit'; el.innerHTML = `<div class="bar"><i style="width:${Math.round(h.rel * 100)}%"></i></div><div></div>`; el.lastChild.textContent = `${h.text} (BM25 ${h.score.toFixed(1)})`; hits.appendChild(el); }
     const RT = $('rethink'); RT.hidden = !r.rethink; const RH = $('rethinkHits'); RH.innerHTML = '';
     if (r.rethink) for (const h of r.rethink.hits) { const el = document.createElement('div'); el.className = 'hit'; el.innerHTML = `<div class="bar"><i style="width:${Math.round(h.rel * 100)}%"></i></div><div></div>`; el.lastChild.textContent = `${h.text} (BM25 ${h.score.toFixed(1)})`; RH.appendChild(el); }
@@ -528,14 +533,20 @@ details.about p { margin: 6px 0; }
         addMeta(m, `loss ${r.result ? r.result.loss.toFixed(3) : '–'}`); renderSummary(r.summary); addEvent(`知識を学習 loss ${r.result ? r.result.loss.toFixed(3) : '–'}`); scheduleSave();
       } else {
         setStatus('考えています…', 'busy');
-        const r = await call({ op: 'reply', text, opts: { candidates: 3, maxNew: 48 } });
+        const r = await call({ op: 'reply', text, opts: { candidates: 4, maxNew: 64 } });
         renderThinking(r);
         const m = addMsg('bot', r.text || '…');
-        setStatus('学習しています…', 'busy');
-        const l = await call({ op: 'learnTurn', user: text, bot: r.text, context: r.context, weight: 1, steps: 1 });
-        addMeta(m, `${r.ms} ms · 学習 loss ${l.result ? l.result.loss.toFixed(3) : '–'}`, { user: text, bot: r.text, context: r.context });
-        renderSummary(l.summary); addEvent(`会話を学習 loss ${l.result ? l.result.loss.toFixed(3) : '–'} (${l.result ? l.result.tokens : 0} トークン)`);
-        maybeEvolve(); scheduleSave();
+        if (r.unknown) {
+          // 知らないと答えた時は、その答え自体を学ばない (「知りません」と言う癖がつくため)
+          addMeta(m, `${r.ms} ms · 知らない話題なので学習しません`);
+          addEvent(`「${r.keys && r.keys[0]}」は未学習と判断 (検索結果が質問に触れていない)`);
+        } else {
+          setStatus('学習しています…', 'busy');
+          const l = await call({ op: 'learnTurn', user: text, bot: r.text, context: r.context, weight: 1, steps: 1 });
+          addMeta(m, `${r.ms} ms · 学習 loss ${l.result ? l.result.loss.toFixed(3) : '–'}`, { user: text, bot: r.text, context: r.context });
+          renderSummary(l.summary); addEvent(`会話を学習 loss ${l.result ? l.result.loss.toFixed(3) : '–'} (${l.result ? l.result.tokens : 0} トークン)`);
+          maybeEvolve(); scheduleSave();
+        }
       }
       setStatus('準備完了', 'on');
     } catch (e) { addMsg('sys', 'エラー: ' + e.message); setStatus('エラー', ''); }
