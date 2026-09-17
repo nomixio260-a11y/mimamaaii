@@ -143,7 +143,8 @@ details.about p { margin: 6px 0; }
     <div class="metric"><span class="k">パラメータ</span><span class="v" id="mParams">–</span><span class="s" id="mArch">–</span></div>
     <div class="metric"><span class="k">層 / 語彙</span><span class="v" id="mLayers">–</span><span class="s" id="mVocabAdded">–</span></div>
     <div class="metric"><span class="k">事前学習</span><span class="v" id="mPre">–</span><span class="s" id="mPreTok">–</span></div>
-    <div class="metric"><span class="k">取り置き PPL</span><span class="v" id="mPpl">–</span><span class="s">低いほど文を予測できる</span></div>
+    <div class="metric"><span class="k">学習素材</span><span class="v" id="mCorpus">–</span><span class="s" id="mCorpusRatio">–</span></div>
+    <div class="metric"><span class="k">会話の予測力</span><span class="v" id="mGain">–</span><span class="s" id="mBpc">低いほど文を予測できる</span></div>
     <div class="metric"><span class="k">この端末での学習</span><span class="v" id="mOnline">–</span><span class="s" id="mOnlineTok">–</span></div>
     <div class="metric"><span class="k">直近の損失</span><span class="v" id="mLoss">–</span><span class="s" id="mLossTrend">–</span></div>
     <div class="metric"><span class="k">知識文 / 事実</span><span class="v" id="mDocs">–</span><span class="s" id="mReplay">–</span></div>
@@ -307,7 +308,18 @@ details.about p { margin: 6px 0; }
     $('mVocabAdded').textContent = `語彙追加 +${fmt((m.vocab_added || 0) + (st.vocabAdded || 0))} 層追加 +${fmt(m.grown_layers || 0)}`;
     $('mPre').textContent = fmt(s.pretrainStep) + ' step';
     $('mPreTok').textContent = `${((m.trained_tokens || 0) / 1e6).toFixed(1)}M トークン`;
-    $('mPpl').textContent = m.holdout_ppl ? Number(m.holdout_ppl).toFixed(2) : '–';
+    // 学習素材 (ディスクに貯めたトークン) と、パラメータ 1 つあたりのトークン数。
+    // 20 トークン/パラメータ が「一から学習する場合の計算最適」の目安 (Chinchilla 則)。
+    const corpusTok = m.corpus_tokens || 0;
+    $('mCorpus').textContent = corpusTok ? (corpusTok / 1e6).toFixed(0) + 'M トークン' : '–';
+    $('mCorpusRatio').textContent = corpusTok && s.params
+      ? `${(corpusTok / s.params).toFixed(1)} トークン/パラメータ (目安 20)` : `知識文 ${fmt(m.kb_docs || 0)} 文`;
+    // 会話の予測力: 文字の出現頻度だけを知っている状態から何 % 予測を詰められたか
+    const ev = (m.eval_log || []).slice(-1)[0] || {};
+    const gain = ev.dialog_gain_fresh != null ? ev.dialog_gain_fresh : ev.dialog_bpc_gain;
+    const bpc = ev.dialog_bpc_fresh != null ? ev.dialog_bpc_fresh : ev.dialog_bpc;
+    $('mGain').textContent = gain != null ? (gain * 100).toFixed(1) + '%' : '–';
+    $('mBpc').textContent = bpc != null ? `${bpc.toFixed(2)} ビット/文字 (低いほど良い)` : '低いほど文を予測できる';
     $('mOnline').textContent = fmt(st.onlineSteps) + ' step';
     $('mOnlineTok').textContent = `会話 ${fmt(st.turns)} ターン + 常時学習 ${fmt(st.idleSteps || 0)} step / ${fmt(st.onlineTokens)} トークン`;
     const lh = st.lossHist || [];

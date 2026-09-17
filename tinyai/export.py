@@ -198,6 +198,10 @@ def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1
         "grown_layers": nl.grown, "widened": getattr(nl, "widened", 0), "vocab_added": nl.vocab_added, "online_steps": nl.online_steps, "decode": nl.decode,
         "last_loss": stats.get("last_loss"), "loss_hist": [round(x, 3) for x in nl.loss_hist[-100:]],
         "kb_docs": len(brain.kb), "facts": brain.facts.count,
+        # ディスクに貯めた学習トークン (UI で「学習素材」と「トークン/パラメータ」を出すため)
+        "corpus_tokens": nl.corpus.tokens if getattr(nl, "corpus", None) else 0,
+        "corpus_seqs": len(nl.corpus) if getattr(nl, "corpus", None) else 0,
+        "pool_tokens": nl.pool.total_tokens if getattr(nl, "pool", None) else 0,
         "dialogs": len(brain.dialogs), "dialogs_with_history": brain.dialogs.with_history(), "exported_docs": len(docs), "dialogs_by_source": brain.dialogs.by_source(),
         "stats": {k: v for k, v in brain.stats.items() if isinstance(v, (int, float))},
     }
