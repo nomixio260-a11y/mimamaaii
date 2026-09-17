@@ -16,6 +16,8 @@ from collections import deque
 
 _PII_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|\+?\d[\d\-() ]{8,}\d")
 _QUOTE_RE = re.compile(r"「([^「」]{2,80})」")
+# 中身のない前置き (これだけを学ぶと「以下のような質問があります」のような空の応答を返すようになる)
+_HOLLOW_RE = re.compile(r"(以下|次|下記)の(ような|とおり|点|よう)|以下に|ご紹介します|説明します$|挙げます$")
 
 
 class DialogStore:
@@ -63,11 +65,20 @@ class DialogStore:
         そのままだと「1. **バッテリーの温度管理**」のような途中で切れた断片を学ぶことになり、
         生成にも「1.**…**」という壊れた書式が現れる (実測: 会話の 8% に書式混入、6% が途中で終了)。
         小さなモデルには書式より地の文を学ばせる。"""
-        t = re.sub(r"\*\*|__|`+", "", text)
+        t = re.sub(r"\*+|__+|`+", "", text)          # ** も *** も残さない
         t = re.sub(r"^\s*#{1,6}\s*", "", t, flags=re.M)
         m = re.search(r"\n\s*(?:\d+[.)]|[-*・])\s*", t)
-        if m and m.start() >= 30:            # 箇条書きの手前に十分な説明文があれば、そこまでを学ぶ
-            t = t[: m.start()]
+        if m:                                # 箇条書きが始まる手前で切る (途中で切れた項目を学ばない)
+            lead, rest = t[: m.start()].strip(), t[m.start():]
+            if _HOLLOW_RE.search(lead) or len(lead) < 25:
+                # 「以下のような点に注意してください。」だけを学ぶと、中身の無い前置きばかり返すようになる。
+                # 箇条書きの最初の 2 項目を地の文にして、内容のある応答として学ぶ。
+                items = [re.sub(r"^\s*(?:\d+[.)]|[-*・])\s*", "", ln).strip()
+                         for ln in rest.splitlines() if ln.strip()]
+                items = [i for i in items if len(i) >= 6][:2]
+                t = (lead + " " + " ".join(items)).strip() if items else lead
+            else:
+                t = lead
         t = re.sub(r"[ \t]+", " ", t)
         t = re.sub(r"\n{2,}", "\n", t).strip()
         return t or text.strip()

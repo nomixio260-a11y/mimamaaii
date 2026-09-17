@@ -1347,11 +1347,16 @@ class DialogHistoryTest(unittest.TestCase):
                    "\n\n1. **温度管理**\n高温だと劣化が早まります。\n2. **充電**\n満充電を避けます。")
         cleaned = DialogStore.clean_reply(long_md)
         self.assertNotIn("**", cleaned)
-        self.assertNotIn("1.", cleaned)
-        self.assertIn("温度", long_md)                       # 元には箇条書きがある
-        self.assertTrue(cleaned.endswith("ください。"))        # 地の文だけが残る
+        self.assertNotIn("\n1.", cleaned)
+        self.assertIn("高温だと劣化", cleaned)                # 箇条書きの中身は地の文にして残す
+        self.assertNotIn("1. ", cleaned)                      # 記号は落とす
         self.assertEqual(DialogStore.clean_reply("**太字**と`コード`"), "太字とコード")
-        self.assertEqual(DialogStore.clean_reply("- 箇条書きだけ"), "- 箇条書きだけ")   # 短すぎる時は残す
+        self.assertEqual(DialogStore.clean_reply("- 箇条書きだけ"), "- 箇条書きだけ")   # 1 行だけなら残す
+        hollow = "日本の四季について説明します。\n\n- 春は桜が咲きます。\n- 夏は高温多湿です。"
+        got = DialogStore.clean_reply(hollow)
+        self.assertIn("春は桜", got)                         # 前置きだけの応答にしない
+        self.assertNotIn("- 春", got)
+        self.assertEqual(DialogStore.clean_reply("1.***太字***です"), "1.太字です")     # ** も *** も落とす
         d = DialogStore(5)
         d.add("質問", long_md)
         self.assertNotIn("**", d.pairs[-1][1])
