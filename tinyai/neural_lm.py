@@ -103,6 +103,8 @@ class NeuralLM:
         self._pregrow_ppl: float | None = None       # 成長直前の ppl (成長が裏目に出ていないかの判定用)
         self._pregrow_dialog: float | None = None    # 成長直前の対話 ppl
         self.dialog_hist: list[float] = []           # 対話 ppl の推移 (成長の判断に使う)
+        self.lr_scale = 1.0                          # 学習率の調整倍率 (不安定な時に下げる)
+        self._last_damp_step = 0
         self._pregrow_path = self.data_dir / "neural.pregrow.npz"
         self._last_save = 0.0
         self.batch = neural.PRESETS[self.size]["batch"] if self.available else 8
@@ -140,6 +142,7 @@ class NeuralLM:
                 self.decode.update({k: v for k, v in saved.items() if k in self.decode})
                 self.grown = int(meta.get("grown", 0))
                 self._last_grow_step = int(meta.get("last_grow_step", 0))
+                self.lr_scale = float(meta.get("lr_scale", 1.0))
                 self.vocab_added = int(meta.get("vocab_added", 0))
                 self.online_steps = int(meta.get("online_steps", 0))
                 self.batch = neural.PRESETS.get(self.size, {}).get("batch", self.batch)
@@ -363,15 +366,48 @@ class NeuralLM:
 
     GROW_WARMUP = 400            # 成長直後に学習率を戻していくステップ数
 
+    LR_FLOOR_RATIO = 0.5         # 学習が不安定な時に下げる倍率
+
     def _depth_lr(self) -> float:
         """層数に応じた学習率。プリセットの学習率は「その層数」で調整した値なので、
         成長して深くなったらそのままでは大きすぎる (実測: 4 層想定の 6e-4 のまま 9 層まで増やしたら、
         対話 ppl 75 → 118、接地率 0.95 → 0.83 と崩れた)。深さの平方根に反比例させる
         (層が増えるほど残差の重なりが深くなり、同じ更新幅でも出力の変化が大きくなるため)。"""
         base_layers = neural.PRESETS.get(self.size, {}).get("layers", self.model.L if self.model else 4)
+        lr = self.lr * self.lr_scale
         if self.model is None or self.model.L <= base_layers:
-            return self.lr
-        return self.lr * (base_layers / self.model.L) ** 0.5
+            return lr
+        return lr * (base_layers / self.model.L) ** 0.5
+
+    def maybe_damp_lr(self) -> bool:
+        """会話の質が続けて落ちていたら学習率を下げる。
+
+        成長や分布の変化で学習が不安定になった時、放っておくと質が落ち続ける。
+        対話 ppl (固定の取り置きで測る) の直近 2 回が、その前 4 回の中央値より 25% 以上悪ければ、
+        学習率を半分にして落ち着かせる。下げるのは 1,500 ステップに 1 回まで。"""
+        with self.lock:
+            if self.model is None or len(self.dialog_hist) < 6:
+                return False
+            if self.model.step - self._last_damp_step < 1500:
+                return False
+            recent = sum(self.dialog_hist[-2:]) / 2
+            prev = sorted(self.dialog_hist[-6:-2])
+            base = (prev[1] + prev[2]) / 2
+            if recent <= base * 1.25:
+                return False
+            self._last_damp_step = self.model.step
+            self.damp_lr("対話 ppl %.1f -> %.1f" % (base, recent))
+            return True
+
+    def damp_lr(self, reason: str = "") -> float:
+        """学習が不安定な時に学習率をさらに半分にする (下限 1/8 まで)。
+        自動で下げたことを記録し、書き出しにも残す (なぜ遅くなったかを後から追えるように)。"""
+        with self.lock:
+            if self.lr_scale <= 0.125:
+                return self.lr_scale
+            self.lr_scale *= self.LR_FLOOR_RATIO
+            log.warning("学習率を下げました (x%.3f) %s", self.lr_scale, reason)
+            return self.lr_scale
 
     def _effective_lr(self) -> float:
         """成長直後は学習率を下げてから戻す。
@@ -636,7 +672,7 @@ class NeuralLM:
             except Exception as e:
                 log.warning("再生バッファの保存に失敗: %s", e)
             self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300], "holdout_recent": [list(x) for x in self._holdout_recent],
-                                                       "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "last_grow_step": self._last_grow_step, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
+                                                       "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "last_grow_step": self._last_grow_step, "lr_scale": self.lr_scale, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
             self._last_save = time.time()
 
     def _infer(self):
@@ -718,6 +754,7 @@ class NeuralLM:
             "corpus_seqs": len(self.corpus) if self.corpus else 0,
             "corpus_tokens": self.corpus.tokens if self.corpus else 0,
             "holdout": len(self._holdout), "holdout_recent": len(self._holdout_recent), "recent_ppl": self.recent_ppl,
+            "lr_scale": self.lr_scale, "lr": round(self._effective_lr(), 7) if self.model else None,
             "last_loss": round(self.last_loss, 3) if self.last_loss is not None else None,
             "holdout_ppl": self.holdout_ppl,
             "ngram_ppl": self.ngram_ppl,

@@ -1551,6 +1551,28 @@ class GrowthTest(unittest.TestCase):
             nl.model.step = nl._last_grow_step + nl.GROW_WARMUP
             self.assertEqual(nl._effective_lr(), nl._depth_lr())           # 馴染んだら深さ補正のみに戻る
 
+    def test_learning_rate_is_damped_when_dialogue_keeps_falling(self):
+        """会話の質が続けて落ちたら学習率を自動で下げる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.model.step = 5000
+            nl.dialog_hist = [75.0, 74.0, 76.0, 75.0, 110.0, 115.0]     # 直近 2 回が大きく悪化
+            before = nl._effective_lr()
+            self.assertTrue(nl.maybe_damp_lr())
+            self.assertLess(nl._effective_lr(), before)
+            self.assertFalse(nl.maybe_damp_lr())                        # 続けては下げない
+            nl.model.step += 1500
+            self.assertTrue(nl.maybe_damp_lr())                         # 間隔を空ければまた下げる
+
+    def test_learning_rate_is_kept_when_dialogue_is_stable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.model.step = 5000
+            nl.dialog_hist = [75.0, 74.0, 76.0, 75.0, 74.0, 73.0]       # 安定している
+            before = nl._effective_lr()
+            self.assertFalse(nl.maybe_damp_lr())
+            self.assertEqual(nl._effective_lr(), before)
+
     def test_growth_stops_when_dialogue_gets_worse(self):
         """平文の指標が良くても、会話の質が落ちていれば成長させない。"""
         with tempfile.TemporaryDirectory() as tmp:

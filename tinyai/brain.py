@@ -574,6 +574,7 @@ class Brain:
                 # データ側は自前の刈り込みで縮むので、モデルの成長は別枠で判断する。
                 grow_cost = self.neural.growth_bytes()
                 mem_ok = self.guard.pressure() + grow_cost / max(self.guard.soft, 1) < 0.95
+                nl.maybe_damp_lr()                         # 会話の質が落ち続けていれば学習率を下げる
                 if nl.check_growth():                      # 前回の成長が裏目なら取り消す
                     self.stats["neural_rollback"] += 1
                 elif nl.maybe_grow(mem_ok, data_tokens=nl.corpus.tokens if nl.corpus else 0):
