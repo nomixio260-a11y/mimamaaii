@@ -28,7 +28,7 @@ log = logging.getLogger("tinyai.neural")
 
 # 復号パラメータの既定値の世代。上げると、古いチェックポイントが持っている値のうち
 # 研究で見直した項目 (現在は copy_bonus) を捨てて新しい既定値から再開する。
-DECODE_VERSION = 2
+DECODE_VERSION = 3
 
 # 本文を指す言い回し (読解データ由来。文脈なしで学ぶと雑談にも出てくる)
 _PASSAGE_RE = re.compile(r"文章(に|では|から|によ)|文中|この記事(に|では)|上記の|与えられた文|本文(に|では)|記載されてい")
@@ -547,11 +547,19 @@ class NeuralLM:
                 self.vocab_added += n
             return n
 
+    @property
+    def decode_stable(self) -> dict:
+        """採用済みの復号設定。試行中は self.decode が「試している設定」なので、配布や表示には
+        こちらを使う (実測: 6 票で動く山登りの途中の値がそのままブラウザ版に配られていた)。"""
+        return dict(self._decode_trial or self.decode)
+
     def feedback(self, positive: bool) -> None:
-        """👍/👎 で復号パラメータを山登り: 試行中の設定が採用済みより良ければ採用、悪ければ戻す。"""
+        """👍/👎 で復号パラメータを山登り: 試行中の設定が採用済みより良ければ採用、悪ければ戻す。
+
+        判定に使う票数が少ないと、山登りではなく酔歩になる。12 票 (だいたい 6 往復ぶん) 貯めてから判定する。"""
         self._fb[0 if positive else 1] += 1
         n = sum(self._fb)
-        if n < 6:
+        if n < 12:
             return
         rate = self._fb[0] / n
         if self._decode_trial is not None:

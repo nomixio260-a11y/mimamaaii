@@ -940,7 +940,7 @@ class RealtimeLearningTest(unittest.TestCase):
             # 語彙の進化
             added = b.neural.evolve_vocab(["新語ホゲホゲ理論が何度も出てくる。新語ホゲホゲ理論とは新語ホゲホゲ理論である。"] * 6, top=5)
             self.assertGreater(added, 0)
-            for _ in range(6):
+            for _ in range(12):                       # 12 票貯まってから判定する (少ない票での酔歩を避ける)
                 b.neural.feedback(True)
             self.assertIsNotNone(b.neural._decode_trial)  # 復号パラメータの試行が始まる
 
@@ -2305,3 +2305,31 @@ class UnknownBecomesHomeworkTest(unittest.TestCase):
             self.assertIn("知りません", r.text)
             self.assertEqual(b.next_topic(), "ゾンビ星ペンタクロン")   # 先に積んだ話題より優先
             self.assertGreaterEqual(b.stats["unknown_queued"], 1)
+
+
+class DecodeTrialTest(unittest.TestCase):
+    """👍/👎 の山登りの「試している設定」を配布しない。"""
+
+    def _lm(self, tmp):
+        from tinyai.neural_lm import NeuralLM
+        nl = NeuralLM(Path(tmp), size="tiny")
+        nl.ensure_model()
+        return nl
+
+    def test_stable_config_is_the_accepted_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            accepted = dict(nl.decode)
+            for i in range(12):                      # 12 票で 1 回だけ判定し、次の試行に移る
+                nl.feedback(True)
+            self.assertIsNotNone(nl._decode_trial)   # 試行中
+            self.assertNotEqual(nl.decode, accepted)
+            self.assertEqual(nl.decode_stable, accepted)
+
+    def test_few_votes_do_not_move_the_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            accepted = dict(nl.decode)
+            for i in range(6):
+                nl.feedback(True)
+            self.assertEqual(nl.decode, accepted)     # 6 票では動かない (酔歩を避ける)
