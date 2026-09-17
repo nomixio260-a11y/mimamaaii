@@ -333,7 +333,8 @@ class NeuralLM:
     def evaluate(self, ngram_ppl: float | None = None) -> dict:
         if self.model is None or not self._holdout:
             return {}
-        self.holdout_ppl = round(neural.perplexity(self.model, self._holdout), 2)
+        with self.model.use_ema():
+            self.holdout_ppl = round(neural.perplexity(self.model, self._holdout), 2)
         self.ngram_ppl = ngram_ppl
         if self.holdout_ppl is not None:
             if ngram_ppl is not None:
@@ -369,7 +370,8 @@ class NeuralLM:
     def score(self, text: str) -> float | None:
         if self.model is None:
             return None
-        return self.model.logprob(self.seq_text(text))
+        with self.model.use_ema():
+            return self.model.logprob(self.seq_text(text))
 
     def chat(self, user: str, context: str | None = None, n: int = 2, max_new: int = 48, temperature: float = 0.7) -> list[str]:
         """RAG 形式で応答候補を n 本生成。"""
@@ -378,7 +380,9 @@ class NeuralLM:
         prompt = self.prompt_dialog(user, context)
         out = []
         dec = self.decode
-        for ids in self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=dec["temperature"], top_p=dec["top_p"], repetition_penalty=dec["repetition_penalty"], rng=self.nprng):
+        with self.model.use_ema():
+            gens = self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=dec["temperature"], top_p=dec["top_p"], repetition_penalty=dec["repetition_penalty"], rng=self.nprng)
+        for ids in gens:
             text = self.tok.decode(ids).strip()
             if len(text) >= 2:
                 out.append(text)
@@ -388,7 +392,8 @@ class NeuralLM:
         if self.model is None:
             return ""
         prompt = [BOS] + self.tok.encode(seed_text, max_tokens=self.model.T // 2)
-        ids = self.model.generate(prompt, max_new=max_new, temperature=temperature, rng=self.nprng)
+        with self.model.use_ema():
+            ids = self.model.generate(prompt, max_new=max_new, temperature=temperature, rng=self.nprng)
         return self.tok.decode(ids)
 
     def stats(self) -> dict:
@@ -414,5 +419,6 @@ class NeuralLM:
             "online_steps": self.online_steps,
             "decode": dict(self.decode),
             "dropout": self.model.dropout if self.model else self.dropout,
+            "ema": self.model.ema is not None if self.model else False,
             "priority_mean": round(float(self.pool.priority[: len(self.pool)].mean()), 3) if len(self.pool) else None,
         }

@@ -36,6 +36,7 @@ def export_model(model: "neural.TinyTransformer", tok, out_dir: Path, meta_extra
     np = neural.np
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    src = model.ema if model.ema is not None and all(k in model.ema and model.ema[k].shape == v.shape for k, v in model.p.items()) else model.p
     names = ["wte"]
     for i in range(model.L):
         names += [f"l{i}.rms1", f"l{i}.wqkv", f"l{i}.wo", f"l{i}.rms2", f"l{i}.w1", f"l{i}.wg", f"l{i}.w2"]
@@ -45,7 +46,7 @@ def export_model(model: "neural.TinyTransformer", tok, out_dir: Path, meta_extra
     offset = 0
     deq = {}
     for name in names:
-        w = model.p[name]
+        w = src[name]
         if w.ndim == 1:
             b = w.astype(np.float32).tobytes()
             tensors.append({"name": name, "shape": list(w.shape), "dtype": "f32", "offset": offset})
@@ -62,7 +63,7 @@ def export_model(model: "neural.TinyTransformer", tok, out_dir: Path, meta_extra
     (out_dir / "model.bin").write_bytes(b"".join(blobs))
     meta = {
         "V": model.V, "d": model.d, "heads": model.h, "layers": model.L, "ctx": model.T, "ff": model.ff,
-        "params": model.n_params(), "step": model.step, "bytes": offset, "tensors": tensors,
+        "params": model.n_params(), "step": model.step, "bytes": offset, "tensors": tensors, "ema": src is not model.p,
     }
     meta.update(meta_extra or {})
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")

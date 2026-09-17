@@ -347,7 +347,7 @@ details.about p { margin: 6px 0; }
     const heat = getCss('--heat'); const left = 56;
     rows.forEach((row, r) => {
       const mx = Math.max.apply(null, row) || 1;
-      c.fillStyle = getCss('--ink3'); c.fillText(pieceOf(best.trace[r].token).slice(0, 5), 2, r * cell + cell - 1);
+      if (cell >= 9 || r % Math.ceil(9 / cell) === 0) { c.fillStyle = getCss('--ink3'); c.fillText(pieceOf(best.trace[r].token).slice(0, 5), 2, r * cell + cell - 1); }
       row.forEach((v, j) => { c.fillStyle = `color-mix(in srgb, ${heat} ${Math.round((v / mx) * 100)}%, ${getCss('--surface2')})`; c.fillRect(left + j * cell, r * cell, cell - 1, cell - 1); });
     });
     c.fillStyle = getCss('--ink3'); c.fillText('← プロンプトの語 (左が先頭)', left, rows.length * cell + 14);

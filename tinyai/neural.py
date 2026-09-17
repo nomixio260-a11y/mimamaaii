@@ -126,6 +126,8 @@ class TinyTransformer:
         self.p = p
         self.m = {k: np.zeros_like(v) for k, v in p.items()}
         self.v = {k: np.zeros_like(v) for k, v in p.items()}
+        self.ema: dict | None = None            # 重みの指数移動平均 (Polyak 平均): 評価と生成に使うと汎化が良い
+        self.ema_decay = 0.998
         self.step = 0
         self.mask = np.triu(np.full((ctx, ctx), -1e9, self.dtype), 1)
         self.cos, self.sin = _rope_tables(ctx, d // heads, self.dtype)
@@ -150,6 +152,8 @@ class TinyTransformer:
             self.p[k] = v
             self.m[k] = np.zeros_like(v)
             self.v[k] = np.zeros_like(v)
+            if self.ema is not None:
+                self.ema[k] = v.copy()
         self.L += 1
         return self.L
 
@@ -163,6 +167,8 @@ class TinyTransformer:
         self.p["wte"] = np.concatenate([self.p["wte"], extra], axis=0)
         self.m["wte"] = np.concatenate([self.m["wte"], np.zeros_like(extra)], axis=0)
         self.v["wte"] = np.concatenate([self.v["wte"], np.zeros_like(extra)], axis=0)
+        if self.ema is not None:
+            self.ema["wte"] = np.concatenate([self.ema["wte"], extra.copy()], axis=0)
         self.V += n
         return self.V
 
@@ -317,7 +323,42 @@ class TinyTransformer:
             if gk.ndim >= 2:
                 self.p[k] *= (1 - lr * wd)
             self.p[k] -= (lr_eff * tmp).astype(self.dtype, copy=False)
+        self.update_ema()
         return norm
+
+    def update_ema(self) -> None:
+        """重みの指数移動平均を更新 (学習の揺れを平均した重み: 評価・生成・書き出しに使う)。"""
+        if self.ema is None:
+            self.ema = {k: v.copy() for k, v in self.p.items()}
+            return
+        d = self.ema_decay if self.step > 200 else 0.9  # 序盤は速く追従
+        for k, v in self.p.items():
+            e = self.ema.get(k)
+            if e is None or e.shape != v.shape:
+                self.ema[k] = v.copy()
+                continue
+            e *= d
+            e += (1 - d) * v
+
+    class _UseEMA:
+        def __init__(self, model):
+            self.model = model
+            self.saved = None
+
+        def __enter__(self):
+            m = self.model
+            if m.ema is not None and all(k in m.ema and m.ema[k].shape == v.shape for k, v in m.p.items()):
+                self.saved = m.p
+                m.p = m.ema
+            return m
+
+        def __exit__(self, *a):
+            if self.saved is not None:
+                self.model.p = self.saved
+
+    def use_ema(self):
+        """with model.use_ema(): ... の間は EMA 重みで推論する。"""
+        return TinyTransformer._UseEMA(self)
 
     # ------------------------------------------------------------ 推論
     def _step(self, tok: int, pos: int, cache: list) -> np.ndarray:
@@ -471,6 +512,7 @@ class TinyTransformer:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, **{f"p.{k}": v for k, v in self.p.items()}, **{f"m.{k}": v for k, v in self.m.items()}, **{f"v.{k}": v for k, v in self.v.items()},
+                            **({f"e.{k}": v for k, v in self.ema.items()} if self.ema is not None else {}),
                             step=np.array(self.step), shape=np.array([self.V, self.d, self.h, self.L, self.T, self.ff]), dropout=np.array(self.dropout))
         tokenizer.save(Path(str(path) + ".vocab.json"))
         Path(str(path) + ".meta.json").write_text(json.dumps(meta or {}, ensure_ascii=False), encoding="utf-8")
@@ -486,6 +528,8 @@ class TinyTransformer:
             model.m[k] = z[f"m.{k}"]
             model.v[k] = z[f"v.{k}"]
         model.step = int(z["step"])
+        if any(k.startswith("e.") for k in z.files):
+            model.ema = {k: z[f"e.{k}"] for k in model.p if f"e.{k}" in z.files}
         tok = SubwordTokenizer.load(Path(str(path) + ".vocab.json"))
         meta_path = Path(str(path) + ".meta.json")
         meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
