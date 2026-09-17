@@ -149,7 +149,10 @@ class Brain:
         self.neural = NeuralLM(self.cfg.data_dir, size=size, seed=self.cfg.seed or 0,
                                dropout=self.cfg.neural_dropout,
                                pool_capacity=max(30000, int(self.cfg.memory_mb) * 100),
-                               corpus_tokens=max(8_000_000, int(self.cfg.memory_mb) * 80_000))  # Transformer LM (numpy)
+                               # コーパスはディスクなので、メモリではなく空き容量で決める。
+                               # 1 トークン 4 バイト = メモリ 1 MB あたり 20 万トークンで 800 KB のディスク。
+                               # 上限に達すると古い素材から上書きされるので、余裕を持たせる。
+                               corpus_tokens=max(8_000_000, int(self.cfg.memory_mb) * 200_000))  # Transformer LM (numpy)
         self.last_self_eval: dict | None = None
         self.dialog_holdout: list = []             # 評価用に固定した会話 (比較できるように)
         self._fresh_holdout: list = []             # 最近の会話から採った取り置き (一定期間は固定して比べる)
