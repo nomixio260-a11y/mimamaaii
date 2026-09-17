@@ -20,3 +20,5 @@ Aratako/Magpie-Tanuki-8B-97k	default	train	conversations
 llm-jp/oasst2-33k-en	default	train	conversations
 baobab-trees/wikipedia-human-retrieval-ja	default	train	qa_text
 kunishou/oasst1-chat-44k-ja	default	train	conversations
+izumi-lab/wikipedia-ja-20230720	default	train	text
+kunishou/J-ResearchCorpus	default	train	text
