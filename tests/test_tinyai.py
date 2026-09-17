@@ -1,4 +1,5 @@
 """python -m unittest discover -s tests  (pytest でも動く)"""
+import json
 import re
 import random
 import tempfile
@@ -2333,3 +2334,22 @@ class DecodeTrialTest(unittest.TestCase):
             for i in range(6):
                 nl.feedback(True)
             self.assertEqual(nl.decode, accepted)     # 6 票では動かない (酔歩を避ける)
+
+
+class ExportDiversityTest(unittest.TestCase):
+    """配る知識文は出典を順番に回して選ぶ (点数の高い 1 出典で埋めない)。"""
+
+    def test_sources_are_interleaved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            for i in range(5):
+                b.learn_text(f"よく引かれる出典の文その{i}。これは十分な長さの日本語の文です。", "https://a/many")
+            b.learn_text("めったに引かれない出典の文。これも十分な長さの日本語の文です。", "https://b/rare")
+            for d in b.kb.docs.values():
+                if d.source == "https://a/many":
+                    d.hits = 100
+            from tinyai.export import select_docs
+            docs = select_docs(b.kb, max_docs=4, max_chars=100000)
+            self.assertLessEqual(len(docs), 4)
+            self.assertTrue(any("めったに引かれない" in t for t in docs))  # 少数派の出典も混ざる
+            self.assertEqual(len(docs), len(set(docs)))

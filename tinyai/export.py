@@ -168,6 +168,35 @@ def history_from_logs(paths, max_points: int = 400) -> dict:
             "eval_log": evals[-200:], "growth_log": growth[-60:]}
 
 
+def select_docs(kb, max_docs: int, max_chars: int) -> list[str]:
+    """ブラウザ版に配る知識文を選ぶ。出典ごとに点数順に並べ、出典を順番に回して取る。
+
+    点数順にそのまま取ると、よく引かれる 1 つの出典 (青空文庫の 1 作品など) が上位を埋めてしまい、
+    配る知識が偏る。話題の広さは文の数より出典の数で決まる。"""
+    by_src: dict[str, list[str]] = {}
+    for d in sorted(kb.docs.values(), key=lambda d: (-(d.hits + d.score), d.id)):
+        t = strip_broken(d.text).strip()      # 文字化けの記号は落とす (JSON に読めない文字を出さない)
+        if len(t) < 8 or len(t) > 300:
+            continue
+        by_src.setdefault(d.source, []).append(t)
+    docs: list[str] = []
+    total = 0
+    queues = [iter(v) for v in by_src.values()]
+    while queues and len(docs) < max_docs and total < max_chars:
+        alive = []
+        for q in queues:
+            t = next(q, None)
+            if t is None:
+                continue
+            docs.append(t)
+            total += len(t)
+            alive.append(q)
+            if len(docs) >= max_docs or total >= max_chars:
+                break
+        queues = alive
+    return docs
+
+
 def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1_500_000, replay: int = 400, logs=None) -> dict:
     """Brain 全体からブラウザ用の一式を書き出す (モデル + 知識文 + 再生用の会話例 + 進化の統計)。"""
     nl = brain.neural
@@ -177,16 +206,7 @@ def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1
     if getattr(nl, "_holdout", None):
         nl.evaluate()
     out_dir = Path(out_dir)
-    docs = []
-    total = 0
-    for d in sorted(brain.kb.docs.values(), key=lambda d: (-(d.hits + d.score), d.id)):
-        t = strip_broken(d.text).strip()      # 文字化けの記号は落とす (JSON に読めない文字を出さない)
-        if len(t) < 8 or len(t) > 300:
-            continue
-        docs.append(t)
-        total += len(t)
-        if len(docs) >= max_docs or total >= max_chars:
-            break
+    docs = select_docs(brain.kb, max_docs, max_chars)
     pairs = [[strip_broken(u), strip_broken(b)] for u, b, _, w, *_ in list(brain.dialogs.pairs)[-replay * 3 :]
              if w > 0 and len(b) <= 200][-replay:]
     kb = {"docs": docs, "replay": pairs}
