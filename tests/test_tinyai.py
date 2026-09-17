@@ -2360,3 +2360,15 @@ class ExportDiversityTest(unittest.TestCase):
             self.assertLessEqual(len(docs), 4)
             self.assertTrue(any("めったに引かれない" in t for t in docs))  # 少数派の出典も混ざる
             self.assertEqual(len(docs), len(set(docs)))
+
+
+class MixedScaleHistoryTest(unittest.TestCase):
+    """尺度の違う値が混ざった古い履歴は読み込み時に捨てる。"""
+
+    def test_mixed_scale_history_is_dropped(self):
+        from tinyai.neural_lm import NeuralLM
+        mixed = [410.25, 48.7, 408.46, 49.8]
+        self.assertEqual(NeuralLM._single_scale(mixed), [])
+        same = [49.6, 50.1, 48.9, 51.0]
+        self.assertEqual(NeuralLM._single_scale(same), same)
+        self.assertEqual(NeuralLM._single_scale([]), [])

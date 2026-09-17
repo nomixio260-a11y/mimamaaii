@@ -154,7 +154,7 @@ class NeuralLM:
                 self.lr_scale = float(meta.get("lr_scale", 1.0))
                 # 品質の履歴も引き継ぐ。10 分ごとに再開する運用では、履歴が消えると
                 # 「続けて悪化したら学習率を下げる」ような規則が一度も発火しない
-                self.dialog_hist = [float(x) for x in meta.get("dialog_hist", [])]
+                self.dialog_hist = self._single_scale([float(x) for x in meta.get("dialog_hist", [])])
                 self.recent_hist = [float(x) for x in meta.get("recent_hist", [])]
                 self._last_damp_step = int(meta.get("last_damp_step", 0))
                 self.vocab_added = int(meta.get("vocab_added", 0))
@@ -448,6 +448,16 @@ class NeuralLM:
         if since >= self.GROW_WARMUP or since < 0:
             return lr
         return lr * (0.3 + 0.7 * since / self.GROW_WARMUP)
+
+    @staticmethod
+    def _single_scale(hist: list[float]) -> list[float]:
+        """尺度の違う値が混ざった履歴は捨てる。
+
+        以前は 1 回の評価で 2 つの尺度 (bpc×100 ≒ 410 と削減率から作った値 ≒ 49) を入れていた。
+        古いチェックポイントを読むと、直したあとも混ざった履歴が残り、成長の取り消しが誤爆する。"""
+        if len(hist) >= 2 and max(hist) > min(hist) * 4:
+            return []
+        return hist
 
     def note_dialog_ppl(self, value: float | None) -> None:
         """自己評価で測った対話 ppl を記録する (成長の判断に使う)。"""
