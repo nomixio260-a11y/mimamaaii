@@ -86,11 +86,27 @@
   }
 
   // ------------------------------------------------------------ 行列演算 (Float32Array, 行優先)
+  // 行列積: 内側のループを 4 つ展開し、2 行ずつまとめて読む (JIT が SIMD 化しやすい形)
   function matmul(A, M, K, W, N, out) { // out[M,N] = A[M,K] @ W[K,N]
     out = out || new Float32Array(M * N);
+    const N4 = N - (N % 4);
     for (let i = 0; i < M; i++) {
       const ao = i * K, oo = i * N;
-      for (let k = 0; k < K; k++) {
+      let k = 0;
+      for (; k + 1 < K; k += 2) {
+        const a0 = A[ao + k], a1 = A[ao + k + 1];
+        if (a0 === 0 && a1 === 0) continue;
+        const w0 = k * N, w1 = w0 + N;
+        let j = 0;
+        for (; j < N4; j += 4) {
+          out[oo + j] += a0 * W[w0 + j] + a1 * W[w1 + j];
+          out[oo + j + 1] += a0 * W[w0 + j + 1] + a1 * W[w1 + j + 1];
+          out[oo + j + 2] += a0 * W[w0 + j + 2] + a1 * W[w1 + j + 2];
+          out[oo + j + 3] += a0 * W[w0 + j + 3] + a1 * W[w1 + j + 3];
+        }
+        for (; j < N; j++) out[oo + j] += a0 * W[w0 + j] + a1 * W[w1 + j];
+      }
+      for (; k < K; k++) {
         const a = A[ao + k];
         if (a === 0) continue;
         const wo = k * N;
@@ -101,26 +117,37 @@
   }
   function matmulBT(A, M, K, W, N, out) { // out[M,N] = A[M,K] @ W[N,K]^T
     out = out || new Float32Array(M * N);
+    const K4 = K - (K % 4);
     for (let i = 0; i < M; i++) {
       const ao = i * K, oo = i * N;
       for (let j = 0; j < N; j++) {
         const wo = j * K;
-        let s = 0;
-        for (let k = 0; k < K; k++) s += A[ao + k] * W[wo + k];
-        out[oo + j] = s;
+        let s0 = 0, s1 = 0, s2 = 0, s3 = 0, k = 0;
+        for (; k < K4; k += 4) {
+          s0 += A[ao + k] * W[wo + k]; s1 += A[ao + k + 1] * W[wo + k + 1];
+          s2 += A[ao + k + 2] * W[wo + k + 2]; s3 += A[ao + k + 3] * W[wo + k + 3];
+        }
+        for (; k < K; k++) s0 += A[ao + k] * W[wo + k];
+        out[oo + j] = s0 + s1 + s2 + s3;
       }
     }
     return out;
   }
   function matmulAT(A, M, K, D, N, out) { // out[K,N] = A[M,K]^T @ D[M,N]
     out = out || new Float32Array(K * N);
+    const N4 = N - (N % 4);
     for (let i = 0; i < M; i++) {
       const ao = i * K, dofs = i * N;
       for (let k = 0; k < K; k++) {
         const a = A[ao + k];
         if (a === 0) continue;
         const oo = k * N;
-        for (let j = 0; j < N; j++) out[oo + j] += a * D[dofs + j];
+        let j = 0;
+        for (; j < N4; j += 4) {
+          out[oo + j] += a * D[dofs + j]; out[oo + j + 1] += a * D[dofs + j + 1];
+          out[oo + j + 2] += a * D[dofs + j + 2]; out[oo + j + 3] += a * D[dofs + j + 3];
+        }
+        for (; j < N; j++) out[oo + j] += a * D[dofs + j];
       }
     }
     return out;

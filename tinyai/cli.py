@@ -327,7 +327,7 @@ def cmd_serve(args) -> int:
             elif u.path == "/ask":
                 q = parse_qs(u.query).get("q", [""])[0]
                 r = brain.reply(q) if q else None
-                self._send(200, r.__dict__ if r else {"error": "q required"})
+                self._send(200, dict(r.__dict__, thought=brain.last_thought, neural=brain.neural.stats()) if r else {"error": "q required"})
             elif u.path == "/notices":
                 self._send(200, {"notices": brain.take_notices()})
             else:
@@ -342,8 +342,9 @@ def cmd_serve(args) -> int:
             except ValueError:
                 js = {"text": raw}
             if u.path == "/ask":
+                brain.last_thought = None
                 r = brain.reply(js.get("text", ""))
-                self._send(200, r.__dict__)
+                self._send(200, dict(r.__dict__, thought=brain.last_thought, neural=brain.neural.stats()))
             elif u.path == "/learn":
                 n = brain.learn_text(js.get("text", ""), source=js.get("source", "api"))
                 self._send(200, {"learned": n})
