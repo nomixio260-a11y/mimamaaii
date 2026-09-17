@@ -236,6 +236,7 @@ def cmd_train(args) -> int:
     limit_s = (args.hours * 3600) if args.hours else args.seconds
     done = 0
     last_log = 0
+    last_eval = time.time()
     rounds = 0
     try:
         while (limit_s is None or time.time() - t0 < limit_s) and (limit_s is not None or done < args.steps):
@@ -270,6 +271,13 @@ def cmd_train(args) -> int:
             done += nl.model.step - before
             if state is not None:
                 state.update(step=nl.model.step, loss=round(r["loss"], 3), tok_s=r.get("tokens_per_s"), ppl=nl.holdout_ppl)
+            if args.eval_every and time.time() - last_eval >= args.eval_every:
+                last_eval = time.time()
+                ev = brain.self_evaluate()
+                if ev:
+                    print("eval " + json.dumps(ev, ensure_ascii=False), flush=True)
+                    if state is not None:
+                        state["eval"] = ev
             if done - last_log >= 100:
                 last_log = done
                 ev = nl.evaluate(brain.lm.perplexity(brain.holdout) if brain.holdout else None)
@@ -461,6 +469,7 @@ def main(argv=None) -> int:
     p.add_argument("--workers", type=int, default=None, help="データ並列のプロセス数 (既定: CPU 数 - 1)")
     p.add_argument("--serve", type=int, default=None, metavar="PORT", help="学習しながらこのポートで会話 API を開く (学習中のモデルとそのまま話せる)")
     p.add_argument("--serve-host", default="127.0.0.1")
+    p.add_argument("--eval-every", type=float, default=300, help="この秒数ごとに自己評価 (取り置き ppl・会話 ppl・RAG 忠実性) を回してログに出す。0 で無効")
     p.add_argument("--collect-per-round", type=int, default=3, help="1 学習ラウンドあたりに収集するバッチ数 (会話データを多く集めるほど大きく)")
     p.set_defaults(func=cmd_train)
 

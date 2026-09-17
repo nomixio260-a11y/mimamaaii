@@ -226,7 +226,7 @@ def run_corpus_metrics(corpus: Path | None) -> dict:
 
 
 # ---------------------------------------------------------------- ニューラル LM
-def _neural_metrics(b: Brain, hold_sents: list[str], verbose: bool = False) -> dict:
+def _neural_metrics(b: Brain, hold_sents: list[str], verbose: bool = False, sweep: bool = False) -> dict:
     """学習済み (または学習したばかりの) ニューラル LM を測る:
     holdout ppl / RAG 忠実性 (文脈の文をどれだけ使うか) / リアルタイム学習 (教えた答えの対数確率の伸び、👎 の抑制)
     / 思考 (再検索で文脈が増えた割合) / 生成速度。"""
@@ -289,6 +289,40 @@ def _neural_metrics(b: Brain, hold_sents: list[str], verbose: bool = False) -> d
                 if b.last_thought and b.last_thought.get("context2"):
                     rethink += 1
             out["think_rethink_rate"] = round(rethink / max(m, 1), 3)
+        # 会話としての予測力 (応答部だけの ppl): 文の ppl とは別に測る
+        pairs = [(u, bb) for u, bb, _, w in list(b.dialogs.pairs)[-2000:] if w > 0][-60:]
+        lps = []
+        for u, bb in pairs:
+            ids = nl.seq_dialog(u, bb)
+            start = nl.loss_from(ids)
+            if len(ids) - start < 2:
+                continue
+            lps.append(nl.model.logprob(ids[max(0, start - 1):]))
+        if lps:
+            out["dialog_ppl"] = round(math.exp(-sum(lps) / len(lps)), 2)
+        # 復号バイアスの掃引 (文脈をどれだけ使わせると接地率と自然さがどうなるか)
+        if sweep:
+            out["copy_bonus_sweep"] = {}
+            keep = nl.decode.get("copy_bonus", 0)
+            for bonus in (0.0, 1.5, 3.0, 5.0):
+                nl.decode["copy_bonus"] = bonus
+                g2 = n2 = 0
+                fl = []
+                for s_ in hold_sents[:20]:
+                    ks = [k for k in keywords(s_, limit=1) if is_phrase(k)]
+                    if not ks:
+                        continue
+                    cands = nl.chat(f"{ks[0]}について教えて", s_, n=2, max_new=40)
+                    if not cands:
+                        continue
+                    cph = set(_phr(s_))
+                    best = max(cands, key=lambda c: len(set(_phr(c)) & cph))
+                    ph = set(_phr(best))
+                    g2 += len(ph & cph) / max(len(ph), 1)
+                    fl.append(nl.score(best) or -20)
+                    n2 += 1
+                out["copy_bonus_sweep"][str(bonus)] = {"grounded": round(g2 / max(n2, 1), 3), "fluency": round(sum(fl) / max(len(fl), 1), 3)}
+            nl.decode["copy_bonus"] = keep
     finally:
         nl.model.dropout = drop
     return out
@@ -338,7 +372,7 @@ def run_neural_budget(corpus: Path, steps: int = 300, verbose: bool = False) -> 
         return out
 
 
-def run_brain_eval(data_dir: Path, verbose: bool = False) -> dict:
+def run_brain_eval(data_dir: Path, verbose: bool = False, sweep: bool = False) -> dict:
     """学習済みの Brain を評価: ニューラル LM の実力と収集ソースの評価表。"""
     cfg = Config(data_dir=data_dir, memory_mb=1024, hard_limit=False, web_enabled=False, tools=True)
     b = Brain(cfg)
@@ -352,7 +386,7 @@ def run_brain_eval(data_dir: Path, verbose: bool = False) -> dict:
     if b.neural.model is not None:
         out["neural"] = b.neural.stats()
         hold = [d.text for d in b.kb.random_docs(min(200, len(b.kb)), random.Random(1))]
-        out.update(_neural_metrics(b, hold, verbose))
+        out.update(_neural_metrics(b, hold, verbose, sweep=sweep))
     # 収集ソースの評価表 (Collector の健全性は Brain の状態に保存されている場合のみ)
     sources = (b.agent_state.get("sources") if hasattr(b, "agent_state") else None) or {}
     try:
@@ -395,6 +429,8 @@ def main() -> None:
     ap.add_argument("--neural", action="store_true", help="--corpus で小型 Transformer を固定ステップ学習して学習効率を測る")
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--data", default=None, help="学習済み Brain のデータディレクトリを評価する")
+    ap.add_argument("--sweep", action="store_true", help="復号バイアス (文脈への寄せ方) を掃引して接地率と自然さの関係を測る")
+    ap.add_argument("--fail-on-regress", action="store_true", help="主要指標が前回より 5%% 以上悪化したら終了コード 1 (CI 用)")
     args = ap.parse_args()
     paths = [Path(p) for p in args.set] if args.set else sorted(EVAL_DIR.glob("*.tsv"))
     sets = load_sets(paths)
@@ -413,7 +449,7 @@ def main() -> None:
     if args.neural and args.corpus:
         result.update(run_neural_budget(Path(args.corpus), steps=args.steps, verbose=args.verbose))
     if args.data:
-        result["brain"] = run_brain_eval(Path(args.data), verbose=args.verbose)
+        result["brain"] = run_brain_eval(Path(args.data), verbose=args.verbose, sweep=args.sweep)
     print("\n== 会話評価: %d/%d = %.3f" % (total_ok, total_n, result["conversation"]["acc"]))
     for k, v in sorted(per_cat.items()):
         print(f"   {k:<12} {v['ok']}/{v['n']} = {v['acc']}")
@@ -443,10 +479,30 @@ def main() -> None:
             if a is not None and b_ is not None:
                 worse = (b_ < a * 0.95) if hb else (b_ > a * 1.05)
                 print(f"   {k:<20} {a} -> {b_}{'   ⚠ 退行' if worse else ''}")
+    regressions = []
+    if last:
+        for k, hb in {"conversation": True, "retrieval_mrr": True, "retrieval_recall3": True, "perplexity": False, "gen_grounded4": True,
+                      "learn_sents_per_s": True, "neural_budget_loss": False, "neural_tokens_per_s": True, "neural_holdout_ppl": False,
+                      "rag_grounded": True, "online_gain_nat": True, "dialog_ppl": False}.items():
+            a, b_ = last.get(k), result.get(k)
+            if isinstance(a, dict):
+                a, b_ = a.get("acc"), (b_ or {}).get("acc")
+            if a is None or b_ is None or not a:
+                continue
+            if (b_ < a * 0.95) if hb else (b_ > a * 1.05):
+                regressions.append(f"{k}: {a} -> {b_}")
+    if regressions:
+        print("\n⚠ 退行:", "; ".join(regressions))
+    if "brain" in result and "copy_bonus_sweep" in result["brain"]:
+        print("== 復号バイアスの掃引 (接地率 / 自然さ)")
+        for k, v in result["brain"]["copy_bonus_sweep"].items():
+            print(f"   copy_bonus={k}: {v['grounded']} / {v['fluency']}")
     if not args.no_save:
         RESULTS.parent.mkdir(parents=True, exist_ok=True)
         with RESULTS.open("a", encoding="utf-8") as f:
             f.write(json.dumps(result, ensure_ascii=False) + "\n")
+    if args.fail_on_regress and regressions:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

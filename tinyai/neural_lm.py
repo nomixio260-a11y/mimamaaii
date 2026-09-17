@@ -37,7 +37,7 @@ class NeuralLM:
         """メモリ上限から最大のプリセットを選ぶ (学習バッファと Adam 状態を含めた概算)。"""
         if memory_mb >= 1024:
             return "xl"
-        if memory_mb >= 512:
+        if memory_mb >= 450:
             return "large"
         if memory_mb >= 200:
             return "base"

@@ -47,7 +47,7 @@ header.top .status { margin-left: auto; font-family: var(--mono); font-size: 12p
 .metric .v { font-family: var(--mono); font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .metric .s { font-size: 11px; color: var(--ink2); }
 .metric .v.small { font-size: 14px; }
-.evo .chart { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.evo .chart { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
 .chartbox { border-top: 1px solid var(--line2); padding-top: 8px; min-width: 0; }
 .chartbox h3 { margin: 0 0 4px; font-size: 12px; color: var(--ink2); font-weight: 500; display: flex; justify-content: space-between; }
 .chartbox h3 span { font-family: var(--mono); font-variant-numeric: tabular-nums; }
@@ -153,6 +153,8 @@ details.about p { margin: 6px 0; }
     <div class="chart">
       <div class="chartbox"><h3>サーバーでの学習 <span id="preLossLast"></span></h3><canvas id="preChart" height="104"></canvas>
         <div class="legend"><span><i style="background:var(--accent)"></i>学習損失</span><span><i style="background:var(--heat)"></i>取り置き PPL (未知の文の予測しにくさ)</span></div></div>
+      <div class="chartbox" id="qualityBox" hidden><h3>サーバーでの自動評価 <span id="qualityLast"></span></h3><canvas id="qChart" height="104"></canvas>
+        <div class="legend"><span><i style="background:var(--accent)"></i>RAG 忠実性 (文脈の語をどれだけ使うか)</span><span><i style="background:var(--heat)"></i>会話 PPL</span></div></div>
       <div class="chartbox"><h3>この端末での学習 <span id="onLossLast"></span></h3><canvas id="onChart" height="104"></canvas>
         <div class="legend"><span><i style="background:var(--accent)"></i>会話・常時学習の損失</span></div></div>
     </div>
@@ -365,6 +367,34 @@ details.about p { margin: 6px 0; }
     c.fillStyle = getCss('--accent'); c.beginPath(); c.arc(x(log.length - 1), y(last.loss), 2.5, 0, Math.PI * 2); c.fill();
     $('preLossLast').textContent = `step ${fmt(last.step)} · loss ${last.loss.toFixed(3)} · PPL ${last.ppl != null ? last.ppl.toFixed(1) : '–'} · ${fmt(last.tok_s)} トークン/秒`;
   }
+  // サーバーでの自動評価: RAG 忠実性 (左軸 0〜1) と会話 PPL (右軸)
+  function drawQuality(cv, log) {
+    const box = $('qualityBox'); box.hidden = !(log && log.length >= 2);
+    if (box.hidden) return;
+    const dpr = window.devicePixelRatio || 1; const W = cv.clientWidth || 300, H = cv.clientHeight || 104;
+    cv.width = W * dpr; cv.height = H * dpr; const c = cv.getContext('2d'); c.scale(dpr, dpr); c.clearRect(0, 0, W, H);
+    c.font = '10px ' + getCss('--mono'); c.strokeStyle = getCss('--line2');
+    const pad = { l: 32, r: 42, t: 8, b: 16 };
+    const gvals = log.map((r) => r.rag_grounded).filter((v) => v != null);
+    const pvals = log.map((r) => r.dialog_ppl).filter((v) => v != null);
+    const gmax = Math.max(0.2, gvals.length ? Math.max.apply(null, gvals) : 1);
+    const plo = pvals.length ? Math.min.apply(null, pvals) : 0, phi = pvals.length ? Math.max.apply(null, pvals) : 1, pspan = (phi - plo) || 1;
+    const x = (i) => pad.l + (i / Math.max(log.length - 1, 1)) * (W - pad.l - pad.r);
+    const yg = (v) => pad.t + (1 - v / gmax) * (H - pad.t - pad.b);
+    const yp = (v) => pad.t + (1 - (v - plo) / pspan) * (H - pad.t - pad.b);
+    for (const v of [0, gmax / 2, gmax]) { c.beginPath(); c.moveTo(pad.l, yg(v)); c.lineTo(W - pad.r, yg(v)); c.stroke(); c.fillStyle = getCss('--ink3'); c.fillText(v.toFixed(2), 2, yg(v) + 3); }
+    if (pvals.length) { c.fillStyle = getCss('--heat'); for (const v of [plo, phi]) c.fillText(v.toFixed(0), W - pad.r + 4, yp(v) + 3); }
+    const line = (get, yf, color) => {
+      c.strokeStyle = color; c.lineWidth = 1.7; c.beginPath(); let started = false;
+      log.forEach((r, i) => { const v = get(r); if (v == null) return; started ? c.lineTo(x(i), yf(v)) : c.moveTo(x(i), yf(v)); started = true; });
+      c.stroke();
+    };
+    if (pvals.length) line((r) => r.dialog_ppl, yp, getCss('--heat'));
+    line((r) => r.rag_grounded, yg, getCss('--accent'));
+    const last = log[log.length - 1];
+    c.fillStyle = getCss('--ink3'); c.fillText('step ' + fmt(log[0].step), pad.l, H - 3);
+    $('qualityLast').textContent = `忠実性 ${last.rag_grounded != null ? last.rag_grounded.toFixed(2) : '–'} · 会話 PPL ${last.dialog_ppl != null ? last.dialog_ppl.toFixed(0) : '–'} · 文 PPL ${last.ppl != null ? last.ppl.toFixed(1) : '–'}`;
+  }
   // サーバーが読んで学んだもの (収集の記録)
   function renderCollect(meta) {
     const rows = meta.collect_log || [];
@@ -519,6 +549,7 @@ details.about p { margin: 6px 0; }
       const bin = await fetchWeights((f) => { $('loadBar').style.width = Math.round(f * 100) + '%'; });
       $('loadText').textContent = '重みを float32 に展開しています';
       drawServer($('preChart'), meta.train_log || []);
+      drawQuality($('qChart'), meta.eval_log || []);
       renderCollect(meta);
       startWorker();
       if (!state.worker) await loadScript('engine.js');
@@ -560,7 +591,7 @@ details.about p { margin: 6px 0; }
     if (!confirm('この端末での学習内容をすべて消して、配布時の重みに戻します。よろしいですか？')) return;
     await dbDel('snapshot'); location.reload();
   });
-  window.addEventListener('resize', () => { if (state.summary) renderSummary(state.summary); if (state.last) drawAttention(state.last.best, state.last.promptPieces); if (state.meta) drawServer($('preChart'), state.meta.train_log || []); });
+  window.addEventListener('resize', () => { if (state.summary) renderSummary(state.summary); if (state.last) drawAttention(state.last.best, state.last.promptPieces); if (state.meta) { drawServer($('preChart'), state.meta.train_log || []); drawQuality($('qChart'), state.meta.eval_log || []); } });
   boot();
 })();
 </script>

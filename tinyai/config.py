@@ -18,15 +18,16 @@ class Config:
     # 保存先ディレクトリ
     data_dir: Path = field(default_factory=lambda: Path(os.environ.get("TINYAI_DATA", "~/.tinyai")).expanduser())
     # プロセス全体のメモリ上限 (MB)。RSS がこれを超えないよう自動プルーニングする。
-    memory_mb: int = field(default_factory=lambda: _env_int("TINYAI_MEMORY_MB", 256))
+    memory_mb: int = field(default_factory=lambda: _env_int("TINYAI_MEMORY_MB", 500))
     # OS レベルの強制上限 (RLIMIT) も掛けるか
     hard_limit: bool = True
     # 言語モデルの最大 n-gram 次数 (これより高い次数は保存しない)。
     # tools/experiment.py の結果: 数千文規模では 4 次は 3 次とパープレキシティが同じで、
     # エントリ数 1.8 倍・学習時間 1.6 倍。大規模コーパスなら 4 に上げる。
     max_order: int = _env_int("TINYAI_MAX_ORDER", 3)
-    # 知識ベースに保持する最大文数 (メモリ予算とどちらか厳しい方)
-    max_docs: int = 60000
+    # 知識ベースに保持する最大文数 (0 ならメモリ上限から自動で決める: 1MB あたり 400 文)。
+    # 実際にはメモリ予算とどちらか厳しい方が効く
+    max_docs: int = 0
     # Web 探索
     web_enabled: bool = True
     languages: tuple = ("ja", "en")
@@ -58,3 +59,9 @@ class Config:
         d = asdict(self)
         d["data_dir"] = str(self.data_dir)
         return d
+
+
+    def __post_init__(self):
+        if not self.max_docs:
+            # メモリ 1MB あたり 400 文 (500MB なら 20 万文)。知識ベースの取り分は予算の 30%
+            self.max_docs = max(20000, int(self.memory_mb) * 400)

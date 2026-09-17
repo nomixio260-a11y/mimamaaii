@@ -97,6 +97,7 @@ def export_model(model: "neural.TinyTransformer", tok, out_dir: Path, meta_extra
 
 
 _STEP_RE = re.compile(r"^step (\d+) loss ([\d.]+) (\d+) tok/s\s+(\{.*?\})\s+経過 ([\d.]+) 分")
+_EVAL_RE = re.compile(r"^eval (\{.*\})\s*$")
 _COLLECT_RE = re.compile(r"^\s+収集 \[(\w+)\] (.+?) : (\d+) 文, 会話 (\d+)(?: \(会話計 (\d+)\))?")
 
 
@@ -105,6 +106,7 @@ def history_from_logs(paths, max_points: int = 400) -> dict:
     ブラウザ版の「サーバー側の学習の様子」に渡す。"""
     steps: list[dict] = []
     collects: list[dict] = []
+    evals: list[dict] = []
     for path in paths:
         path = Path(path)
         if not path.exists():
@@ -118,6 +120,13 @@ def history_from_logs(paths, max_points: int = 400) -> dict:
                     ev = {}
                 steps.append({"step": int(m.group(1)), "loss": round(float(m.group(2)), 3),
                               "tok_s": int(m.group(3)), "ppl": ev.get("neural_ppl"), "ngram_ppl": round(ev.get("ngram_ppl"), 1) if ev.get("ngram_ppl") else None})
+                continue
+            m = _EVAL_RE.match(line)
+            if m:
+                try:
+                    evals.append(json.loads(m.group(1)))
+                except Exception:
+                    pass
                 continue
             m = _COLLECT_RE.match(line)
             if m:
@@ -133,7 +142,8 @@ def history_from_logs(paths, max_points: int = 400) -> dict:
     if len(dedup) > max_points:                       # 間引く (先頭と末尾は残す)
         k = len(dedup) / max_points
         dedup = [dedup[min(int(i * k), len(dedup) - 1)] for i in range(max_points)]
-    return {"train_log": dedup, "collect_log": collects[-60:], "collect_total": len(collects)}
+    evals.sort(key=lambda r: r.get("step", 0))
+    return {"train_log": dedup, "collect_log": collects[-60:], "collect_total": len(collects), "eval_log": evals[-200:]}
 
 
 def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1_500_000, replay: int = 400, logs=None) -> dict:

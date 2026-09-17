@@ -114,6 +114,14 @@ _MORE_RE = re.compile(r"^(もっと|詳しく|もっと詳しく|続けて|続�
 _FOLLOWUP_RE = re.compile(r"^(それ|これ|あれ|そこ|そいつ|彼|彼女|it|that|this|they|he|she)")
 
 
+def neural_perplexity(nl) -> float:
+    """取り置き文のパープレキシティ (EMA 重みで)。"""
+    from . import neural as _neural
+
+    with nl.lock, nl.model.use_ema():
+        return _neural.perplexity(nl.model, nl._holdout)
+
+
 class Brain:
     def __init__(self, config: Config | None = None, rng: random.Random | None = None):
         self.cfg = config or Config()
@@ -135,6 +143,7 @@ class Brain:
         self.agent = Agent(self)                  # 道具 (計算・日付・換算・比較・列挙・要約・調査・プロファイル)
         size = self.cfg.neural_size if self.cfg.neural_size != "auto" else NeuralLM.size_for_memory(self.cfg.memory_mb)
         self.neural = NeuralLM(self.cfg.data_dir, size=size, seed=self.cfg.seed or 0)  # Transformer LM (numpy, dropout=cfg.neural_dropout)
+        self.last_self_eval: dict | None = None
         self.last_thought: dict | None = None      # 直近のニューラル応答の思考過程 (下書き → 再検索 → 検証)
         self._neural_pending_text: deque = deque(maxlen=5000)
         self._neural_pending_dialog: deque = deque(maxlen=2000)   # (発話, 応答, 文脈, 重み)
@@ -483,6 +492,57 @@ class Brain:
             if time.time() - nl._last_save > 300:
                 nl.save()
         return r
+
+    def self_evaluate(self, n_docs: int = 24, n_dialogs: int = 40) -> dict:
+        """学習中に自分で品質を測る (自動評価)。取り置き文の ppl だけでなく、
+        会話としての ppl と RAG 忠実性 (文脈の句をどれだけ使うか) を測り、学習ログに残す。"""
+        nl = self.neural
+        if nl.model is None or nl.tok is None:
+            return {}
+        out: dict = {"step": nl.model.step}
+        t0 = time.perf_counter()
+        # 1. 取り置き文の ppl (言語としての予測力)
+        if nl._holdout:
+            out["ppl"] = round(neural_perplexity(nl), 2)
+        # 2. 会話の ppl (応答部だけ: 会話としての予測力)
+        pairs = [(u, b) for u, b, _, w in list(self.dialogs.pairs)[-2000:] if w > 0][-n_dialogs:]
+        if pairs:
+            lps = []
+            with nl.lock, nl.model.use_ema():
+                for u, b in pairs:
+                    ids = nl.seq_dialog(u, b)
+                    start = nl.loss_from(ids)
+                    if len(ids) - start < 2:
+                        continue
+                    lps.append(nl.model.logprob(ids[max(0, start - 1):]))
+            if lps:
+                out["dialog_ppl"] = round(math.exp(-sum(lps) / len(lps)), 2)
+        # 3. RAG 忠実性: 知識文を文脈に、その文のキーワードを質問にして、答えが文脈の句をどれだけ含むか
+        grounded = kw = n = 0
+        for d in self.kb.random_docs(min(n_docs * 3, len(self.kb)), self.rng):
+            if n >= n_docs:
+                break
+            if not (20 <= len(d.text) <= 200):
+                continue
+            ks = [k for k in keywords(d.text, limit=1) if is_phrase(k)]
+            if not ks:
+                continue
+            cands = nl.chat(f"{ks[0]}について教えて", d.text, n=2, max_new=40)
+            if not cands:
+                continue
+            cph = set(phrases(d.text))
+            best = max(cands, key=lambda c: len(set(phrases(c)) & cph))
+            ph = set(phrases(best))
+            grounded += len(ph & cph) / max(len(ph), 1)
+            kw += ks[0] in best
+            n += 1
+        if n:
+            out["rag_grounded"] = round(grounded / n, 3)
+            out["rag_keyword"] = round(kw / n, 3)
+        out["seconds"] = round(time.perf_counter() - t0, 1)
+        self.stats["self_evals"] += 1
+        self.last_self_eval = out
+        return out
 
     def rebuild_suffix(self) -> None:
         """知識文全体から接尾辞配列を作り直す (数万文で 0.1 秒程度)。"""

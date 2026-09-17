@@ -34,8 +34,8 @@ from .bpe import PAD, UNK, BOS, EOS, USR, BOT, CTX, SEP, SPECIALS, SubwordTokeni
 PRESETS = {
     "small": dict(d=128, layers=2, heads=4, ctx=64, ff=384, batch=32, lr=1e-3),
     "base": dict(d=192, layers=4, heads=6, ctx=256, ff=512, batch=8, lr=6e-4),
-    "large": dict(d=256, layers=6, heads=8, ctx=128, ff=704, batch=8, lr=4e-4),
-    "xl": dict(d=384, layers=8, heads=8, ctx=160, ff=1024, batch=6, lr=3e-4),
+    "large": dict(d=256, layers=6, heads=8, ctx=256, ff=704, batch=6, lr=4e-4),
+    "xl": dict(d=384, layers=8, heads=8, ctx=320, ff=1024, batch=4, lr=3e-4),
 }
 # 成長の上限 (プリセット名 -> 最大層数)。層は損失が停滞した時に 1 層ずつ、関数を保ったまま追加される
 MAX_LAYERS = {"small": 4, "base": 6, "large": 8, "xl": 12}
@@ -128,6 +128,7 @@ class TinyTransformer:
         self.v = {k: np.zeros_like(v) for k, v in p.items()}
         self.ema: dict | None = None            # 重みの指数移動平均 (Polyak 平均): 評価と生成に使うと汎化が良い
         self.ema_decay = 0.998
+        self.ema_every = 4
         self.step = 0
         self.mask = np.triu(np.full((ctx, ctx), -1e9, self.dtype), 1)
         self.cos, self.sin = _rope_tables(ctx, d // heads, self.dtype)
@@ -350,11 +351,15 @@ class TinyTransformer:
         return norm
 
     def update_ema(self) -> None:
-        """重みの指数移動平均を更新 (学習の揺れを平均した重み: 評価・生成・書き出しに使う)。"""
+        """重みの指数移動平均を更新 (学習の揺れを平均した重み: 評価・生成・書き出しに使う)。
+        毎ステップ全パラメータを触ると数 % を食うので ema_every ステップに 1 回だけ、減衰を累乗して適用する。"""
         if self.ema is None:
             self.ema = {k: v.copy() for k, v in self.p.items()}
             return
+        if self.step % self.ema_every:
+            return
         d = self.ema_decay if self.step > 200 else 0.9  # 序盤は速く追従
+        d = d ** self.ema_every
         for k, v in self.p.items():
             e = self.ema.get(k)
             if e is None or e.shape != v.shape:
