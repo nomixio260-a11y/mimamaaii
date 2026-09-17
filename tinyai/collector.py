@@ -77,8 +77,8 @@ class SourceHealth:
     @property
     def score(self) -> float:
         # 成功率 × (文の収穫 + 新規性) × 学習価値。未試行の源は楽観的な高い点 (探索) を与える
-        if self.tries == 0:
-            return 1.0
+        if self.tries == 0 and self.gain == 0 and self.novelty == 0:
+            return 0.6   # 未試行: 失敗続きの源 (≈0.25) より高く、実績のある源より低い
         t = max(self.tries, 1)
         return (self.ok + 1) / (self.tries + 2) * (self.gain / t + self.novelty / t + 0.5) * (0.5 + self.value)
 
