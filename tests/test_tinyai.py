@@ -2012,6 +2012,10 @@ class DialogBpcTest(unittest.TestCase):
             self.assertGreater(r["dialog_bpc"], 0)
             self.assertLess(r["dialog_bpc"], 20)                  # 1 文字 20 ビットは超えない
             self.assertTrue(b.neural.dialog_hist)                 # 規則が使う履歴に入る
+            if "dialog_bpc_unigram" in r:
+                self.assertGreater(r["dialog_bpc_unigram"], 0)
+                self.assertAlmostEqual(r["dialog_bpc_gain"],
+                                       1 - r["dialog_bpc"] / r["dialog_bpc_unigram"], places=2)
 
 
 if __name__ == "__main__":

@@ -634,10 +634,20 @@ class Brain:
                 out["dialog_ppl"] = round(ppls[len(ppls) // 2], 2)
                 out["dialog_ppl_mean"] = round(sum(ppls) / len(ppls), 2)
                 if chars:
+                    # 絶対的な物差し: 同じ応答の文字ユニグラム分布のエントロピー。
+                    # 「文字の出現頻度だけ知っている」状態が何ビット必要かで、モデルの上限側の基準になる
+                    # (ppl や bpc の数字だけでは、良いのか悪いのか判断できない)。
+                    from collections import Counter as _C
+                    cnt = _C("".join(b for _, b in pairs))
+                    tot = sum(cnt.values())
+                    uni = -sum(n / tot * math.log2(n / tot) for n in cnt.values()) if tot else None
                     # 1 文字あたりのビット数。語彙を増やすとトークンの区切りが変わり、
                     # 1 トークンあたりの ppl は機械的に上がる (1 トークンが多くの文字を担うため)。
                     # 文字あたりで測れば語彙の変更をまたいで比較できる。成長や学習率の判断にはこちらを使う。
                     out["dialog_bpc"] = round(nats / chars / math.log(2), 4)
+                    if uni:
+                        out["dialog_bpc_unigram"] = round(uni, 3)
+                        out["dialog_bpc_gain"] = round(1 - out["dialog_bpc"] / uni, 3)   # 0 = 頻度だけ、1 = 完全予測
                     self.neural.note_dialog_ppl(out["dialog_bpc"] * 100)   # 規則は同じ尺度で扱う
                 else:
                     self.neural.note_dialog_ppl(out["dialog_ppl"])
