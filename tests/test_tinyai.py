@@ -2113,7 +2113,7 @@ class FreeGenerationDefaultsTest(unittest.TestCase):
             nl = NeuralLM(Path(tmp), size="small")
             self.assertEqual(nl.decode["temperature"], 0.85)
             self.assertEqual(nl.decode["top_p"], 0.95)
-            self.assertEqual(nl.decode["repetition_penalty"], 1.15)   # 繰り返しは n-gram 禁止が担う
+            self.assertEqual(nl.decode["repetition_penalty"], 1.3)    # 新しい温度で測り直した結果
             self.assertEqual(nl.decode["no_repeat_ngram"], 3)
 
     def test_chat_length_follows_retrieval(self):

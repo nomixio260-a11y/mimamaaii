@@ -63,10 +63,13 @@ class NeuralLM:
         self.pool_path = self.data_dir / "neural.pool.npz"   # 再生バッファ (再起動しても作り直さない)
         self.size = size if size in neural.PRESETS else "base"
         # 進化する復号パラメータ (👍/👎 の割合で山登り)
-        # 自由な文生成のための復号既定値。繰り返しの抑制は n-gram 禁止が担うので、
-        # 一律の繰り返しペナルティは 1.3 → 1.15 に緩め、温度と top_p を上げて言い回しの幅を広げる。
-        # 実測 (10 の話題 × 3 本): 平均長 50.6 → 76.2 文字、文字 3-gram の繰り返しは 0.017 → 0.021 で横ばい。
-        self.decode = {"temperature": 0.85, "top_p": 0.95, "repetition_penalty": 1.15, "copy_bonus": 1.0,
+        # 自由な文生成のための復号既定値。温度と top_p を上げて言い回しの幅を広げる。
+        # 繰り返しペナルティは一度 1.15 まで緩めたが、新しい温度で測り直すと 1.3 の方が
+        # 長さ・多様性・繰り返しのすべてで優れていた (3 つの乱数種で確認):
+        #   罰 1.15 → 平均長 85.9 / distinct-2 0.542 / 繰り返し 0.037
+        #   罰 1.30 → 平均長 75.8 / distinct-2 0.577 / 繰り返し 0.020
+        # 温度を変えたら、他の復号パラメータも測り直す必要がある。
+        self.decode = {"temperature": 0.85, "top_p": 0.95, "repetition_penalty": 1.3, "copy_bonus": 1.0,
                        "no_repeat_ngram": 3, "min_new": 6, "temp_spread": 0.25}
         self._decode_trial: dict | None = None
         self._fb = [0, 0]           # 現在の設定での (👍, 👎)
