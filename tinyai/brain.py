@@ -149,6 +149,8 @@ class Brain:
                                corpus_tokens=max(8_000_000, int(self.cfg.memory_mb) * 80_000))  # Transformer LM (numpy)
         self.last_self_eval: dict | None = None
         self.dialog_holdout: list = []             # 評価用に固定した会話 (比較できるように)
+        self._fresh_holdout: list = []             # 最近の会話から採った取り置き (一定期間は固定して比べる)
+        self._fresh_holdout_step = 0
         self._followup = False                     # 直前の発話が指示語・情報量の乏しい問いか
         self.last_thought: dict | None = None      # 直近のニューラル応答の思考過程 (下書き → 再検索 → 検証)
         self._neural_pending_text: deque = deque(maxlen=5000)
@@ -654,10 +656,17 @@ class Brain:
         # 2b. 最近の会話でも同じ測り方をする。固定の取り置きは時間が経つほど今の分布から離れるので、
         # そこだけを見ると「分布が動いた」のを「質が落ちた」と取り違える
         # (実測: 固定 4.23 bpc / 削減 45.7% に対し、最近の会話では 3.35 bpc / 削減 49.0%)。
-        recent_pairs = [(u, bb) for u, bb, src, w, *_ in list(self.dialogs.pairs)[-4000:]
-                        if w > 0 and 10 <= len(bb) <= 200 and not src.startswith("aozora")]
+        # 抽出しなおすたびに中身が変わると、評価のたびに値が動いて比べられない
+        # (実測: 同じモデルで 0.529 → 0.501 → 0.477)。一定期間は同じ集合を使い、古くなったら入れ替える。
+        step_now = nl.model.step
+        if not self._fresh_holdout or step_now - self._fresh_holdout_step > 1500:
+            cand = [(u, bb) for u, bb, src, w, *_ in list(self.dialogs.pairs)[-4000:]
+                    if w > 0 and 10 <= len(bb) <= 200 and not src.startswith("aozora")]
+            if len(cand) >= 20:
+                self._fresh_holdout = random.Random(step_now).sample(cand, min(n_dialogs * 2, len(cand)))
+                self._fresh_holdout_step = step_now
+        recent_pairs = list(self._fresh_holdout)
         if len(recent_pairs) >= 20:
-            recent_pairs = random.Random(self.rng.randrange(10 ** 6)).sample(recent_pairs, min(n_dialogs, len(recent_pairs)))
             nats2 = chars2 = 0.0
             with nl.lock, nl._infer():
                 for u, bb in recent_pairs:

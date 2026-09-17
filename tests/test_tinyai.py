@@ -2020,6 +2020,8 @@ class DialogBpcTest(unittest.TestCase):
             if "dialog_gain_fresh" in r:
                 self.assertGreater(r["dialog_bpc_fresh"], 0)      # 最近の会話でも測る
                 self.assertLessEqual(r["dialog_gain_fresh"], 1.0)
+                again = b.self_evaluate(n_docs=4, n_dialogs=12)   # 続けて測っても同じ値 (比べられる)
+                self.assertEqual(again["dialog_bpc_fresh"], r["dialog_bpc_fresh"])
             if "dialog_bpc_unigram" in r:
                 self.assertGreater(r["dialog_bpc_unigram"], 0)
                 self.assertAlmostEqual(r["dialog_bpc_gain"],
