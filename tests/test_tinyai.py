@@ -2124,6 +2124,38 @@ class FreeGenerationDefaultsTest(unittest.TestCase):
         self.assertIn("max_new = 110 if weak else 60", src)
 
 
+class DatasetWeightTest(unittest.TestCase):
+    """datasets.txt の 5 列目で選ばれやすさを指定できる。"""
+
+    def test_weights_are_read(self):
+        from tinyai.collector import HuggingFaceDatasets
+        class FakeCol:
+            @staticmethod
+            def _list_lines(name):
+                return ["# コメント",
+                        "ds/a\tdefault\ttrain\ttext\t3.0",
+                        "ds/b\tdefault\ttrain\tconversations",        # 重み省略 = 1.0
+                        "ds/c\tdefault\ttrain\tinstruction\tおかしな値"]
+        h = HuggingFaceDatasets.__new__(HuggingFaceDatasets)
+        h.col = FakeCol()
+        specs = h._specs()
+        self.assertEqual(len(specs), 3)
+        self.assertEqual(specs[0][4], 3.0)
+        self.assertEqual(specs[1][4], 1.0)
+        self.assertEqual(specs[2][4], 1.0)                           # 読めない値は 1.0 に倒す
+
+    def test_real_file_parses(self):
+        from pathlib import Path
+        from tinyai.collector import HuggingFaceDatasets, DATA_DIR
+        lines = (DATA_DIR / "datasets.txt").read_text(encoding="utf-8").splitlines()
+        rows = [l.split("\t") for l in lines if l and not l.startswith("#")]
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertGreaterEqual(len(r), 4)
+            if len(r) >= 5 and r[4]:
+                self.assertGreater(float(r[4]), 0)
+
+
 class QaTextFormatTest(unittest.TestCase):
     """answer が {"text": ...} の形のデータセットを読む (人手で書かれた日本語の回答)。"""
 

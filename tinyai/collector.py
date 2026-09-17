@@ -315,12 +315,18 @@ class HuggingFaceDatasets(Source):
         self.offsets: dict[str, int] = {}
         self.last_dialogs: list = []
 
-    def _specs(self) -> list[tuple[str, str, str, str]]:
+    def _specs(self) -> list[tuple[str, str, str, str, float]]:
+        """datasets.txt の各行: dataset<TAB>config<TAB>split<TAB>形式[<TAB>重み]。
+        重みは選ばれやすさ (既定 1.0)。素の日本語の長文や多ターン会話など、今の構成で薄いものを厚くする。"""
         out = []
         for line in self.col._list_lines("datasets.txt"):
             parts = [x.strip() for x in line.split("\t")]
             if len(parts) >= 4 and not parts[0].startswith("#"):
-                out.append((parts[0], parts[1], parts[2], parts[3]))
+                try:
+                    w = float(parts[4]) if len(parts) >= 5 and parts[4] else 1.0
+                except ValueError:
+                    w = 1.0
+                out.append((parts[0], parts[1], parts[2], parts[3], max(0.05, w)))
         return out
 
     @staticmethod
@@ -400,7 +406,8 @@ class HuggingFaceDatasets(Source):
         specs = self._specs()
         if not specs:
             return []
-        ds, cfg, split, fmt = random.choice(specs)
+        weights = [sp[4] for sp in specs]
+        ds, cfg, split, fmt, _w = random.choices(specs, weights=weights, k=1)[0]
         key = f"{ds}/{cfg}/{split}"
         if key not in self.offsets:
             # 起動ごとに同じ先頭の行を読まないよう、総行数を聞いてランダムな位置から始める

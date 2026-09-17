@@ -1,24 +1,24 @@
 # Hugging Face datasets-server から読む公開データセット (dataset <TAB> config <TAB> split <TAB> 形式)
 # 形式: conversations / instruction / qa / squad / text。ライセンスは各データセットのページを確認すること。
-llm-jp/oasst1-21k-ja	default	train	conversations
-llm-jp/oasst2-33k-ja	default	train	conversations
-llm-jp/magpie-sft-v1.0	default	train	conversations
-Aratako/Magpie-Tanuki-8B-97k	default	train	instruction
+llm-jp/oasst1-21k-ja	default	train	conversations	2.0
+llm-jp/oasst2-33k-ja	default	train	conversations	2.0
+llm-jp/magpie-sft-v1.0	default	train	conversations	0.5
+Aratako/Magpie-Tanuki-8B-97k	default	train	instruction	0.5
 kunishou/databricks-dolly-15k-ja	default	train	instruction
 kunishou/hh-rlhf-49k-ja	default	train	instruction
-saillab/alpaca-japanese-cleaned	default	train	instruction
+saillab/alpaca-japanese-cleaned	default	train	instruction	0.5
 Kendamarron/jimba-instuction-1k-beta	default	train	instruction
-izumi-lab/llm-japanese-dataset	default	train	instruction
+izumi-lab/llm-japanese-dataset	default	train	instruction	0.5
 SkelterLabsInc/JaQuAD	default	train	squad
-databricks/databricks-dolly-15k	default	train	instruction
-llm-jp/oasst1-21k-en	default	train	conversations
-shi3z/ja_conv_wikipedia_orion14B_100K	default	train	conversations
+databricks/databricks-dolly-15k	default	train	instruction	0.4
+llm-jp/oasst1-21k-en	default	train	conversations	0.4
+shi3z/ja_conv_wikipedia_orion14B_100K	default	train	conversations	1.5
 llm-jp/hh-rlhf-12k-ja	default	train	preference
 Aratako/Synthetic-JP-EN-Coding-Dataset-801k	default	train	conversations
 kunishou/hh-rlhf-49k-ja	default	train	instruction
-Aratako/Magpie-Tanuki-8B-97k	default	train	conversations
-llm-jp/oasst2-33k-en	default	train	conversations
-baobab-trees/wikipedia-human-retrieval-ja	default	train	qa_text
-kunishou/oasst1-chat-44k-ja	default	train	conversations
-izumi-lab/wikipedia-ja-20230720	default	train	text
-kunishou/J-ResearchCorpus	default	train	text
+Aratako/Magpie-Tanuki-8B-97k	default	train	conversations	0.5
+llm-jp/oasst2-33k-en	default	train	conversations	0.4
+baobab-trees/wikipedia-human-retrieval-ja	default	train	qa_text	1.5
+kunishou/oasst1-chat-44k-ja	default	train	conversations	2.5
+izumi-lab/wikipedia-ja-20230720	default	train	text	3.0
+kunishou/J-ResearchCorpus	default	train	text	2.0
