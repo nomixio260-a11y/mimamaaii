@@ -210,12 +210,14 @@ def cmd_train(args) -> int:
     nl.pool.priority = brain.neural.pool.priority if len(nl.pool.priority) >= nl.pool.capacity else __import__("numpy").zeros(nl.pool.capacity, dtype="float32")
     docs = list(brain.kb.docs.values())
     brain.rng.shuffle(docs)
-    for d in docs[:24000]:
+    t_fill = time.time()
+    for d in docs[: args.pool_texts]:
         nl.add_text(d.text)
     for u, b, _, w in list(brain.dialogs.pairs):
         nl.add_dialog(u, b, weight=w)
-    n_copy = brain.feed_copy_examples(docs[:12000])
-    print(f"写し取り練習 {n_copy} 例を追加")
+    # 写し取り練習は検索を伴うので数を絞る (残りは学習中に _feed_neural が少しずつ足す)
+    n_copy = brain.feed_copy_examples(docs[: args.pool_copy])
+    print(f"再生バッファを用意: 平文 {min(len(docs), args.pool_texts)} + 会話 {len(brain.dialogs)} + 写し取り {n_copy} 例 ({time.time() - t_fill:.0f} 秒)")
     nl.set_workers(args.workers if args.workers is not None else cfg.neural_workers)
     print(f"モデル {nl.size}: パラメータ {nl.model.n_params():,}, 語彙 {len(nl.tok)}, プール {len(nl.pool)} 系列 / {nl.pool.total_tokens:,} トークン, 会話 {len(brain.dialogs)}, 並列 {nl.workers}")
     srv = None
@@ -484,6 +486,8 @@ def main(argv=None) -> int:
     p.add_argument("--serve", type=int, default=None, metavar="PORT", help="学習しながらこのポートで会話 API を開く (学習中のモデルとそのまま話せる)")
     p.add_argument("--serve-host", default="127.0.0.1")
     p.add_argument("--eval-every", type=float, default=300, help="この秒数ごとに自己評価 (取り置き ppl・会話 ppl・RAG 忠実性) を回してログに出す。0 で無効")
+    p.add_argument("--pool-texts", type=int, default=12000, help="起動時に再生バッファへ入れる知識文の数")
+    p.add_argument("--pool-copy", type=int, default=4000, help="起動時に作る RAG 写し取り練習の数 (検索を伴うので多いと起動が遅い)")
     p.add_argument("--collect-per-round", type=int, default=3, help="1 学習ラウンドあたりに収集するバッチ数 (会話データを多く集めるほど大きく)")
     p.set_defaults(func=cmd_train)
 
