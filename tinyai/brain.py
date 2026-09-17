@@ -519,10 +519,11 @@ class Brain:
                 n_d = 0
                 for item in batch.dialogs:
                     q, a = item[0], item[1]
-                    ctx = item[2] if len(item) > 2 else None   # (発話, 応答, 文脈) = 読解データは文脈付きで学ぶ (RAG の練習)
-                    if self.dialogs.add(q, a, source=batch.source or "web"):
+                    ctx = item[2] if len(item) > 2 else None    # (発話, 応答, 文脈) = 読解データは文脈付き (RAG の練習)
+                    w = item[3] if len(item) > 3 else 1.0       # w < 0 = 選好データの不採用応答 (unlikelihood)
+                    if self.dialogs.add(q, a, source=batch.source or "web", weight=w):
                         n_d += 1
-                        self._neural_pending_dialog.append((q, a, ctx, 1.0))
+                        self._neural_pending_dialog.append((q, a, ctx, w))
                 self.stats["dialogs_collected"] += n_d
         with self.lock:
             if batch.kind == "topic":

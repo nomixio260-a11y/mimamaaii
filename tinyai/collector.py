@@ -351,6 +351,18 @@ class HuggingFaceDatasets(Source):
             a = (row.get("answer") or row.get("answers") or "").strip() if isinstance(row.get("answer") or row.get("answers"), str) else ""
             if q and a:
                 pairs.append((q, a))
+        elif fmt == "preference":   # 選好データ: 採用された応答は正例、不採用の応答は負例 (unlikelihood)
+            conv = row.get("conversations") or []
+            last_user = ""
+            for m in conv:
+                if (m.get("from") or m.get("role") or "").lower() in ("human", "user", "prompter"):
+                    last_user = (m.get("value") or m.get("content") or "").strip()
+            chosen = (row.get("chosen") or "").strip()
+            rejected = (row.get("rejected") or "").strip()
+            if last_user and chosen:
+                pairs.append((last_user, chosen))
+                if rejected and rejected != chosen:
+                    pairs.append((last_user, rejected, None, -1.0))
         elif fmt == "squad":   # 読解: 文脈の中から答える練習 (RAG と同じ形)
             q = (row.get("question") or "").strip()
             ctx = (row.get("context") or "").strip()
@@ -396,7 +408,7 @@ class HuggingFaceDatasets(Source):
             pairs.extend(self._pairs_from_row(row, fmt))
         self.last_dialogs = pairs
         # 応答文は知識としても学ぶ (説明文であることが多い)
-        body = "\n".join(texts) + "\n" + "\n".join(p[1] for p in pairs if len(p[1]) >= 20) + "\n" + "\n".join(p[2] for p in pairs if len(p) > 2 and fmt == "squad")
+        body = "\n".join(texts) + "\n" + "\n".join(p[1] for p in pairs if len(p[1]) >= 20 and not (len(p) > 3 and p[3] < 0)) + "\n" + "\n".join(p[2] for p in pairs if len(p) > 2 and p[2] and fmt == "squad")
         src = f"hf:{ds}#{off}"
         return [(src, body, [])] if len(body) > 40 else []
 

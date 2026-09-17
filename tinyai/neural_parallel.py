@@ -164,7 +164,7 @@ class ParallelTrainer:
                     acc += views[k]
                 acc *= 1.0 / self.workers
                 g[k] = acc
-            self.model.adamw(g, lr=neural.lr_at(self.model.step, lr, warmup, total))
+            self.model.adamw(g, lr=neural.lr_at(self.model.step, lr, warmup, total, schedule="wsd"))
             losses.append(sum(step_losses) / len(step_losses))
         dt = time.perf_counter() - t0
         return {"steps": steps, "loss": sum(losses[-10:]) / max(len(losses[-10:]), 1), "first_loss": losses[0],

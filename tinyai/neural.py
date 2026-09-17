@@ -33,7 +33,7 @@ from .bpe import PAD, UNK, BOS, EOS, USR, BOT, CTX, SEP, SPECIALS, SubwordTokeni
 
 PRESETS = {
     "small": dict(d=128, layers=2, heads=4, ctx=64, ff=384, batch=32, lr=1e-3),
-    "base": dict(d=192, layers=4, heads=6, ctx=128, ff=512, batch=12, lr=6e-4),
+    "base": dict(d=192, layers=4, heads=6, ctx=256, ff=512, batch=8, lr=6e-4),
     "large": dict(d=256, layers=6, heads=8, ctx=128, ff=704, batch=8, lr=4e-4),
     "xl": dict(d=384, layers=8, heads=8, ctx=160, ff=1024, batch=6, lr=3e-4),
 }
@@ -156,6 +156,16 @@ class TinyTransformer:
                 self.ema[k] = v.copy()
         self.L += 1
         return self.L
+
+    def extend_context(self, new_T: int) -> int:
+        """文脈長を伸ばす (RoPE 表と因果マスクを作り直すだけ。パラメータの形は変わらないので
+        学習済みの重みをそのまま使える)。RoPE は位置の外挿がきくので、伸ばした後に学習を続ければ馴染む。"""
+        if new_T <= self.T:
+            return self.T
+        self.T = new_T
+        self.mask = np.triu(np.full((new_T, new_T), -1e9, self.dtype), 1)
+        self.cos, self.sin = _rope_tables(new_T, self.d // self.h, self.dtype)
+        return self.T
 
     def add_tokens(self, n: int) -> int:
         """語彙を n 語増やす (新しい埋め込みは既存の平均 + 小さな乱数)。トークナイザ側と同期して呼ぶ。"""
@@ -658,16 +668,22 @@ class SequencePool:
         return len(self.items)
 
 
-def lr_at(step: int, base_lr: float, warmup: int, total: int, min_ratio: float = 0.1) -> float:
+def lr_at(step: int, base_lr: float, warmup: int, total: int, min_ratio: float = 0.1, schedule: str = "wsd") -> float:
+    """学習率。既定は WSD (warmup-stable-decay): ウォームアップの後は一定に保つ。
+    終わりの無い継続学習ではコサイン減衰は「いつ終わるか」を決め打ちする必要があり、
+    途中で学習率が落ちきってそれ以上学べなくなる。一定に保ち、書き出しは EMA (平均重み) で行う方が良い
+    (減衰の役割を EMA が担う)。schedule="cosine" で従来の挙動。"""
     if step < warmup:
         return base_lr * (step + 1) / warmup
+    if schedule == "wsd":
+        return base_lr
     if total <= warmup:
         return base_lr
     t = min(1.0, (step - warmup) / max(1, total - warmup))
     return base_lr * (min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * t)))
 
 
-def train_steps(model: TinyTransformer, pool: SequencePool, steps: int, batch: int = 16, lr: float = 5e-4, warmup: int = 200, total: int = 20000, log=None) -> dict:
+def train_steps(model: TinyTransformer, pool: SequencePool, steps: int, batch: int = 16, lr: float = 5e-4, warmup: int = 200, total: int = 20000, log=None, schedule: str = "wsd") -> dict:
     if len(pool) == 0:
         return {"steps": 0}
     t0 = time.perf_counter()
@@ -676,7 +692,7 @@ def train_steps(model: TinyTransformer, pool: SequencePool, steps: int, batch: i
         x, y, w = pool.batch(batch, model.T)
         loss, g = model.loss_and_grads(x, y, w)
         pool.update(model.last_row_loss)
-        model.adamw(g, lr=lr_at(model.step, lr, warmup, total))
+        model.adamw(g, lr=lr_at(model.step, lr, warmup, total, schedule=schedule))
         losses.append(loss)
         if log and model.step % 50 == 0:
             log(model.step, loss)

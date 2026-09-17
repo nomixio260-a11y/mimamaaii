@@ -94,6 +94,10 @@ class NeuralLM:
             try:
                 self.model, self.tok, meta = neural.TinyTransformer.load(self.path)
                 self.model.dropout = self.dropout
+                want_ctx = neural.PRESETS.get(meta.get("size", self.size), {}).get("ctx", self.model.T)
+                if want_ctx > self.model.T:   # プリセットが伸びていれば、学習済みの重みのまま文脈を伸ばす
+                    log.info("文脈長を %d -> %d に拡張", self.model.T, want_ctx)
+                    self.model.extend_context(want_ctx)
                 self.trained_tokens = int(meta.get("trained_tokens", 0))
                 self.holdout_ppl = meta.get("holdout_ppl")
                 self.ready = bool(meta.get("ready", False))
@@ -166,6 +170,9 @@ class NeuralLM:
         if self.model is None:
             return
         ids = self.seq_dialog(user, bot, context)
+        if weight < 0:      # 選好データの「選ばれなかった応答」: unlikelihood で出しにくくする
+            self.pool.add(ids, weight, loss_from=self.loss_from(ids))
+            return
         for _ in range(max(1, int(round(weight)))):
             self.pool.add(ids, loss_from=self.loss_from(ids))
 

@@ -240,25 +240,28 @@ def cmd_train(args) -> int:
     try:
         while (limit_s is None or time.time() - t0 < limit_s) and (limit_s is not None or done < args.steps):
             if collector is not None:
-                # 1 分の学習ごとに 1 バッチ収集 (会話データの多いストリーム源を優先し、3 回に 1 回は話題探索)
+                # 1 分の学習ごとに数バッチ収集 (会話データの多いストリーム源を優先し、たまに話題探索とリンク辿り)
                 rounds += 1
-                batch = None
-                if rounds % 3:
-                    for _ in range(3):   # 供給源はランダム選択なので、外れ (レート制限など) なら別の源を試す
-                        batch = collector.collect_stream()
-                        if batch is not None:
-                            break
-                if batch is None:
-                    batch = collector.collect_link()
-                if batch is None:
-                    topic = brain.next_topic()
-                    batch = collector.collect(topic) if topic else None
-                if batch is not None:
+                for slot in range(args.collect_per_round):
+                    batch = None
+                    if slot or rounds % 3:
+                        for _ in range(3):   # 供給源はランダム選択なので、外れ (レート制限など) なら別の源を試す
+                            batch = collector.collect_stream()
+                            if batch is not None:
+                                break
+                    if batch is None and slot == 0:
+                        batch = collector.collect_link()
+                    if batch is None and slot == 0:
+                        topic = brain.next_topic()
+                        batch = collector.collect(topic) if topic else None
+                    if batch is None:
+                        continue
                     n = brain.learn_batch(batch, collector)
                     brain.background_step(budget_docs=400)
                     if state is not None:
                         state["collected"] += n
-                    print(f"  収集 [{batch.kind}] {batch.topic[:30]} : {n} 文, 会話 {len(batch.dialogs)} (会話計 {len(brain.dialogs)})")
+                    neg = sum(1 for d in batch.dialogs if len(d) > 3 and d[3] < 0)
+                    print(f"  収集 [{batch.kind}] {batch.topic[:34]} : {n} 文, 会話 {len(batch.dialogs)}{f' (負例 {neg})' if neg else ''} (会話計 {len(brain.dialogs)})")
             before = nl.model.step
             r = brain.neural_step(steps=10, budget_seconds=60)
             if r is None:
@@ -458,6 +461,7 @@ def main(argv=None) -> int:
     p.add_argument("--workers", type=int, default=None, help="データ並列のプロセス数 (既定: CPU 数 - 1)")
     p.add_argument("--serve", type=int, default=None, metavar="PORT", help="学習しながらこのポートで会話 API を開く (学習中のモデルとそのまま話せる)")
     p.add_argument("--serve-host", default="127.0.0.1")
+    p.add_argument("--collect-per-round", type=int, default=3, help="1 学習ラウンドあたりに収集するバッチ数 (会話データを多く集めるほど大きく)")
     p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("stats", help="状態を表示")

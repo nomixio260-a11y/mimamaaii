@@ -1090,6 +1090,61 @@ class RealtimeLearningTest(unittest.TestCase):
             self.assertIn("draft", b_.last_thought)
             self.assertIn("scores", b_.last_thought)
 
+    def test_wsd_schedule_and_context_extension(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        import numpy as np
+        # WSD: ウォームアップの後は一定 (終わりの無い継続学習で学習率が枯れない)
+        self.assertAlmostEqual(nn.lr_at(0, 1e-3, 10, 1000), 1e-4)
+        self.assertAlmostEqual(nn.lr_at(500, 1e-3, 10, 1000), 1e-3)
+        self.assertAlmostEqual(nn.lr_at(5000, 1e-3, 10, 1000), 1e-3)   # total を超えても止まらない
+        self.assertLess(nn.lr_at(900, 1e-3, 10, 1000, schedule="cosine"), 1e-3)
+        # 文脈長の拡張: 重みは変わらず、伸ばした先でも生成できる
+        m = nn.TinyTransformer(60, d=32, heads=2, layers=1, ctx=16)
+        before = {k: v.copy() for k, v in m.p.items()}
+        x = np.array([[2, 10, 11, 12, 3]])
+        logits_before, _ = m.forward(x)
+        self.assertEqual(m.extend_context(48), 48)
+        self.assertEqual(m.T, 48)
+        for k, v in before.items():
+            self.assertEqual(float(np.abs(m.p[k] - v).max()), 0.0)     # パラメータは無傷
+        logits_after, _ = m.forward(x)
+        self.assertLess(float(np.abs(logits_after - logits_before).max()), 1e-4)  # 短い系列の出力も同じ
+        long_ids = list(range(8, 8 + 40))
+        out = m.generate([2] + long_ids, max_new=3)                    # 伸ばした文脈で動く
+        self.assertLessEqual(len(out), 3)
+
+    def test_preference_data_becomes_negative_example(self):
+        from tinyai.collector import HuggingFaceDatasets
+        row = {"conversations": [{"from": "human", "value": "質問"}, {"from": "gpt", "value": "途中の答え"}, {"from": "human", "value": "本題は？"}],
+               "chosen": "良い答えです。", "rejected": "悪い答えです。"}
+        pairs = HuggingFaceDatasets._pairs_from_row(row, "preference")
+        self.assertEqual(pairs[0], ("本題は？", "良い答えです。"))
+        self.assertEqual(pairs[1][3], -1.0)      # 不採用の応答は負例
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            return
+        if not nn.available():
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.learn_text("\n".join(f"サンプル文 {i} は学習用の文章であり、内容は番号 {i} に関する説明です。" for i in range(10, 90)), "https://x/nn")
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
+            b.neural_step(steps=2, budget_seconds=0.5)
+            from tinyai.collector import Batch
+            b.learn_batch(Batch("t", "stream", [], "pref", 0.1, dialogs=[("本題は？", "良い答えです。"), ("本題は？", "悪い答えです。", None, -1.0)]))
+            neg = [w for _, _, _, w in b._neural_pending_dialog if w < 0]
+            self.assertTrue(neg, "負例が学習待ち行列に入る")
+            before = len(b.neural.pool)
+            b._feed_neural()
+            self.assertGreater(len(b.neural.pool), before)
+            self.assertTrue(any(w < 0 for _, w, _ in b.neural.pool.items), "再生バッファに負例が入る")
+
 
 if __name__ == "__main__":
     unittest.main()
