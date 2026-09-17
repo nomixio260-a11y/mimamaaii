@@ -271,7 +271,7 @@ class NeuralLM:
             if self.model is None or self.corpus is None or k <= 0 or not len(self.corpus):
                 return 0
             n = 0
-            for ids, lf, kind in self.corpus.sample(k, self.nprng):
+            for ids, lf, kind in self.corpus.sample(k, self.nprng, prefer_long=True):
                 if len(ids) >= 4:
                     self.pool.add(ids, loss_from=int(lf), kind=str(kind))
                     n += 1

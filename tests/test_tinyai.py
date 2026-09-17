@@ -1673,6 +1673,19 @@ class TokenCorpusTest(unittest.TestCase):
             self.assertEqual(small.tokens, 600)                # 減らした時は収まる分だけ残る
             self.assertEqual(len(small.sample(1)[0][0]), 10)   # 残った系列はちゃんと読める
 
+    def test_prefer_long_sampling(self):
+        """長い系列を優先して引ける (段落の流れを学ぶ系列をバッファに増やすため)。"""
+        import numpy as np
+        from pathlib import Path
+        from tinyai.neural import TokenCorpus
+        with tempfile.TemporaryDirectory() as tmp:
+            c = TokenCorpus(Path(tmp) / "c.bin", max_tokens=200_000)
+            for i in range(2000):
+                c.append(np.full(20 if i % 2 else 200, 9, dtype=np.int32))
+            plain = [len(x[0]) for x in c.sample(100, np.random.default_rng(1))]
+            longer = [len(x[0]) for x in c.sample(100, np.random.default_rng(1), prefer_long=True)]
+            self.assertGreater(sum(longer) / len(longer), sum(plain) / len(plain) * 1.3)
+
     def test_refresh_from_corpus_feeds_the_pool(self):
         from pathlib import Path
         from tinyai.neural_lm import NeuralLM

@@ -910,15 +910,23 @@ class TokenCorpus:
         self.written += n
         return True
 
-    def sample(self, k: int, rng=None) -> list[tuple]:
-        """無作為に k 本取り出す (memmap から必要な範囲だけ読む)。返すのは (ids, loss_from, 種類)。"""
+    def sample(self, k: int, rng=None, prefer_long: bool = False) -> list[tuple]:
+        """無作為に k 本取り出す (memmap から必要な範囲だけ読む)。返すのは (ids, loss_from, 種類)。
+
+        prefer_long=True なら候補を 2 倍引いて長い方の半分を返す。コーパスには 1 文だけの短い系列も
+        残っているので、そのまま引くと再生バッファの平均長が上がらない (段落の流れを学ぶには長い系列が要る)。"""
         if not self.offs:
             return []
         mm = self._open(create=False)
         if mm is None:
             return []
         rng = rng or np.random.default_rng()
-        pick = rng.choice(len(self.offs), size=min(k, len(self.offs)), replace=False)
+        if prefer_long and len(self.offs) > k * 2:
+            cand = rng.choice(len(self.offs), size=min(k * 2, len(self.offs)), replace=False)
+            cand = sorted(cand, key=lambda i: -self.lens[int(i)])
+            pick = np.array(cand[:k])
+        else:
+            pick = rng.choice(len(self.offs), size=min(k, len(self.offs)), replace=False)
         out = []
         for i in pick:
             i = int(i)
