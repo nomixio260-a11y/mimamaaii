@@ -567,7 +567,13 @@ class Brain:
                 ngram = self.lm.perplexity(self.holdout) if self.holdout else None
                 nl.evaluate(ngram)
                 # 進化: 損失が停滞したら層を追加、新語が増えていれば語彙を拡張
-                mem_ok = self.guard.pressure() < 0.7
+                # 成長に必要なメモリはモデル自身の分だけ (1 層で約 44 万パラメータ =
+                # 重み・Adam の 1 次/2 次・EMA で 7 MB 程度)。知識ベースや再生バッファが
+                # 上限に近いことを理由に成長を止めると、いちばん容量が要る局面で成長できない
+                # (実測: 圧力 0.77 で閾値 0.7 に阻まれ、層 6 のまま止まっていた)。
+                # データ側は自前の刈り込みで縮むので、モデルの成長は別枠で判断する。
+                grow_cost = self.neural.growth_bytes()
+                mem_ok = self.guard.pressure() + grow_cost / max(self.guard.soft, 1) < 0.95
                 if nl.maybe_grow(mem_ok, data_tokens=nl.corpus.tokens if nl.corpus else 0):
                     self.stats["neural_grown"] += 1
                 added = nl.evolve_vocab([d.text for d in self.kb.random_docs(min(300, len(self.kb)), self.rng)], top=50)

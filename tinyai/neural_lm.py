@@ -354,6 +354,14 @@ class NeuralLM:
     TOKENS_PER_PARAM = 20        # Chinchilla 則の目安 (一から学習する場合の計算最適)
     TOKENS_PER_PARAM_SOFT = 5    # 継続学習でデータが増え続ける場合の、容量不足を疑い始める線
 
+    def growth_bytes(self) -> int:
+        """次の成長で増えるメモリの見積り (重み + Adam の 1 次/2 次 + EMA)。"""
+        if self.model is None:
+            return 0
+        d, ff = self.model.d, self.model.ff
+        per_layer = d * 3 * d + d * d + d * ff * 2 + ff * d + 2 * d     # wqkv, wo, w1+wg, w2, rms×2
+        return int(per_layer * 4 * 4)                                   # float32 × (重み, m, v, EMA)
+
     def maybe_grow(self, memory_ok: bool = True, data_tokens: int = 0) -> bool:
         """容量を増やす判断。次のどちらかで、関数を保ったまま層 (または中間次元) を増やす。
           1. 損失が停滞した = 今の容量で学べることは学び切った

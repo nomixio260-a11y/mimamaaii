@@ -1515,6 +1515,15 @@ class GrowthTest(unittest.TestCase):
             self.assertFalse(nl.maybe_grow(True))
             self.assertEqual(nl.model.L, layers)
 
+    def test_growth_cost_is_small(self):
+        """成長のメモリ費用はモデル自身の分だけ (データ側の圧力で止めない)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            cost = nl.growth_bytes()
+            self.assertGreater(cost, 0)
+            per_param = cost / max(nl.model.n_params(), 1)
+            self.assertLess(per_param, 64)        # 1 パラメータあたり数十バイトの範囲に収まる
+
     def test_grows_when_data_outgrows_capacity(self):
         """損失が下がり続けていても、データ量が容量に対して多すぎれば先回りして大きくする。"""
         with tempfile.TemporaryDirectory() as tmp:
