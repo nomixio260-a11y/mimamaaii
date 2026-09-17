@@ -609,11 +609,14 @@ class SequencePool:
         self._cum_n = -1
         self.journal: list | None = None       # ワーカー同期用: None なら記録しない
 
-    def add(self, ids: list[int], weight: float = 1.0, loss_from: int = 0) -> None:
+    def add(self, ids, weight: float = 1.0, loss_from: int = 0) -> None:
         """weight < 0 は負例 (unlikelihood)。負例は詰め込まず単独の系列として学習する。
-        loss_from: この添字以降のトークンを本来の重みで学習する (それより前はプロンプト部)。"""
+        loss_from: この添字以降のトークンを本来の重みで学習する (それより前はプロンプト部)。
+        系列は int32 配列で持つ (Python のリストは 1 トークン約 36 バイト、int32 なら 4 バイト)。"""
         if len(ids) < 3:
             return
+        if not isinstance(ids, np.ndarray):
+            ids = np.asarray(ids, dtype=np.int32)
         item = (ids, float(weight), int(loss_from))
         if len(self.items) < self.capacity:
             self.priority[len(self.items)] = self.init_priority
@@ -678,24 +681,26 @@ class SequencePool:
                 y[b, :L] = seq[1 : L + 1]
                 w[b, :L] = -self.token_weights(L, lf, wt)
                 continue
-            buf: list[int] = []
+            parts: list = []
             tw: list = []
-            while len(buf) < T + 1:
+            filled = 0
+            while filled < T + 1:
                 if len(seq) > T + 1:
                     s_ = int(self.rng.integers(len(seq) - T))
                     seq = seq[s_ : s_ + T + 1]
                     lf = max(0, lf - s_)
-                buf.extend(seq)
+                parts.append(seq)
+                filled += len(seq)
                 tw.append(self.token_weights(len(seq) - 1, lf, max(wt, 0.1)))
                 tw.append(np.array([max(wt, 0.1)], dtype=np.float32))  # 系列末 <eos> から次系列先頭への予測
-                if len(buf) < T + 1:
+                if filled < T + 1:
                     j = self._pick()
                     seq, wt, lf = self.items[j]
                     while wt < 0:
                         j = self._pick()
                         seq, wt, lf = self.items[j]
                     rows.append(j)
-            buf = buf[: T + 1]
+            buf = np.concatenate(parts)[: T + 1]
             x[b] = buf[:-1]
             y[b] = buf[1:]
             w[b] = np.concatenate(tw)[:T]
