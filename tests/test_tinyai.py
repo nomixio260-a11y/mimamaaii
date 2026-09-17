@@ -1256,5 +1256,54 @@ class RealtimeLearningTest(unittest.TestCase):
                 self.assertLessEqual(weak, strong)
 
 
+
+class DecodeQualityTest(unittest.TestCase):
+    """自由生成のための復号: 言い回しのループ禁止、最短長、既定値の世代管理。"""
+
+    def test_banned_ngram_tokens(self):
+        from tinyai.neural import _banned_ngram_tokens
+        out = [5, 6, 7, 5, 6]
+        self.assertEqual(_banned_ngram_tokens(out, 3), {7})       # 5,6 の続きに出た 7 は禁止
+        self.assertEqual(_banned_ngram_tokens(out, 2), {7})       # 直前 6 の続きも 7
+        self.assertEqual(_banned_ngram_tokens([1, 2], 3), set())  # 長さが足りなければ禁止なし
+
+    def test_min_new_and_no_repeat_in_generate(self):
+        import numpy as np
+        from tinyai.neural import TinyTransformer, EOS
+        m = TinyTransformer(vocab_size=40, d=32, heads=4, layers=1, ctx=40, ff=64, seed=1)
+        m.p["wte"][EOS] *= 50.0                                   # 終端が出やすい状態にする
+        short = m.generate_batch([3, 4], n=3, max_new=12, temperature=0.7, rng=np.random.default_rng(0))
+        long = m.generate_batch([3, 4], n=3, max_new=12, temperature=0.7, rng=np.random.default_rng(0), min_new=5)
+        self.assertGreaterEqual(min(len(x) for x in long), 5)
+        self.assertGreaterEqual(min(len(x) for x in long), min(len(x) for x in short))
+        outs = m.generate_batch([3, 4], n=3, max_new=24, temperature=0.9, rng=np.random.default_rng(2),
+                                no_repeat_ngram=3, min_new=8)
+        for o in outs:
+            grams = [tuple(o[i:i + 3]) for i in range(len(o) - 2)]
+            self.assertEqual(len(grams), len(set(grams)))         # 同じ 3-gram は二度出ない
+
+    def test_decode_version_resets_stale_value(self):
+        import json
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            nl = NeuralLM(d, size="small")
+            nl.min_sentences, nl.min_chars = 4, 40
+            nl.ensure_model(["こんにちは。今日はいい天気です。散歩に行きましょう。%d" % i for i in range(60)])
+            nl.save()
+            meta_path = d / "neural.npz.meta.json"
+            meta = json.loads(meta_path.read_text())
+            self.assertGreaterEqual(meta["decode_version"], 1)
+            meta.pop("decode_version")                            # 古い書き出しを模す
+            meta["decode"]["copy_bonus"] = 3.0
+            meta["decode"]["temperature"] = 0.55
+            meta_path.write_text(json.dumps(meta))
+            nl2 = NeuralLM(d, size="small")
+            nl2.ensure_model()
+            self.assertEqual(nl2.decode["copy_bonus"], 1.0)       # 見直した項目は既定値から
+            self.assertEqual(nl2.decode["temperature"], 0.55)     # それ以外は保存値のまま
+
+
 if __name__ == "__main__":
     unittest.main()

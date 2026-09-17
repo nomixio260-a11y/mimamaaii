@@ -442,6 +442,8 @@
       const maxNew = opts.maxNew || 40, temperature = opts.temperature || 0.7, topK = opts.topK || 40, topP = opts.topP || 0.9, rep = opts.repetitionPenalty || 1.3;
       // 文脈 (検索した文) のトークンを少し出やすくする = 写し取りの手掛かり (Context-aware decoding の簡易版)
       const copyBonus = opts.copyBonus || 0, copySet = copyBonus && opts.copyIds ? new Set(opts.copyIds) : null;
+      // no-repeat-ngram: 同じ言い回しのループだけを禁じる (単語の再利用は許す)。minNew: 短すぎる返事を防ぐ
+      const noRepeat = opts.noRepeatNgram || 0, minNew = opts.minNew || 0;
       const stop = opts.stop || [EOS];
       const rand = opts.rand || Math.random;
       prompt = prompt.slice(-(this.T - 1));
@@ -457,6 +459,13 @@
         z[PAD] = -1e9; z[UNK] = -1e9;
         if (copySet) for (const t of copySet) if (t >= 8 && t < V) z[t] += copyBonus;
         if (rep > 1 && tokens.length) { const recent = new Set(tokens.slice(-20)); for (const t of recent) z[t] = z[t] > 0 ? z[t] / rep : z[t] * rep; }
+        if (noRepeat > 1 && tokens.length >= noRepeat) {
+          const pre = tokens.slice(-(noRepeat - 1)).join(',');
+          for (let i = 0; i + noRepeat <= tokens.length; i++) {
+            if (tokens.slice(i, i + noRepeat - 1).join(',') === pre) z[tokens[i + noRepeat - 1]] = -1e9;
+          }
+        }
+        if (minNew && tokens.length < minNew) for (const t of stop) z[t] = -1e9;
         for (let i = 0; i < V; i++) z[i] /= Math.max(temperature, 1e-3);
         // top-k (部分選択: 全体をソートしない)
         const K = Math.min(topK, V);
@@ -546,7 +555,8 @@
       this.model = new Model(meta, bin);
       this.kb = new Retriever(kb && kb.docs);
       this.replay = (kb && kb.replay) ? kb.replay.slice() : [];
-      this.decode = Object.assign({ temperature: 0.7, top_p: 0.9, repetition_penalty: 1.3, copy_bonus: 1.0 }, meta.decode || {});
+      this.decode = Object.assign({ temperature: 0.7, top_p: 0.9, repetition_penalty: 1.3, copy_bonus: 1.0, no_repeat_ngram: 3, min_new: 6 }, meta.decode || {});
+      if ((meta.decode_version || 0) < 1) this.decode.copy_bonus = 1.0;   // 古い書き出しの復号設定は既定値に戻す
       if (this.decode.copy_bonus === undefined) this.decode.copy_bonus = 1.0;
       this.lr = 3e-4;
       this.stats = { onlineSteps: 0, onlineTokens: 0, idleSteps: 0, turns: 0, good: 0, bad: 0, taught: 0, vocabAdded: 0, lossHist: [], learnedDocs: 0 };
@@ -601,6 +611,7 @@
       const cands = [];
       for (let i = 0; i < n; i++) {
         const g = this.model.generate(prompt, { maxNew, temperature: this.decode.temperature, topP: this.decode.top_p, repetitionPenalty: this.decode.repetition_penalty,
+                                                noRepeatNgram: this.decode.no_repeat_ngram || 0, minNew: Math.min(this.decode.min_new || 0, Math.max(1, maxNew >> 2)),
                                                 copyIds, copyBonus: copyBonus === undefined ? (this.decode.copy_bonus || 0) : copyBonus });
         const text = this.tok.decode(g.tokens).trim();
         // 候補の点数: 平均対数確率 + 長さと文脈との重なりの補正 (接地)

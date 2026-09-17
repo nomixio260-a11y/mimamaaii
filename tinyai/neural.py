@@ -81,6 +81,19 @@ def _softmax(x):
     return e / e.sum(-1, keepdims=True)
 
 
+def _banned_ngram_tokens(out, size: int) -> set:
+    """生成済みの列で、直前の (size-1) トークンと同じ並びが過去に現れていたら、その次に来た
+    トークンを禁止する (no-repeat-ngram)。同じ言い回しのループだけを止める。"""
+    if size < 2 or len(out) < size:
+        return set()
+    prefix = tuple(out[-(size - 1):])
+    banned = set()
+    for i in range(len(out) - size + 1):
+        if tuple(out[i:i + size - 1]) == prefix:
+            banned.add(out[i + size - 1])
+    return banned
+
+
 def _rope_tables(ctx: int, dh: int, dtype, base: float = 10000.0):
     half = dh // 2
     freqs = 1.0 / (base ** (np.arange(0, half, dtype=np.float64) / half))
@@ -466,11 +479,14 @@ class TinyTransformer:
         return xf @ p["wte"].T  # (B, V)
 
     def generate_batch(self, prompt: list[int], n: int = 3, max_new: int = 40, temperature: float = 0.8, top_k: int = 40, top_p: float = 0.9, repetition_penalty: float = 1.3, rng=None, stop=(EOS,),
-                       copy_ids=None, copy_bonus: float = 0.0) -> list[list[int]]:
+                       copy_ids=None, copy_bonus: float = 0.0, no_repeat_ngram: int = 0, min_new: int = 0) -> list[list[int]]:
         """同じプロンプトから n 本の候補を同時に生成 (1 本ずつより約 n 倍速い)。
         copy_ids / copy_bonus: 文脈 (検索した文) に現れるトークンの対数確率を少し持ち上げる = 写し取りの手掛かり。
         小さなモデルは文脈を無視して「それらしい文」を作りがちなので、復号の時点で文脈側に寄せる
-        (Context-aware decoding の簡易版。追加の順伝播は不要)。"""
+        (Context-aware decoding の簡易版。追加の順伝播は不要)。
+        no_repeat_ngram: 生成済みの n-gram をもう一度作る候補を禁止する。反復ペナルティと違って
+        「同じ単語を二度使うこと」ではなく「同じ言い回しの繰り返し」だけを止めるので、自由な文が壊れにくい。
+        min_new: この長さに達するまで終端トークンを抑制し、極端に短い返事を防ぐ。"""
         rng = rng or np.random.default_rng()
         prompt = prompt[-(self.T - 1):]
         cache = [(None, None) for _ in range(self.L)]
@@ -502,6 +518,12 @@ class TinyTransformer:
                 if repetition_penalty > 1.0 and outs[b]:
                     for t in set(outs[b][-20:]):
                         zb[t] = zb[t] / repetition_penalty if zb[t] > 0 else zb[t] * repetition_penalty
+                if no_repeat_ngram > 1 and len(outs[b]) >= no_repeat_ngram - 1:
+                    for t in _banned_ngram_tokens(outs[b], no_repeat_ngram):
+                        zb[t] = -1e9
+                if min_new and len(outs[b]) < min_new:
+                    for t in stop:
+                        zb[t] = -1e9
                 zb = zb / max(temperature, 1e-3)
                 if top_k and top_k < len(zb):
                     thr = np.partition(zb, -top_k)[-top_k]

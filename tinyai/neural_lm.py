@@ -23,6 +23,10 @@ from .neural_parallel import ParallelTrainer
 
 log = logging.getLogger("tinyai.neural")
 
+# 復号パラメータの既定値の世代。上げると、古いチェックポイントが持っている値のうち
+# 研究で見直した項目 (現在は copy_bonus) を捨てて新しい既定値から再開する。
+DECODE_VERSION = 1
+
 _QA_TEMPLATES = {
     "definition": ["{s}とは？", "{s}って何？", "{s}について教えて"],
     "is": ["{s}とは？", "{s}は何？"],
@@ -52,7 +56,8 @@ class NeuralLM:
         self.path = self.data_dir / "neural.npz"
         self.size = size if size in neural.PRESETS else "base"
         # 進化する復号パラメータ (👍/👎 の割合で山登り)
-        self.decode = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.3, "copy_bonus": 1.0}
+        self.decode = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.3, "copy_bonus": 1.0,
+                       "no_repeat_ngram": 3, "min_new": 6}
         self._decode_trial: dict | None = None
         self._fb = [0, 0]           # 現在の設定での (👍, 👎)
         self._fb_best = 0.5         # 採用済み設定の 👍 率
@@ -107,7 +112,13 @@ class NeuralLM:
                 self.ready = bool(meta.get("ready", False))
                 self.size = meta.get("size", self.size)
                 self._holdout = [list(x) for x in meta.get("holdout", [])][:300]
-                self.decode.update(meta.get("decode", {}))
+                saved = dict(meta.get("decode", {}))
+                # 既定値を変えた項目は、山登りで動かした形跡がない限り新しい既定値を使う
+                # (古いチェックポイントの復号設定が新しい研究結果を上書きしてしまうのを防ぐ)
+                if int(meta.get("decode_version", 0)) < DECODE_VERSION:
+                    for k in ("copy_bonus",):
+                        saved.pop(k, None)
+                self.decode.update({k: v for k, v in saved.items() if k in self.decode})
                 self.grown = int(meta.get("grown", 0))
                 self.vocab_added = int(meta.get("vocab_added", 0))
                 self.online_steps = int(meta.get("online_steps", 0))
@@ -334,7 +345,7 @@ class NeuralLM:
             self._fb_best = rate
         # 次の試行: 1 つのパラメータを少し動かす
         cand = dict(self.decode)
-        key = self.rng.choice(list(cand))
+        key = self.rng.choice([k for k in ("temperature", "top_p", "repetition_penalty", "copy_bonus") if k in cand])
         step = {"temperature": 0.1, "top_p": 0.05, "repetition_penalty": 0.1, "copy_bonus": 0.5}[key]
         hi = {"temperature": 1.2, "top_p": 0.99, "repetition_penalty": 2.0, "copy_bonus": 5.0}[key]
         lo = {"temperature": 0.3, "top_p": 0.5, "repetition_penalty": 1.0, "copy_bonus": 0.0}[key]
@@ -415,7 +426,7 @@ class NeuralLM:
             if self.model is None or self.tok is None:
                 return
             self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300],
-                                                       "decode": self.decode, "grown": self.grown, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
+                                                       "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
             self._last_save = time.time()
 
     def _infer(self):
@@ -463,7 +474,9 @@ class NeuralLM:
             bonus = dec.get("copy_bonus", 0.0) if copy_bonus is None else copy_bonus
             with self._infer():
                 gens = self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=dec["temperature"], top_p=dec["top_p"], repetition_penalty=dec["repetition_penalty"], rng=self.nprng,
-                                                 copy_ids=copy_ids, copy_bonus=bonus)
+                                                 copy_ids=copy_ids, copy_bonus=bonus,
+                                                 no_repeat_ngram=int(dec.get("no_repeat_ngram", 0)),
+                                                 min_new=min(int(dec.get("min_new", 0)), max(max_new // 4, 1)))
             for ids in gens:
                 text = self.tok.decode(ids).strip()
                 if len(text) >= 2:
@@ -502,7 +515,7 @@ class NeuralLM:
             "ff": self.model.ff if self.model else 0,
             "vocab_added": self.vocab_added,
             "online_steps": self.online_steps,
-            "decode": dict(self.decode),
+            "decode": dict(self.decode), "decode_version": DECODE_VERSION,
             "dropout": self.model.dropout if self.model else self.dropout,
             "ema": bool(self.use_ema and self.model is not None and self.model.ema is not None),
             "ema_ppl": self.ema_ppl,
