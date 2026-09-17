@@ -57,6 +57,7 @@ class NeuralLM:
         self._fb = [0, 0]           # 現在の設定での (👍, 👎)
         self._fb_best = 0.5         # 採用済み設定の 👍 率
         self.loss_hist: list[float] = []
+        self.ppl_hist: list[float] = []      # 取り置き ppl の推移 (成長の判断に使う)
         self.grown = 0
         self.vocab_added = 0
         self.online_steps = 0
@@ -260,7 +261,10 @@ class NeuralLM:
             h = self.loss_hist
             if len(h) < 20:
                 return False
-            recent, before = sum(h[-10:]) / 10, sum(h[-20:-10]) / 10
+            # 取り置き ppl が悪化し続けている = 過学習なので、容量を増やしても意味がない
+            ph = self.ppl_hist
+            if len(ph) >= 4 and sum(ph[-2:]) / 2 > sum(ph[-4:-2]) / 2 * 1.15:
+                return False
             if before - recent < 0.02 and recent > 1.5:  # 改善が止まり、まだ十分に低くない
                 self.stop_parallel()  # パラメータの形が変わるので並列ワーカーは作り直す (次の train_some で再開)
                 self.model.grow_layer()
@@ -352,6 +356,9 @@ class NeuralLM:
                 return {}
             with self.model.use_ema():
                 self.holdout_ppl = round(neural.perplexity(self.model, self._holdout), 2)
+            self.ppl_hist.append(self.holdout_ppl)
+            if len(self.ppl_hist) > 100:
+                del self.ppl_hist[:50]
             self.ngram_ppl = ngram_ppl
             if self.holdout_ppl is not None:
                 if ngram_ppl is not None:

@@ -38,7 +38,7 @@ PRESETS = {
     "xl": dict(d=384, layers=8, heads=8, ctx=320, ff=1024, batch=4, lr=3e-4),
 }
 # 成長の上限 (プリセット名 -> 最大層数)。層は損失が停滞した時に 1 層ずつ、関数を保ったまま追加される
-MAX_LAYERS = {"small": 4, "base": 6, "large": 8, "xl": 12}
+MAX_LAYERS = {"small": 5, "base": 9, "large": 12, "xl": 16}
 
 
 def available() -> bool:
