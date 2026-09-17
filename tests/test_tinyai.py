@@ -1524,6 +1524,21 @@ class GrowthTest(unittest.TestCase):
             per_param = cost / max(nl.model.n_params(), 1)
             self.assertLess(per_param, 64)        # 1 パラメータあたり数十バイトの範囲に収まる
 
+    def test_learning_rate_ramps_back_after_growth(self):
+        """成長直後は学習率を下げ、少しずつ元に戻す。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            self.assertEqual(nl._effective_lr(), nl.lr)                    # 成長前は通常どおり
+            need = nl.TOKENS_PER_PARAM * nl.model.n_params()
+            self.assertTrue(nl.maybe_grow(True, data_tokens=need + 1))
+            just_after = nl._effective_lr()
+            self.assertLess(just_after, nl.lr * 0.5)                       # 直後は大きく下げる
+            nl.model.step = nl._last_grow_step + nl.GROW_WARMUP // 2
+            mid = nl._effective_lr()
+            self.assertGreater(mid, just_after)                            # 少しずつ戻る
+            nl.model.step = nl._last_grow_step + nl.GROW_WARMUP
+            self.assertEqual(nl._effective_lr(), nl.lr)                    # 馴染んだら元に戻る
+
     def test_growth_has_a_cooldown(self):
         """一度成長したら、しばらくは次の成長を待つ (増やす→悪化→また増やす の悪循環を避ける)。"""
         with tempfile.TemporaryDirectory() as tmp:

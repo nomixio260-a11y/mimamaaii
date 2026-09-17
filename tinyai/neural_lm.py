@@ -357,6 +357,22 @@ class NeuralLM:
     TOKENS_PER_PARAM = 20        # Chinchilla 則の目安 (一から学習する場合の計算最適)
     TOKENS_PER_PARAM_SOFT = 5    # 継続学習でデータが増え続ける場合の、容量不足を疑い始める線
 
+    GROW_WARMUP = 400            # 成長直後に学習率を戻していくステップ数
+
+    def _effective_lr(self) -> float:
+        """成長直後は学習率を下げてから戻す。
+
+        層を足した直後のモデルは、追加した層が恒等写像の状態から学び始める。そこへ通常の学習率を
+        かけると既に学んだ重みの方が崩れ、取り置き ppl と対話 ppl が悪化する
+        (実測: 12 分で 3 層追加した後、対話 ppl 75 → 98、損失 1.93 → 2.04)。
+        0.3 倍から始めて 400 ステップかけて戻す。"""
+        if not self.grown or self.model is None:
+            return self.lr
+        since = self.model.step - self._last_grow_step
+        if since >= self.GROW_WARMUP or since < 0:
+            return self.lr
+        return self.lr * (0.3 + 0.7 * since / self.GROW_WARMUP)
+
     def growth_bytes(self) -> int:
         """次の成長で増えるメモリの見積り (重み + Adam の 1 次/2 次 + EMA)。"""
         if self.model is None:
@@ -472,7 +488,7 @@ class NeuralLM:
                         self.workers = 1
                 if self._parallel is not None:
                     try:
-                        r = self._parallel.train(steps=steps, batch=batch, lr=self.lr, total=self.total_steps)
+                        r = self._parallel.train(steps=steps, batch=batch, lr=self._effective_lr(), total=self.total_steps)
                     except MemoryError:
                         self.batch = max(2, batch // 2)
                         return None
@@ -483,7 +499,7 @@ class NeuralLM:
                         del self.loss_hist[:100]
                     return r
             try:
-                r = neural.train_steps(self.model, self.pool, steps=steps, batch=batch, lr=self.lr, total=self.total_steps)
+                r = neural.train_steps(self.model, self.pool, steps=steps, batch=batch, lr=self._effective_lr(), total=self.total_steps)
             except MemoryError:
                 # メモリ上限に当たったらバッチを半分にして続ける
                 self.batch = max(2, batch // 2)
