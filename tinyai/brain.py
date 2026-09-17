@@ -253,6 +253,11 @@ class Brain:
         kb, lm, timers = self.kb, self.lm, self.timers
         protected = source in ("user", "chat", "seed")
         perf = time.perf_counter
+        # ニューラル LM には「続きもの」で渡す。1 文ずつ (平均 92 トークン) だと段落の流れを学べず、
+        # 生成が 1 文ごとに話題を変えてしまう。同じ出典の連続した文をまとめ、文脈長に近い長さで渡す。
+        span: list[str] = []
+        span_len = 0
+        SPAN_CHARS = 350        # 文脈 256 トークン ≒ 日本語 300〜400 文字
         for s in sentences:
             self._holdout_counter += 1
             t0 = perf()
@@ -294,10 +299,16 @@ class Brain:
                 timers["lm"] += perf() - t0
             self._semantic_queue.append((doc.id, info.phrases))
             self._suffix_dirty += 1
-            if self.neural.available and (added % 3 == 0 or q >= 0.7):
-                self._neural_pending_text.append(s)
+            if self.neural.available:
+                span.append(s)
+                span_len += len(s)
+                if span_len >= SPAN_CHARS:
+                    self._neural_pending_text.append("".join(span))
+                    span, span_len = [], 0
             if added % 500 == 0:
                 self._maybe_enforce()
+        if span_len >= 40:                  # 端数も渡す (短すぎるものは捨てる)
+            self._neural_pending_text.append("".join(span))
         return added
 
     # ------------------------------------------------------------ 後回しの学習 (意味ベクトル・接尾辞配列)

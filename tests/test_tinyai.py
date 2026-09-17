@@ -1,4 +1,5 @@
 """python -m unittest discover -s tests  (pytest でも動く)"""
+import re
 import random
 import tempfile
 import threading
@@ -1582,6 +1583,26 @@ class TokenCorpusTest(unittest.TestCase):
             self.assertGreater(len(nl.corpus), 100)          # 読んだ文はコーパスにも入る
             n = nl.refresh_from_corpus(50)
             self.assertGreater(n, 0)
+
+
+class SpanLearningTest(unittest.TestCase):
+    """ニューラル LM には連続した文をまとめて渡す (段落の流れを学ぶため)。"""
+
+    def test_sentences_are_grouped_into_spans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b._neural_pending_text.clear()
+            text = "。".join("これは文書の第 %d 文であり、続きものとして読めるように書かれています" % i
+                             for i in range(1, 41)) + "。"
+            b.learn_text(text, "https://example.com/doc")
+            spans = list(b._neural_pending_text)
+            self.assertTrue(spans)
+            avg = sum(len(x) for x in spans) / len(spans)
+            self.assertGreater(avg, 150)                 # 1 文ずつ (40〜90 文字) より明らかに長い
+            first = spans[0]                              # 取り込まれた文が連続して同じ系列に入る
+            nums = [int(m) for m in re.findall(r"第 (\d+) 文", first)]
+            self.assertGreater(len(nums), 3)
+            self.assertEqual(nums, sorted(nums))          # 出てきた順のまま (並べ替えや欠落ではない)
 
 
 if __name__ == "__main__":
