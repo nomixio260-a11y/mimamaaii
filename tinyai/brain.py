@@ -396,6 +396,28 @@ class Brain:
         ctx = " ".join(parts)
         return ctx[:max_chars] if ctx else None
 
+    def feed_copy_examples(self, docs) -> int:
+        """RAG の写し取り練習を再生バッファへ: 文脈 = その文 (+ 隣の文、時々は無関係な文も混ぜて「選ぶ」練習)、
+        質問 = キーワード、答え = その文。"""
+        nl = self.neural
+        n = 0
+        for d in docs:
+            if d.source == "chat" or len(d.text) < 12:
+                continue
+            ks = [k for k in keywords(d.text, limit=2) if is_phrase(k)]
+            if not ks:
+                continue
+            nb = self.kb.docs.get(d.id + 1)
+            neighbor = nb.text if nb and nb.source == d.source else None
+            if self.rng.random() < 0.3:
+                # 無関係な文を混ぜる (前でも後ろでも): 文脈の中から正しい文を選ぶ練習
+                other = next(iter(self.kb.random_docs(1, self.rng)), None)
+                if other is not None and other.id != d.id:
+                    neighbor = f"{other.text} {neighbor}" if neighbor and self.rng.random() < 0.5 else other.text
+            nl.add_copy_example(ks[0], d.text, neighbor)
+            n += 1
+        return n
+
     def _feed_neural(self, max_qa_docs: int = 60) -> None:
         """再生バッファへ: 平文、会話 (文脈付き)、事実からの合成 QA。"""
         nl = self.neural
@@ -405,11 +427,7 @@ class Brain:
             u, b, ctx, w = self._neural_pending_dialog.popleft()
             nl.add_dialog(u, b, ctx, weight=w)
         # 文脈からの抽出練習: 最近の知識文をキーワード付きで (RAG で「検索文を使う」ことを学ぶ)
-        for d in self.kb.random_docs(min(20, len(self.kb)), self.rng):
-            ks = [k for k in keywords(d.text, limit=2) if is_phrase(k)]
-            if ks and d.source not in ("chat",):
-                nb = self.kb.docs.get(d.id + 1)
-                nl.add_copy_example(ks[0], d.text, nb.text if nb and nb.source == d.source else None)
+        self.feed_copy_examples(self.kb.random_docs(min(60, len(self.kb)), self.rng))
         n = 0
         for key, lst in self.facts.by_subject.items():
             for rel, obj, doc_id in lst:

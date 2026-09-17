@@ -170,8 +170,9 @@ class NeuralLM:
         """RAG の「文脈から抜き出す」練習: 文脈 (その文 + 周辺) を与え、キーワードについて聞かれたらその文を答える。"""
         if self.model is None:
             return
-        context = f"{sentence} {neighbors}" if neighbors else sentence
-        q = self.rng.choice([f"{keyword}について教えて", f"{keyword}とは？", f"{keyword}は？", f"{keyword}について"])
+        # 文脈の中での位置も散らす (先頭固定だと「最初の文を写す」だけ覚える)
+        context = (f"{sentence} {neighbors}" if self.rng.random() < 0.5 else f"{neighbors} {sentence}") if neighbors else sentence
+        q = self.rng.choice([f"{keyword}について教えて", f"{keyword}とは？", f"{keyword}は？", f"{keyword}について", f"{keyword}を説明して", f"{keyword}って何？"])
         ids = self.seq_dialog(q, sentence, context)
         self.pool.add(ids, loss_from=self.loss_from(ids))
 
@@ -214,10 +215,8 @@ class NeuralLM:
         ids = self.seq_dialog(user, bot, context)
         lf = self.loss_from(ids)
         self.pool.add(ids, weight, loss_from=lf)
-        if len(self.pool) < 8:
-            return None
         T = self.model.T
-        B = 4
+        B = 4 if len(self.pool) >= 8 else 1   # 再生バッファがまだ無ければその系列だけで学ぶ
         x = neural.np.full((B, T), neural.PAD, dtype=neural.np.int64)
         y = neural.np.full((B, T), neural.PAD, dtype=neural.np.int64)
         w = neural.np.ones((B, T), dtype=neural.np.float32)
@@ -227,8 +226,9 @@ class NeuralLM:
         y[0, :L] = seq[1 : L + 1]
         tw = neural.SequencePool.token_weights(L, lf, weight)
         w[0, :L] = tw if weight > 0 else -tw
-        rx, ry, rw = self.pool.batch(B - 1, T)
-        x[1:], y[1:], w[1:] = rx, ry, rw
+        if B > 1:
+            rx, ry, rw = self.pool.batch(B - 1, T)
+            x[1:], y[1:], w[1:] = rx, ry, rw
         last = None
         for _ in range(steps):
             loss, g = self.model.loss_and_grads(x, y, w)

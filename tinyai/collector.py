@@ -76,7 +76,9 @@ class SourceHealth:
 
     @property
     def score(self) -> float:
-        # 成功率 × (文の収穫 + 新規性) × 学習価値。試行が少ないうちは楽観的
+        # 成功率 × (文の収穫 + 新規性) × 学習価値。未試行の源は楽観的な高い点 (探索) を与える
+        if self.tries == 0:
+            return 1.0
         t = max(self.tries, 1)
         return (self.ok + 1) / (self.tries + 2) * (self.gain / t + self.novelty / t + 0.5) * (0.5 + self.value)
 
@@ -304,8 +306,8 @@ class HuggingFaceDatasets(Source):
     conversations (from/value の配列) / instruction (instruction, input, output) / qa (question, answer) / text (text)。"""
     name = "hfdatasets"
     kind = "stream"
-    weight = 1.0
-    PAGE = 50
+    weight = 1.5      # 会話・指示・読解データは希少なので少し優先
+    PAGE = 100
 
     def __init__(self, col, lang="ja"):
         super().__init__(col, lang)
