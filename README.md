@@ -15,6 +15,8 @@ numpy が無い環境では、検索と事実ストアによる応答に自動�
 | 成長 (進化) | 損失が停滞したら **関数を保ったまま層を追加** (新層の出力射影をゼロで初期化: Net2Net 型)。新しいテキストに頻出する未知の単位を**語彙に追加**し、埋め込みも拡張。復号パラメータ (温度・top-p・繰り返しペナルティ) は 👍 率で山登り |
 | 規模 | プリセット small 1.2M / base 2.9M / large 6.4M / **xl 17M** (d=384, 8 層, 文脈 160)。`TINYAI_NEURAL=auto` (既定) はメモリ上限から選ぶ: 200MB→base, 512MB→large, 1GB→xl。成長で層は最大 12 まで |
 | アーキテクチャ | RMSNorm・RoPE・SwiGLU・重み共有・KV キャッシュ・top-p・繰り返しペナルティ・コサイン学習率・系列パッキング。逆伝播は手書きで有限差分検査済み |
+| 学習効率 | **損失マスク**: 会話系列の文脈・発話 (プロンプト部) は重み 0.2、応答部は 1.0 で学習し、同じ計算量で会話の質に勾配を集中させる。データ並列 (4 プロセスで 3.5k → 10k トークン/秒)。語彙進化・層追加は並列ワーカーを作り直してから形を変える |
+| ブラウザ版 | `python -m tinyai export` で重みを **int8 (行ごとのスケール、4 分の 1 のサイズ、base で 3MB)** に書き出し、`web/` の JS エンジン (Transformer の順伝播・逆伝播・AdamW・KV キャッシュ・BM25 を依存なしで移植、numpy と logits・損失・勾配が一致) がブラウザの中で応答し、**会話 1 ターンごとに重みを更新**する。UI は思い出した知識、注意の地図、一語ごとの確信度と候補、候補の点数、進化の数値 (パラメータ・層・語彙・学習ステップ・損失曲線) を表示。学習内容は端末の IndexedDB に保存 |
 
 ```
 python -m tinyai            # 対話 (裏で自動学習が回る)
@@ -78,6 +80,11 @@ python -m tinyai evolve --seconds 3600 --interval 30
 python -m tinyai train --steps 2000 --seconds 600          # 手元の知識と会話で
 python -m tinyai train --hours 3 --size large              # 収集システムからデータを流し込みながら長時間
 TINYAI_NEURAL=small python -m tinyai chat                  # 小さいモデルで裏学習 (低スペック向け)
+
+# ブラウザ版の書き出し (web/ と同じ場所に置いて静的配信する)
+python -m tinyai export --out web/dist
+cp web/index.html web/engine.js web/worker.js web/dist/ && python -m http.server -d web/dist 8080
+node web/validate.js web/dist         # JS 移植と numpy の一致検査 (トークナイザ・logits・損失・勾配)
 
 # 状態 (世代・適応度・メモリ・ニューラル LM・会話データなど)
 python -m tinyai stats

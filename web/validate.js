@@ -1,0 +1,63 @@
+// node web/validate.js <export_dir> : 書き出した検証ベクトルと JS 移植の一致を確かめる
+const fs = require('fs'); const path = require('path');
+const T = require('./engine.js');
+const dir = process.argv[2];
+const meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'));
+const vocab = JSON.parse(fs.readFileSync(path.join(dir, 'vocab.json'), 'utf8'));
+const kb = JSON.parse(fs.readFileSync(path.join(dir, 'kb.json'), 'utf8'));
+const test = JSON.parse(fs.readFileSync(path.join(dir, 'test.json'), 'utf8'));
+const buf = fs.readFileSync(path.join(dir, 'model.bin'));
+const bin = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+let t0 = Date.now();
+const eng = new T.Engine(meta, bin, vocab, kb);
+console.log('load ms', Date.now() - t0, 'params', eng.model.nParams(), 'vocab', eng.tok.length);
+// tokenizer 一致
+const enc = eng.tok.encode('こんにちは、元気？', 20);
+const expect = test.prompt.slice(2, -1);
+console.log('tokenizer', JSON.stringify(enc) === JSON.stringify(expect) ? 'OK' : `NG ${enc} vs ${expect}`);
+// 順伝播 (全系列) と KV キャッシュ逐次の一致 + numpy との一致
+t0 = Date.now();
+const fw = eng.model.forward(test.prompt, false);
+const V = eng.model.V, L = test.prompt.length;
+const last = Array.from(fw.logits.subarray((L - 1) * V, L * V));
+let maxErr = 0; for (const [i, v] of test.top) maxErr = Math.max(maxErr, Math.abs(last[i] - v));
+const order = last.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).slice(0, 5).map((x) => x[1]);
+console.log('forward ms', Date.now() - t0, 'max |logit err| vs numpy', maxErr.toFixed(5), 'top5', order, 'expected', test.top.slice(0, 5).map((x) => x[0]));
+const cache = eng.model.newCache(); let st = null;
+for (let p = 0; p < L; p++) st = eng.model.stepToken(test.prompt[p], p, cache, true);
+let e2 = 0; for (let i = 0; i < V; i++) e2 = Math.max(e2, Math.abs(st.logits[i] - last[i]));
+console.log('kv-cache step vs full forward max err', e2.toFixed(6));
+// 損失と勾配
+const seq = test.train.seq; const n = seq.length - 1;
+const w = new Float32Array(n); const lf = seq.indexOf(T.BOT) + 1;
+for (let t = 0; t < n; t++) w[t] = t + 1 < lf ? 0.2 : 1.0;
+t0 = Date.now();
+const { loss, g } = eng.model.lossAndGrads(seq.slice(0, n), seq.slice(1), w);
+const ms = Date.now() - t0;
+let gr = 0; for (let i = 0; i < g['l0.wo'].length; i++) gr += g['l0.wo'][i] ** 2; gr = Math.sqrt(gr);
+let gw = 0; for (let i = 0; i < g.wte.length; i++) gw += g.wte[i] ** 2; gw = Math.sqrt(gw);
+let gm = 0; for (let i = 0; i < g.rmsf.length; i++) gm = Math.max(gm, Math.abs(g.rmsf[i] - test.train.grad_rmsf[i]));
+console.log(`train step ms ${ms} (T=${n})  loss js ${loss.toFixed(5)} numpy ${test.train.loss.toFixed(5)}`);
+console.log(`grad |wo0| js ${gr.toFixed(5)} numpy ${test.train.grad_norm_wo0.toFixed(5)}  |wte| js ${gw.toFixed(5)} numpy ${test.train.grad_norm_wte.toFixed(5)}  rmsf max err ${gm.toExponential(2)}`);
+// 学習が損失を下げるか + 応答
+const before = loss;
+for (let i = 0; i < 3; i++) eng.model.adamw(eng.model.lossAndGrads(seq.slice(0, n), seq.slice(1), w).g, 3e-4);
+const after = eng.model.lossAndGrads(seq.slice(0, n), seq.slice(1), w).loss;
+console.log('loss before', before.toFixed(4), 'after 3 steps', after.toFixed(4), after < before ? 'OK' : 'NG');
+t0 = Date.now();
+const r = eng.reply('こんにちは');
+console.log('reply ms', Date.now() - t0, JSON.stringify(r.text), 'cands', r.candidates.map((c) => [c.text.slice(0, 20), c.score.toFixed(2)]), 'hits', r.hits.length);
+t0 = Date.now();
+const lt = eng.learnTurn('こんにちは', r.text, r.context, 1, 1);
+console.log('learnTurn ms', Date.now() - t0, lt);
+const snap = eng.snapshot();
+console.log('snapshot keys', Object.keys(snap), 'weights bytes', Object.values(snap.weights.p).reduce((a, b) => a + b.byteLength, 0));
+const fails = [];
+if (JSON.stringify(enc) !== JSON.stringify(expect)) fails.push('tokenizer');
+if (maxErr > 0.02) fails.push('forward');
+if (e2 > 1e-3) fails.push('kvcache');
+if (Math.abs(loss - test.train.loss) > 0.01) fails.push('loss');
+if (Math.abs(gr - test.train.grad_norm_wo0) / test.train.grad_norm_wo0 > 0.02) fails.push('grad');
+if (!(after < before)) fails.push('learning');
+console.log(fails.length ? 'FAIL ' + fails.join(',') : 'ALL OK');
+process.exit(fails.length ? 1 : 0);

@@ -931,6 +931,77 @@ class RealtimeLearningTest(unittest.TestCase):
                 b.neural.feedback(True)
             self.assertIsNotNone(b.neural._decode_trial)  # 復号パラメータの試行が始まる
 
+    def test_loss_mask_and_parallel_restart_on_vocab_growth(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        from tinyai.bpe import BOT
+        pool = nn.SequencePool(seed=1)
+        seq = [2, 6, 10, 11, 4, 20, 21, 5, 30, 31, 32, 3]
+        pool.add(seq, loss_from=seq.index(BOT) + 1)
+        x, y, w = pool.batch(1, len(seq) - 1)
+        self.assertEqual(w.shape, (1, len(seq) - 1))
+        # <bot> より前の予測対象は PROMPT_WEIGHT、応答部は 1.0
+        lf = seq.index(BOT) + 1
+        self.assertTrue(all(abs(v - nn.SequencePool.PROMPT_WEIGHT) < 1e-6 for v in w[0, : lf - 1]))
+        self.assertTrue(all(abs(v - 1.0) < 1e-6 for v in w[0, lf - 1 :]))
+        m = nn.TinyTransformer(60, d=32, heads=2, layers=1, ctx=16)
+        loss_masked, _ = m.loss_and_grads(x, y, w)
+        loss_full, _ = m.loss_and_grads(x, y, None)
+        self.assertLess(loss_masked, loss_full)  # プロンプト部の損失が小さく数えられる
+        # 語彙進化・層追加は並列ワーカーを止めてから形を変える
+        with tempfile.TemporaryDirectory() as tmp:
+            from tinyai.neural_lm import NeuralLM
+            nl = NeuralLM(Path(tmp), size="small")
+            texts = [f"文 {i} は語彙学習のためのサンプルであり、番号 {i} に関する説明文である。" for i in range(300)]
+            nl.min_sentences, nl.min_chars = 10, 100
+            self.assertTrue(nl.ensure_model(texts))
+            for t in texts:
+                nl.add_text(t)
+            nl.set_workers(2)
+            r = nl.train_some(steps=2, batch=4)
+            if nl._parallel is not None:
+                V0 = nl.model.V
+                added = nl.evolve_vocab(["新語ホゲホゲ理論が何度も出てくる。新語ホゲホゲ理論とは新語ホゲホゲ理論である。"] * 6, top=5)
+                self.assertGreater(added, 0)
+                self.assertIsNone(nl._parallel)              # 形が変わる前に止めた
+                r = nl.train_some(steps=2, batch=4)          # 新しい形で作り直して続行できる
+                self.assertIsNotNone(r)
+                self.assertEqual(nl.model.V, V0 + added)
+            nl.stop_parallel()
+
+    def test_export_for_web(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        import json
+        from tinyai.export import export_model, quantize_rows, dequantize_rows
+        from tinyai.bpe import SubwordTokenizer
+        np = nn.np
+        w = np.random.default_rng(0).standard_normal((5, 8)).astype(np.float32)
+        q, sc = quantize_rows(w)
+        self.assertLess(float(np.abs(dequantize_rows(q, sc) - w).max()), float(np.abs(w).max()) / 100)
+        texts = [f"文 {i} は書き出しテストのための文章である。" for i in range(50)]
+        tok = SubwordTokenizer.train(texts, size=300)
+        m = nn.TinyTransformer(len(tok), d=32, heads=2, layers=2, ctx=32, ff=64)
+        with tempfile.TemporaryDirectory() as tmp:
+            meta = export_model(m, tok, Path(tmp))
+            self.assertEqual(meta["V"], len(tok))
+            size = (Path(tmp) / "model.bin").stat().st_size
+            self.assertEqual(size, meta["bytes"])
+            self.assertLess(size, m.n_params() * 1.3)   # int8 なので 4 バイト/パラメータより大幅に小さい
+            test = json.loads((Path(tmp) / "test.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(test["top"]), 10)
+            self.assertGreater(test["train"]["loss"], 0)
+            vocab = json.loads((Path(tmp) / "vocab.json").read_text(encoding="utf-8"))
+            self.assertEqual(vocab[:8], ["<pad>", "<unk>", "<bos>", "<eos>", "<usr>", "<bot>", "<ctx>", "<sep>"])
+
 
 if __name__ == "__main__":
     unittest.main()

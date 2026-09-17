@@ -229,11 +229,12 @@ def cmd_train(args) -> int:
                     n = brain.learn_batch(batch, collector)
                     brain.background_step(budget_docs=400)
                     print(f"  収集 [{batch.kind}] {batch.topic[:30]} : {n} 文, 会話 {len(batch.dialogs)}")
+            before = nl.model.step
             r = brain.neural_step(steps=10, budget_seconds=60)
             if r is None:
                 print("学習データが足りません")
                 break
-            done += r["steps"]
+            done += nl.model.step - before
             if done - last_log >= 100:
                 last_log = done
                 ev = nl.evaluate(brain.lm.perplexity(brain.holdout) if brain.holdout else None)
@@ -249,6 +250,27 @@ def cmd_train(args) -> int:
         hits = brain._search(q)
         ctx = " ".join(d.text for _, d in hits[:2])[:200] or None
         print(q, "->", nl.chat(q, ctx, n=2))
+    return 0
+
+
+def cmd_export(args) -> int:
+    """ブラウザ版 (web/) 用にモデル・語彙・知識文を書き出す。"""
+    cfg = _build_config(args)
+    _setup_logging(cfg, False)
+    brain = _open_brain(cfg)
+    if not brain.neural.available:
+        print("numpy がありません: pip install numpy")
+        return 1
+    brain.neural.ensure_model()
+    from .export import export_brain
+
+    try:
+        meta = export_brain(brain, Path(args.out), max_docs=args.max_docs)
+    except RuntimeError as e:
+        print(e)
+        return 1
+    print(json.dumps({k: v for k, v in meta.items() if k != "tensors"}, ensure_ascii=False))
+    print(f"書き出し先: {args.out} (model.bin {meta['bytes'] / 1e6:.1f} MB)。web/index.html, engine.js, worker.js と同じ場所に置いて配信してください。")
     return 0
 
 
@@ -388,6 +410,11 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("stats", help="状態を表示")
     p.set_defaults(func=cmd_stats)
+
+    p = sub.add_parser("export", help="ブラウザ版 (web/) 用にモデルを int8 で書き出す")
+    p.add_argument("--out", default="web/dist")
+    p.add_argument("--max-docs", type=int, default=12000)
+    p.set_defaults(func=cmd_export)
 
     p = sub.add_parser("serve", help="HTTP API + 簡易 Web UI")
     p.add_argument("--host", default="127.0.0.1")

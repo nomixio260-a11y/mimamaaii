@@ -206,8 +206,9 @@ class TinyTransformer:
         return logits, (ids, caches, xf, cf)
 
     def loss_and_grads(self, ids, targets, weights=None):
-        """weights: (B,) の系列ごとの重み。正なら通常の交差エントロピー、負なら unlikelihood
-        (その系列を出しにくくする: L = -log(1 - p_target))。None なら全て +1。"""
+        """weights: (B,) の系列ごと、または (B, T) のトークンごとの重み。正なら通常の交差エントロピー、
+        負なら unlikelihood (その系列を出しにくくする: L = -log(1 - p_target))。None なら全て +1。
+        重み 0 のトークンは損失に入らない (損失マスク)。"""
         p = self.p
         logits, (ids, caches, xf, cf) = self.forward(ids, train=True)
         B, T, V = logits.shape
@@ -219,13 +220,15 @@ class TinyTransformer:
         probs = logits
         valid = (targets != PAD)
         n = max(int(valid.sum()), 1)
+        valid = valid.astype(self.dtype)
         bi = np.arange(B)[:, None]
         ti = np.arange(T)[None, :]
         pt = probs[bi, ti, targets]
         if weights is None:
             w = np.ones((B, 1), self.dtype)
         else:
-            w = np.asarray(weights, self.dtype).reshape(B, 1)
+            w = np.asarray(weights, self.dtype)
+            w = w.reshape(B, 1) if w.ndim == 1 else w.reshape(B, T)  # 系列ごと or トークンごとの重み
         pos = (w > 0)
         # 損失: 正例は -log p、負例は -log(1-p)
         loss_pos = -np.log(np.maximum(pt, 1e-9))
@@ -475,20 +478,27 @@ class TinyTransformer:
 
 # ---------------------------------------------------------------- データと学習
 class SequencePool:
-    """学習系列の再生バッファ。バッチは複数の系列を <eos> 区切りで詰めて作る (系列パッキング)。"""
+    """学習系列の再生バッファ。バッチは複数の系列を <eos> 区切りで詰めて作る (系列パッキング)。
+
+    各系列は (ids, weight, loss_from) を持つ。loss_from より前のトークン (会話の文脈・発話 = プロンプト部) は
+    PROMPT_WEIGHT の小さな重みでしか学習しない (損失マスク)。応答部に勾配を集中させると同じ計算量で
+    会話の質が上がり、プロンプト部にも弱い言語モデル信号を残すので文脈の読みは壊れない。"""
+
+    PROMPT_WEIGHT = 0.2
 
     def __init__(self, capacity: int = 30000, seed: int = 0):
         self.capacity = capacity
-        self.items: list[list[int]] = []
+        self.items: list[tuple[list[int], float, int]] = []
         self.pos = 0
         self.rng = np.random.default_rng(seed) if np is not None else None
         self.total_tokens = 0
 
-    def add(self, ids: list[int], weight: float = 1.0) -> None:
-        """weight < 0 は負例 (unlikelihood)。負例は詰め込まず単独の系列として学習する。"""
+    def add(self, ids: list[int], weight: float = 1.0, loss_from: int = 0) -> None:
+        """weight < 0 は負例 (unlikelihood)。負例は詰め込まず単独の系列として学習する。
+        loss_from: この添字以降のトークンを本来の重みで学習する (それより前はプロンプト部)。"""
         if len(ids) < 3:
             return
-        item = (ids, float(weight))
+        item = (ids, float(weight), int(loss_from))
         if len(self.items) < self.capacity:
             self.items.append(item)
         else:
@@ -497,35 +507,48 @@ class SequencePool:
             self.pos = (self.pos + 1) % self.capacity
         self.total_tokens += len(ids)
 
+    @classmethod
+    def token_weights(cls, length: int, loss_from: int, weight: float = 1.0):
+        """系列 (長さ length) の各「予測対象」の重み: 対象 j は ids[j+1] なので j+1 < loss_from をプロンプト扱い。"""
+        tw = np.full(length, abs(weight), dtype=np.float32)
+        k = min(max(loss_from - 1, 0), length)
+        if k:
+            tw[:k] *= cls.PROMPT_WEIGHT
+        return tw
+
     def batch(self, B: int, T: int):
-        """(x, y, weights)。正例は複数系列を詰めて作り、負例は単独の系列 (pad) にする。"""
+        """(x, y, weights)。weights は (B, T) のトークンごとの重み。正例は複数系列を詰めて作り、負例は単独の系列 (pad) にする。"""
         x = np.full((B, T), PAD, dtype=np.int64)
         y = np.full((B, T), PAD, dtype=np.int64)
-        w = np.ones(B, dtype=np.float32)
+        w = np.ones((B, T), dtype=np.float32)
         n = len(self.items)
         for b in range(B):
-            seq, wt = self.items[int(self.rng.integers(n))]
+            seq, wt, lf = self.items[int(self.rng.integers(n))]
             if wt < 0:
                 seq = seq[: T + 1]
                 L = len(seq) - 1
                 x[b, :L] = seq[:L]
                 y[b, :L] = seq[1 : L + 1]
-                w[b] = wt
+                w[b, :L] = -self.token_weights(L, lf, wt)
                 continue
             buf: list[int] = []
+            tw: list = []
             while len(buf) < T + 1:
                 if len(seq) > T + 1:
                     s_ = int(self.rng.integers(len(seq) - T))
                     seq = seq[s_ : s_ + T + 1]
+                    lf = max(0, lf - s_)
                 buf.extend(seq)
+                tw.append(self.token_weights(len(seq) - 1, lf, max(wt, 0.1)))
+                tw.append(np.array([max(wt, 0.1)], dtype=np.float32))  # 系列末 <eos> から次系列先頭への予測
                 if len(buf) < T + 1:
-                    seq, wt2 = self.items[int(self.rng.integers(n))]
-                    while wt2 < 0:
-                        seq, wt2 = self.items[int(self.rng.integers(n))]
+                    seq, wt, lf = self.items[int(self.rng.integers(n))]
+                    while wt < 0:
+                        seq, wt, lf = self.items[int(self.rng.integers(n))]
             buf = buf[: T + 1]
             x[b] = buf[:-1]
             y[b] = buf[1:]
-            w[b] = max(wt, 0.1)
+            w[b] = np.concatenate(tw)[:T]
         return x, y, w
 
     def __len__(self) -> int:

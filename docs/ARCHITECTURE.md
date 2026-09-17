@@ -132,6 +132,23 @@ Evolver (1 スレッド)
 | OS | RLIMIT_DATA = 上限 + max(96MB, 上限/2) |
 | 選択的学習 | 充填率 60% 超で低品質文を取り込まない (`admission`) |
 
+## ブラウザ版 (web/)
+
+```
+tinyai export ──> model.bin (int8, 行スケール) + meta.json + vocab.json + kb.json + test.json
+                       │
+web/index.html ── fetch ──> worker.js ── importScripts ──> engine.js
+   (UI: 会話 / 思考 / 進化)        (別スレッド)            Tokenizer / Model / Retriever / Engine
+```
+
+* `engine.js` は `tinyai/neural.py` の順伝播・逆伝播・AdamW・KV キャッシュ生成をそのまま移植したもの (Float32Array、依存なし)。
+  `web/validate.js` が `test.json` の numpy 計算値 (logits 上位・損失・勾配ノルム) と突き合わせる
+* 応答: 文字 2-gram の BM25 で知識文を引き、`<ctx>` に入れて候補を複数生成、平均対数確率 + 長さ + 文脈との重なりで選ぶ。
+  生成中に各トークンの上位 5 候補と確率、最終層の注意 (プロンプトのどこを見たか) を記録し UI に渡す
+* リアルタイム学習: ターンごとに `<ctx>…<usr>…<bot>…<eos>` 系列で 1 ステップ更新 (応答部の重み 1.0、プロンプト部 0.2)、
+  再生バッファから 1 本混ぜて忘却を防ぐ。👍 は重み 3、👎 は unlikelihood。復号パラメータは 👍 率で山登り、語彙は会話に頻出する新しい単位で拡張
+* 学習後の重み (float32 約 12MB) と統計は IndexedDB に保存し、次回起動時に復元する。サーバーには何も送らない
+
 ## 拡張点
 
 * **ソースの追加**: `Collector._ordered_sources` に `(名前, fn(topic, n) -> [(url, text, anchors)])` を足すだけ。健全性は自動で記録される。

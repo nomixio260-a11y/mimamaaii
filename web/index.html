@@ -1,0 +1,455 @@
+<title>TinyAI 進化ラボ</title>
+<meta name="description" content="ブラウザの中で動き、会話するたびに重みを更新して進化する小さな Transformer 言語モデル。思考の過程と進化の数値を可視化する。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root {
+  --bg: #eef1f4; --surface: #ffffff; --surface2: #f6f8fa; --line: #d5dbe2; --line2: #e6eaee;
+  --ink: #1b2430; --ink2: #4b5563; --ink3: #7c8794;
+  --accent: #0f8b78; --accent-ink: #ffffff; --accent-soft: #d6efe9;
+  --heat: #d98a1a; --heat-soft: #fbe9cc; --bad: #c0392b; --bad-soft: #f8dcd8;
+  --user: #e3ecf3; --bot: #ffffff;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: "Zen Kaku Gothic New", "Hiragino Sans", "Noto Sans JP", "Yu Gothic", system-ui, sans-serif;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #10161d; --surface: #182029; --surface2: #1f2932; --line: #2c3742; --line2: #24303a;
+    --ink: #e6ebf0; --ink2: #aab4bf; --ink3: #7b8794;
+    --accent: #2fbfa6; --accent-ink: #08211c; --accent-soft: #143a34;
+    --heat: #f0a83c; --heat-soft: #3d2d12; --bad: #e46a5c; --bad-soft: #402320;
+    --user: #223140; --bot: #182029;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #10161d; --surface: #182029; --surface2: #1f2932; --line: #2c3742; --line2: #24303a;
+  --ink: #e6ebf0; --ink2: #aab4bf; --ink3: #7b8794;
+  --accent: #2fbfa6; --accent-ink: #08211c; --accent-soft: #143a34;
+  --heat: #f0a83c; --heat-soft: #3d2d12; --bad: #e46a5c; --bad-soft: #402320;
+  --user: #223140; --bot: #182029;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 14px; line-height: 1.6; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-block: 12px 32px; padding-inline: 16px; display: flex; flex-direction: column; gap: 12px; }
+header.top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; }
+header.top h1 { font-size: 20px; margin: 0; font-weight: 700; letter-spacing: .01em; }
+header.top .sub { color: var(--ink2); font-size: 13px; }
+header.top .status { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--ink2); display: flex; align-items: center; gap: 8px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink3); display: inline-block; }
+.dot.on { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.dot.busy { background: var(--heat); box-shadow: 0 0 0 3px var(--heat-soft); }
+
+/* 進化ストリップ */
+.evo { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px 14px; }
+.metric { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.metric .k { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink3); }
+.metric .v { font-family: var(--mono); font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.metric .s { font-size: 11px; color: var(--ink2); }
+.metric .v.small { font-size: 14px; }
+.evo .chart { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.chartbox { border-top: 1px solid var(--line2); padding-top: 8px; min-width: 0; }
+.chartbox h3 { margin: 0 0 4px; font-size: 12px; color: var(--ink2); font-weight: 500; display: flex; justify-content: space-between; }
+.chartbox h3 span { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+canvas { display: block; width: 100%; max-width: 100%; }
+.levelbar { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink2); }
+.levelbar .bar { flex: 1; height: 8px; border-radius: 4px; background: var(--surface2); border: 1px solid var(--line2); overflow: hidden; }
+.levelbar .bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--heat)); width: 0; transition: width .6s; }
+.levelbar b { font-family: var(--mono); color: var(--ink); }
+
+/* 本体 2 カラム */
+.main { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 12px; align-items: start; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); display: flex; flex-direction: column; min-width: 0; }
+.panel > h2 { margin: 0; padding: 10px 14px; font-size: 13px; font-weight: 700; border-bottom: 1px solid var(--line2); display: flex; align-items: center; gap: 8px; }
+.panel > h2 .hint { font-weight: 400; color: var(--ink3); font-size: 12px; margin-left: auto; }
+
+/* チャット */
+.chat { height: min(70vh, 640px); }
+.log { flex: 1; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.msg { max-width: 92%; padding: 8px 12px; border-radius: 12px; border: 1px solid var(--line2); white-space: pre-wrap; word-break: break-word; }
+.msg.user { align-self: flex-end; background: var(--user); border-bottom-right-radius: 4px; }
+.msg.bot { align-self: flex-start; background: var(--bot); border-bottom-left-radius: 4px; }
+.msg.sys { align-self: center; background: transparent; border: 0; color: var(--ink3); font-size: 12px; padding: 0; }
+.msg .meta { display: flex; gap: 6px; align-items: center; margin-top: 6px; font-size: 11px; color: var(--ink3); font-family: var(--mono); }
+.msg .meta button { font: inherit; font-size: 12px; background: var(--surface2); border: 1px solid var(--line); border-radius: 6px; padding: 1px 7px; cursor: pointer; color: var(--ink); }
+.msg .meta button:hover { border-color: var(--accent); }
+.msg .meta button.done { background: var(--accent-soft); border-color: var(--accent); }
+.msg .meta button.done.bad { background: var(--bad-soft); border-color: var(--bad); }
+.msg .meta .learned { color: var(--accent); }
+.inputrow { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--line2); }
+.inputrow input { flex: 1; min-width: 0; font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface2); color: var(--ink); }
+.inputrow input:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.btn { font: inherit; font-weight: 500; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink); cursor: pointer; }
+.btn[disabled] { opacity: .5; cursor: default; }
+.btn.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+.tools { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 10px; font-size: 12px; color: var(--ink3); align-items: center; }
+.tools button { font: inherit; font-size: 12px; background: var(--surface2); border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; cursor: pointer; color: var(--ink2); }
+
+/* 思考パネル */
+.think { gap: 0; }
+.sec { padding: 10px 14px; border-bottom: 1px solid var(--line2); }
+.sec:last-child { border-bottom: 0; }
+.sec h3 { margin: 0 0 6px; font-size: 12px; font-weight: 700; color: var(--ink2); display: flex; gap: 8px; align-items: baseline; }
+.sec h3 .n { font-family: var(--mono); font-weight: 400; color: var(--ink3); }
+.hit { display: grid; grid-template-columns: 44px 1fr; gap: 8px; align-items: start; font-size: 12.5px; margin: 3px 0; }
+.hit .bar { height: 6px; margin-top: 7px; border-radius: 3px; background: var(--surface2); border: 1px solid var(--line2); overflow: hidden; }
+.hit .bar i { display: block; height: 100%; background: var(--accent); }
+.tokens { display: flex; flex-wrap: wrap; gap: 3px; font-family: var(--mono); font-size: 12px; line-height: 1.4; }
+.tk { padding: 1px 4px; border-radius: 4px; background: var(--surface2); border: 1px solid var(--line2); }
+.tk.sp { color: var(--ink3); font-size: 10px; }
+.tk.gen { cursor: pointer; }
+.tk.gen.sel { outline: 2px solid var(--accent); }
+.cand { display: grid; grid-template-columns: 1fr auto; gap: 8px; font-size: 12.5px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line2); margin: 4px 0; }
+.cand.best { border-color: var(--accent); background: var(--accent-soft); }
+.cand .sc { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--ink2); white-space: nowrap; }
+.alts { margin-top: 6px; font-family: var(--mono); font-size: 12px; display: grid; grid-template-columns: auto 1fr auto; gap: 2px 8px; align-items: center; }
+.alts .bar { height: 8px; background: var(--surface2); border: 1px solid var(--line2); border-radius: 4px; overflow: hidden; }
+.alts .bar i { display: block; height: 100%; background: var(--heat); }
+.legend { font-size: 11px; color: var(--ink3); display: flex; gap: 10px; margin-top: 4px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; margin-right: 3px; }
+.empty { color: var(--ink3); font-size: 12.5px; }
+.events { list-style: none; margin: 0; padding: 0; font-size: 12px; max-height: 120px; overflow-y: auto; font-family: var(--mono); color: var(--ink2); }
+.events li { padding: 1px 0; border-bottom: 1px dashed var(--line2); }
+.loading { padding: 40px 14px; text-align: center; color: var(--ink2); }
+.loading .bar { height: 6px; background: var(--surface2); border: 1px solid var(--line2); border-radius: 3px; overflow: hidden; max-width: 320px; margin: 10px auto; }
+.loading .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+details.about { font-size: 12.5px; color: var(--ink2); }
+details.about summary { cursor: pointer; color: var(--ink2); }
+details.about p { margin: 6px 0; }
+@media (max-width: 860px) {
+  .main { grid-template-columns: 1fr; }
+  .evo .chart { grid-template-columns: 1fr; }
+  .chat { height: min(60vh, 520px); }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <h1>TinyAI 進化ラボ</h1>
+    <span class="sub">ブラウザの中で動き、会話するたびに重みが更新される小さな Transformer</span>
+    <span class="status"><i class="dot" id="dot"></i><span id="statusText">読み込み中</span></span>
+  </header>
+
+  <section class="evo" id="evo" aria-label="進化の状態">
+    <div class="metric"><span class="k">パラメータ</span><span class="v" id="mParams">–</span><span class="s" id="mArch">–</span></div>
+    <div class="metric"><span class="k">層 / 語彙</span><span class="v" id="mLayers">–</span><span class="s" id="mVocabAdded">–</span></div>
+    <div class="metric"><span class="k">事前学習</span><span class="v" id="mPre">–</span><span class="s" id="mPreTok">–</span></div>
+    <div class="metric"><span class="k">取り置き PPL</span><span class="v" id="mPpl">–</span><span class="s">低いほど文を予測できる</span></div>
+    <div class="metric"><span class="k">あなたとの学習</span><span class="v" id="mOnline">–</span><span class="s" id="mOnlineTok">–</span></div>
+    <div class="metric"><span class="k">直近の損失</span><span class="v" id="mLoss">–</span><span class="s" id="mLossTrend">–</span></div>
+    <div class="metric"><span class="k">知識文</span><span class="v" id="mDocs">–</span><span class="s" id="mReplay">–</span></div>
+    <div class="metric"><span class="k">評価 👍 / 👎</span><span class="v" id="mFb">–</span><span class="s" id="mDecode">–</span></div>
+    <div class="levelbar"><span>進化度</span><div class="bar"><i id="levelFill"></i></div><b id="levelText">Lv 0</b></div>
+    <div class="chart">
+      <div class="chartbox"><h3>事前学習の損失 (サーバー側, 直近)<span id="preLossLast"></span></h3><canvas id="preChart" height="90"></canvas></div>
+      <div class="chartbox"><h3>あなたとの学習の損失 (この端末)<span id="onLossLast"></span></h3><canvas id="onChart" height="90"></canvas></div>
+    </div>
+  </section>
+
+  <div class="main">
+    <section class="panel chat" aria-label="会話">
+      <h2>会話 <span class="hint">「覚えて: 文」で知識を教えられます</span></h2>
+      <div class="log" id="log">
+        <div class="loading" id="loading">モデルを読み込んでいます<div class="bar"><i id="loadBar"></i></div><span id="loadText">…</span></div>
+      </div>
+      <div class="tools">
+        <span>例:</span>
+        <button type="button" data-q="こんにちは">こんにちは</button>
+        <button type="button" data-q="人工知能とは？">人工知能とは？</button>
+        <button type="button" data-q="宇宙について教えて">宇宙について教えて</button>
+        <button type="button" data-q="覚えて: 私の好きな色は青です">覚えて: 私の好きな色は青です</button>
+        <button type="button" id="resetBtn" title="この端末での学習内容を消して配布時の重みに戻す">学習をリセット</button>
+      </div>
+      <form class="inputrow" id="form">
+        <input id="input" type="text" placeholder="話しかける…" autocomplete="off" disabled>
+        <button class="btn" id="send" type="submit" disabled>送る</button>
+      </form>
+    </section>
+
+    <section class="panel think" aria-label="思考">
+      <h2>いま何を考えたか <span class="hint" id="thinkTime"></span></h2>
+      <div class="sec"><h3>1. 思い出した知識 <span class="n" id="hitN"></span></h3><div id="hits" class="empty">まだ会話がありません。</div></div>
+      <div class="sec"><h3>2. 読んだプロンプト <span class="n">色の濃さ = 応答生成中に注意を向けた強さ (最終層平均)</span></h3><div id="prompt" class="tokens empty">–</div></div>
+      <div class="sec"><h3>3. 考えた候補 <span class="n">平均対数確率 + 長さ・文脈との重なり</span></h3><div id="cands" class="empty">–</div></div>
+      <div class="sec"><h3>4. 一語ごとの確信度 <span class="n">クリックで他の候補を表示</span></h3><div id="gen" class="tokens empty">–</div><div id="alts"></div>
+        <div class="legend"><span><i style="background:var(--accent)"></i>確率が高い</span><span><i style="background:var(--heat)"></i>迷った</span></div></div>
+      <div class="sec"><h3>5. 注意の地図 <span class="n">縦 = 生成した語、横 = プロンプトの語</span></h3><canvas id="attn" height="120"></canvas></div>
+      <div class="sec"><h3>6. 進化の記録</h3><ul class="events" id="events"></ul></div>
+    </section>
+  </div>
+
+  <details class="about">
+    <summary>このページの仕組み</summary>
+    <p>モデルは LLaMA 系のデコーダ専用 Transformer (RMSNorm・RoPE・SwiGLU・埋め込み共有) で、サーバー側で日本語 Wikipedia・青空文庫・会話データから学習した重みを int8 に量子化して配布しています。ブラウザは重みを float32 に戻し、順伝播だけでなく手書きの逆伝播と AdamW で、あなたとの会話 1 ターンごとに重みを更新します (👍 は重み 3 の正例、👎 はその答えを出しにくくする unlikelihood 学習)。学習内容はこの端末のブラウザにだけ保存されます。</p>
+    <p>応答は「思い出した知識」を文脈として与える RAG 形式で生成します。候補を複数生成し、平均対数確率で選びます。復号パラメータ (温度・top-p・繰り返しペナルティ) は 👍/👎 の割合で山登りし、新しい語の連続が増えると語彙も拡張されます。</p>
+  </details>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const fmt = (n) => (n === null || n === undefined) ? '–' : Number(n).toLocaleString('ja-JP');
+  const state = { meta: null, summary: null, worker: null, engine: null, last: null, busy: false, events: [], saveTimer: null, dbOk: true };
+
+  // ---------------------------------------------------------- Worker / エンジン呼び出し
+  let seq = 0; const pending = new Map();
+  function call(msg, transfer) {
+    if (state.worker) {
+      return new Promise((resolve, reject) => { const id = ++seq; pending.set(id, { resolve, reject }); state.worker.postMessage(Object.assign({ id }, msg), transfer || []); });
+    }
+    // フォールバック: メインスレッドで実行 (UI は一時的に止まる)
+    return new Promise((resolve, reject) => setTimeout(() => { try { resolve(handleLocal(msg)); } catch (e) { reject(e); } }, 0));
+  }
+  function handleLocal(msg) {
+    const E = state.engine;
+    if (msg.op === 'init') { state.engine = new TinyAI.Engine(msg.meta, msg.bin, msg.vocab, msg.kb); let restored = false; if (msg.snapshot) { try { restored = state.engine.restore(msg.snapshot); } catch (e) {} } return { restored, summary: state.engine.summary(), tokens: restored ? state.engine.tok.tokens.slice(8) : null }; }
+    if (msg.op === 'reply') return E.reply(msg.text, msg.opts);
+    if (msg.op === 'learnTurn') return { result: E.learnTurn(msg.user, msg.bot, msg.context, msg.weight, msg.steps), summary: E.summary() };
+    if (msg.op === 'learnText') return { result: E.learnText(msg.text, msg.weight), summary: E.summary() };
+    if (msg.op === 'feedback') return { result: E.feedback(msg.positive), summary: E.summary() };
+    if (msg.op === 'evolveVocab') { const added = E.evolveVocab(msg.texts); return { added, summary: E.summary(), tokens: added ? E.tok.tokens.slice(8) : null }; }
+    if (msg.op === 'snapshot') return E.snapshot();
+    if (msg.op === 'summary') return E.summary();
+  }
+  function startWorker() {
+    try {
+      const w = new Worker('worker.js');
+      w.onmessage = (ev) => { const p = pending.get(ev.data.id); if (!p) return; pending.delete(ev.data.id); ev.data.ok ? p.resolve(ev.data.result) : p.reject(new Error(ev.data.error)); };
+      w.onerror = (e) => { console.warn('worker error', e.message); };
+      state.worker = w;
+    } catch (e) { state.worker = null; }
+  }
+  function loadScript(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); }
+
+  // ---------------------------------------------------------- 保存 (IndexedDB, この端末だけ)
+  function openDb() {
+    return new Promise((resolve, reject) => {
+      try {
+        const req = indexedDB.open('tinyai-lab', 1);
+        req.onupgradeneeded = () => { req.result.createObjectStore('state'); };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      } catch (e) { reject(e); }
+    });
+  }
+  async function dbGet(key) { try { const db = await openDb(); return await new Promise((res, rej) => { const r = db.transaction('state').objectStore('state').get(key); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); } catch (e) { state.dbOk = false; return undefined; } }
+  async function dbPut(key, val) { try { const db = await openDb(); await new Promise((res, rej) => { const tx = db.transaction('state', 'readwrite'); tx.objectStore('state').put(val, key); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); return true; } catch (e) { state.dbOk = false; return false; } }
+  async function dbDel(key) { try { const db = await openDb(); await new Promise((res, rej) => { const tx = db.transaction('state', 'readwrite'); tx.objectStore('state').delete(key); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); } catch (e) {} }
+  function scheduleSave() {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = setTimeout(async () => {
+      const snap = await call({ op: 'snapshot' });
+      snap.events = state.events.slice(-100);
+      const ok = await dbPut('snapshot', snap);
+      setStatus(ok ? '学習内容を保存しました' : '保存できません (この端末の保存領域が使えません)', 'on');
+    }, 1500);
+  }
+
+  // ---------------------------------------------------------- 表示
+  function setStatus(text, cls) { $('statusText').textContent = text; $('dot').className = 'dot ' + (cls || ''); }
+  function addMsg(role, text) {
+    const el = document.createElement('div'); el.className = 'msg ' + role; el.textContent = text;
+    $('log').appendChild(el); $('log').scrollTop = $('log').scrollHeight; return el;
+  }
+  function addEvent(text) {
+    const t = new Date(); const ts = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
+    state.events.push(`${ts} ${text}`); if (state.events.length > 200) state.events.shift();
+    renderEvents();
+  }
+  function renderEvents() { const ul = $('events'); ul.innerHTML = ''; for (const e of state.events.slice().reverse().slice(0, 40)) { const li = document.createElement('li'); li.textContent = e; ul.appendChild(li); } }
+
+  function renderSummary(s) {
+    if (!s) return; state.summary = s; const m = state.meta; const st = s.stats;
+    $('mParams').textContent = (s.params / 1e6).toFixed(2) + 'M';
+    $('mArch').textContent = `d=${s.d} ${s.heads}ヘッド 文脈${s.ctx} FF${s.ff}`;
+    $('mLayers').textContent = `${s.layers} / ${fmt(s.vocab)}`;
+    $('mVocabAdded').textContent = `語彙追加 +${fmt((m.vocab_added || 0) + (st.vocabAdded || 0))} 層追加 +${fmt(m.grown_layers || 0)}`;
+    $('mPre').textContent = fmt(s.pretrainStep) + ' step';
+    $('mPreTok').textContent = `${((m.trained_tokens || 0) / 1e6).toFixed(1)}M トークン`;
+    $('mPpl').textContent = m.holdout_ppl ? Number(m.holdout_ppl).toFixed(2) : '–';
+    $('mOnline').textContent = fmt(st.onlineSteps) + ' step';
+    $('mOnlineTok').textContent = `${fmt(st.onlineTokens)} トークン / ${fmt(st.turns)} ターン`;
+    const lh = st.lossHist || [];
+    $('mLoss').textContent = lh.length ? lh[lh.length - 1].toFixed(3) : (m.last_loss ? Number(m.last_loss).toFixed(3) : '–');
+    if (lh.length >= 6) { const a = avg(lh.slice(-3)), b = avg(lh.slice(-6, -3)); $('mLossTrend').textContent = a < b ? `↓ 下がっている (${(b - a).toFixed(3)})` : `↑ 上がっている (${(a - b).toFixed(3)})`; } else $('mLossTrend').textContent = lh.length ? '学習中' : '事前学習の最終値';
+    $('mDocs').textContent = fmt(s.docs);
+    $('mReplay').textContent = `覚えた文 +${fmt(st.learnedDocs)} 再生 ${fmt(s.replay)} 会話`;
+    $('mFb').textContent = `${fmt(st.good)} / ${fmt(st.bad)}`;
+    $('mDecode').textContent = `温度 ${s.decode.temperature} top-p ${s.decode.top_p} 反復 ${s.decode.repetition_penalty}`;
+    // 進化度: 事前学習ステップ・オンライン学習・評価・語彙拡張から作る連続値 (対数)
+    const score = Math.log10(1 + s.pretrainStep) * 20 + Math.log10(1 + st.onlineSteps * 10) * 15 + Math.log10(1 + (st.good + st.learnedDocs) * 5) * 10 + (m.grown_layers || 0) * 5 + Math.log10(1 + st.vocabAdded) * 5;
+    const lvl = Math.floor(score / 10);
+    $('levelText').textContent = `Lv ${lvl} (${score.toFixed(1)})`;
+    $('levelFill').style.width = Math.min(100, (score % 10) * 10) + '%';
+    drawLoss($('onChart'), lh, getCss('--accent'));
+    $('onLossLast').textContent = lh.length ? `最新 ${lh[lh.length - 1].toFixed(3)} / 最小 ${Math.min.apply(null, lh).toFixed(3)}` : '';
+  }
+  function avg(a) { return a.reduce((x, y) => x + y, 0) / Math.max(a.length, 1); }
+  function getCss(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  function drawLoss(cv, data, color) {
+    const dpr = window.devicePixelRatio || 1; const W = cv.clientWidth || 300, H = cv.clientHeight || 90;
+    cv.width = W * dpr; cv.height = H * dpr; const c = cv.getContext('2d'); c.scale(dpr, dpr); c.clearRect(0, 0, W, H);
+    c.font = '10px ' + getCss('--mono'); c.fillStyle = getCss('--ink3'); c.strokeStyle = getCss('--line2');
+    if (!data || data.length < 2) { c.fillText('データがまだありません', 6, H / 2); return; }
+    const pad = { l: 34, r: 6, t: 6, b: 14 }; const lo = Math.min.apply(null, data), hi = Math.max.apply(null, data); const span = (hi - lo) || 1;
+    const x = (i) => pad.l + (i / (data.length - 1)) * (W - pad.l - pad.r), y = (v) => pad.t + (1 - (v - lo) / span) * (H - pad.t - pad.b);
+    for (const v of [lo, (lo + hi) / 2, hi]) { c.beginPath(); c.moveTo(pad.l, y(v)); c.lineTo(W - pad.r, y(v)); c.stroke(); c.fillText(v.toFixed(2), 2, y(v) + 3); }
+    c.fillText('古い', pad.l, H - 3); c.fillText('新しい', W - pad.r - 30, H - 3);
+    c.strokeStyle = color; c.lineWidth = 1.6; c.beginPath();
+    data.forEach((v, i) => { i ? c.lineTo(x(i), y(v)) : c.moveTo(x(i), y(v)); }); c.stroke();
+    c.fillStyle = color; c.beginPath(); c.arc(x(data.length - 1), y(data[data.length - 1]), 2.5, 0, Math.PI * 2); c.fill();
+  }
+
+  function renderThinking(r) {
+    state.last = r;
+    $('thinkTime').textContent = `${r.ms} ms で ${r.candidates.length} 候補`;
+    $('hitN').textContent = `${r.hits.length} 件`;
+    const hits = $('hits'); hits.innerHTML = ''; hits.className = r.hits.length ? '' : 'empty';
+    if (!r.hits.length) hits.textContent = '関連する知識は見つからず、モデルの記憶だけで答えました。';
+    for (const h of r.hits) { const el = document.createElement('div'); el.className = 'hit'; el.innerHTML = `<div class="bar"><i style="width:${Math.round(h.rel * 100)}%"></i></div><div></div>`; el.lastChild.textContent = `${h.text} (BM25 ${h.score.toFixed(1)})`; hits.appendChild(el); }
+    // プロンプト: 注意の平均で着色
+    const best = r.best; const P = $('prompt'); P.innerHTML = ''; P.className = 'tokens';
+    const att = best.attention && best.attention.length ? best.attention : null;
+    const mean = new Array(r.promptPieces.length).fill(0);
+    if (att) { for (const row of att) row.forEach((v, i) => { mean[i] += v / att.length; }); }
+    const mx = Math.max.apply(null, mean) || 1;
+    r.promptPieces.forEach((pc, i) => { const s = document.createElement('span'); s.className = 'tk' + (pc.startsWith('<') ? ' sp' : ''); s.textContent = pc; if (att) { const a = mean[i] / mx; s.style.background = `color-mix(in srgb, var(--heat) ${Math.round(a * 85)}%, var(--surface2))`; s.title = `注意 ${(mean[i] * 100).toFixed(1)}%`; } P.appendChild(s); });
+    // 候補
+    const C = $('cands'); C.innerHTML = ''; C.className = '';
+    r.candidates.forEach((c) => { const el = document.createElement('div'); el.className = 'cand' + (c === best ? ' best' : ''); el.innerHTML = '<div></div><div class="sc"></div>'; el.firstChild.textContent = c.text || '(空)'; el.lastChild.textContent = `${c.score.toFixed(2)} (logp ${c.meanLogp.toFixed(2)}, ${c.tokens.length}語)`; C.appendChild(el); });
+    // 一語ごとの確信度
+    const G = $('gen'); G.innerHTML = ''; G.className = 'tokens'; $('alts').innerHTML = '';
+    best.trace.forEach((t, i) => { const s = document.createElement('span'); s.className = 'tk gen'; s.textContent = pieceOf(t.token); const p = t.p; s.style.background = `color-mix(in srgb, ${p > 0.5 ? 'var(--accent)' : 'var(--heat)'} ${Math.round((p > 0.5 ? (p - 0.5) * 2 : (1 - p * 2)) * 70 + 10)}%, var(--surface2))`; s.title = `p=${(p * 100).toFixed(1)}%`; s.addEventListener('click', () => showAlts(i)); G.appendChild(s); });
+    if (best.trace.length) showAlts(0);
+    drawAttention(best, r.promptPieces);
+  }
+  const SPECIALS = ['<pad>', '<unk>', '<bos>', '<eos>', '<usr>', '<bot>', '<ctx>', '<sep>'];
+  function pieceOf(id) { const t = state.vocab; if (id < 8) return SPECIALS[id]; const s = t[id - 8]; return s === '▁' ? '␣' : (s === undefined ? '#' + id : s); }
+  function showAlts(i) {
+    const best = state.last.best; const t = best.trace[i]; if (!t) return;
+    Array.from($('gen').children).forEach((el, j) => el.classList.toggle('sel', j === i));
+    const A = $('alts'); A.innerHTML = ''; A.className = 'alts';
+    for (const [id, p] of t.top) { const a = document.createElement('span'); a.textContent = pieceOf(id) + (id === t.token ? ' ←' : ''); const b = document.createElement('div'); b.className = 'bar'; b.innerHTML = `<i style="width:${Math.round(p * 100)}%"></i>`; const v = document.createElement('span'); v.textContent = (p * 100).toFixed(1) + '%'; A.append(a, b, v); }
+  }
+  function drawAttention(best, pieces) {
+    const cv = $('attn'); const rows = best.attention || []; const cols = pieces.length;
+    const dpr = window.devicePixelRatio || 1; const W = cv.clientWidth || 300; const cell = Math.max(4, Math.min(22, Math.floor((W - 60) / Math.max(cols, 1)))); const H = Math.max(40, rows.length * cell + 24);
+    cv.style.height = H + 'px'; cv.width = W * dpr; cv.height = H * dpr; const c = cv.getContext('2d'); c.scale(dpr, dpr); c.clearRect(0, 0, W, H);
+    c.font = '9px ' + getCss('--mono'); c.fillStyle = getCss('--ink3');
+    if (!rows.length) { c.fillText('生成した語がありません', 6, 20); return; }
+    const heat = getCss('--heat'); const left = 56;
+    rows.forEach((row, r) => {
+      const mx = Math.max.apply(null, row) || 1;
+      c.fillStyle = getCss('--ink3'); c.fillText(pieceOf(best.trace[r].token).slice(0, 5), 2, r * cell + cell - 1);
+      row.forEach((v, j) => { c.fillStyle = `color-mix(in srgb, ${heat} ${Math.round((v / mx) * 100)}%, ${getCss('--surface2')})`; c.fillRect(left + j * cell, r * cell, cell - 1, cell - 1); });
+    });
+    c.fillStyle = getCss('--ink3'); c.fillText('← プロンプトの語 (左が先頭)', left, rows.length * cell + 14);
+  }
+
+  // ---------------------------------------------------------- 会話
+  async function send(text) {
+    text = (text || '').trim(); if (!text || state.busy) return;
+    state.busy = true; $('send').disabled = true; $('input').value = '';
+    addMsg('user', text);
+    const teach = text.match(/^(覚えて|おぼえて|教える|remember)[:：]\s*(.+)$/);
+    try {
+      if (teach) {
+        setStatus('覚えています…', 'busy');
+        const r = await call({ op: 'learnText', text: teach[2], weight: 2 });
+        const m = addMsg('bot', `覚えました: 「${teach[2]}」`);
+        addMeta(m, `loss ${r.result ? r.result.loss.toFixed(3) : '–'}`); renderSummary(r.summary); addEvent(`知識を学習 loss ${r.result ? r.result.loss.toFixed(3) : '–'}`); scheduleSave();
+      } else {
+        setStatus('考えています…', 'busy');
+        const r = await call({ op: 'reply', text, opts: { candidates: 3, maxNew: 48 } });
+        renderThinking(r);
+        const m = addMsg('bot', r.text || '…');
+        setStatus('学習しています…', 'busy');
+        const l = await call({ op: 'learnTurn', user: text, bot: r.text, context: r.context, weight: 1, steps: 1 });
+        addMeta(m, `${r.ms} ms · 学習 loss ${l.result ? l.result.loss.toFixed(3) : '–'}`, { user: text, bot: r.text, context: r.context });
+        renderSummary(l.summary); addEvent(`会話を学習 loss ${l.result ? l.result.loss.toFixed(3) : '–'} (${l.result ? l.result.tokens : 0} トークン)`);
+        maybeEvolve(); scheduleSave();
+      }
+      setStatus('準備完了', 'on');
+    } catch (e) { addMsg('sys', 'エラー: ' + e.message); setStatus('エラー', ''); }
+    state.busy = false; $('send').disabled = false; $('input').focus();
+  }
+  function addMeta(msgEl, text, turn) {
+    const meta = document.createElement('div'); meta.className = 'meta'; const s = document.createElement('span'); s.textContent = text; meta.appendChild(s);
+    if (turn) {
+      const up = document.createElement('button'); up.type = 'button'; up.textContent = '👍'; up.title = 'よい答え: 重み 3 で学習';
+      const dn = document.createElement('button'); dn.type = 'button'; dn.textContent = '👎'; dn.title = 'よくない答え: 出しにくくする (unlikelihood)';
+      const done = (good) => { up.disabled = dn.disabled = true; (good ? up : dn).classList.add('done'); if (!good) dn.classList.add('bad'); };
+      up.addEventListener('click', () => { done(true); feedback(turn, true, s); });
+      dn.addEventListener('click', () => { done(false); feedback(turn, false, s); });
+      meta.append(up, dn);
+    }
+    msgEl.appendChild(meta);
+  }
+  async function feedback(turn, good, label) {
+    if (state.busy) { setTimeout(() => feedback(turn, good, label), 300); return; }
+    state.busy = true; setStatus(good ? '👍 を学習しています…' : '👎 を学習しています…', 'busy');
+    try {
+      const l = await call({ op: 'learnTurn', user: turn.user, bot: turn.bot, context: turn.context, weight: good ? 3 : -1, steps: good ? 2 : 1 });
+      const f = await call({ op: 'feedback', positive: good });
+      label.textContent += good ? ` · 👍 学習 loss ${l.result.loss.toFixed(3)}` : ` · 👎 抑制 loss ${l.result.loss.toFixed(3)}`;
+      renderSummary(f.summary);
+      addEvent(good ? `👍 正例として学習 (重み 3)` : `👎 unlikelihood で抑制`);
+      if (f.result) addEvent(`復号パラメータを試行: 温度 ${f.result.decode.temperature} top-p ${f.result.decode.top_p} 反復 ${f.result.decode.repetition_penalty}`);
+      scheduleSave(); setStatus('準備完了', 'on');
+    } catch (e) { setStatus('エラー: ' + e.message, ''); }
+    state.busy = false;
+  }
+  let turnsSinceEvolve = 0;
+  async function maybeEvolve() {
+    turnsSinceEvolve += 1; if (turnsSinceEvolve < 8) return; turnsSinceEvolve = 0;
+    const texts = Array.from($('log').querySelectorAll('.msg.user, .msg.bot')).slice(-40).map((e) => e.firstChild ? e.firstChild.textContent : '');
+    const r = await call({ op: 'evolveVocab', texts });
+    if (r.added) { if (r.tokens) state.vocab = r.tokens; addEvent(`語彙を進化: +${r.added} 語 (埋め込みを拡張)`); renderSummary(r.summary); }
+  }
+
+  // ---------------------------------------------------------- 起動
+  async function fetchProgress(url, onProgress) {
+    const res = await fetch(url); if (!res.ok) throw new Error(url + ' ' + res.status);
+    const total = Number(res.headers.get('content-length')) || 0; if (!res.body || !total) return await res.arrayBuffer();
+    const reader = res.body.getReader(); const chunks = []; let got = 0;
+    for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); got += value.length; onProgress(got / total); }
+    const out = new Uint8Array(got); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; } return out.buffer;
+  }
+  async function boot() {
+    try {
+      const [meta, vocab, kb] = await Promise.all([fetch('meta.json').then((r) => r.json()), fetch('vocab.json').then((r) => r.json()), fetch('kb.json').then((r) => r.json())]);
+      state.meta = meta; state.vocab = vocab.filter((t) => SPECIALS.indexOf(t) < 0);
+      $('loadText').textContent = `重み ${(meta.bytes / 1e6).toFixed(1)} MB (int8) を取得中`;
+      const bin = await fetchProgress('model.bin', (f) => { $('loadBar').style.width = Math.round(f * 100) + '%'; });
+      $('loadText').textContent = '重みを float32 に展開しています';
+      drawLoss($('preChart'), meta.loss_hist || [], getCss('--heat'));
+      $('preLossLast').textContent = meta.loss_hist && meta.loss_hist.length ? `最終 ${meta.loss_hist[meta.loss_hist.length - 1].toFixed(3)}` : '';
+      startWorker();
+      if (!state.worker) await loadScript('engine.js');
+      const snapshot = await dbGet('snapshot');
+      const r = await call({ op: 'init', meta, bin, vocab, kb, snapshot: snapshot || null });
+      if (snapshot && snapshot.events) { state.events = snapshot.events; renderEvents(); }
+      if (r.tokens) state.vocab = r.tokens;
+      renderSummary(r.summary);
+      $('loading').remove();
+      addMsg('sys', r.restored ? `前回までの学習内容を復元しました (この端末で ${fmt(r.summary.stats.onlineSteps)} step 学習済み)` : `配布時の重みで開始 (${meta.size} / ${(meta.params / 1e6).toFixed(2)}M パラメータ, 事前学習 ${fmt(meta.step)} step)`);
+      addMsg('sys', state.worker ? '生成と学習は Worker で動きます' : '生成と学習はメインスレッドで動きます (応答中は画面が一瞬止まります)');
+      if (!r.restored) addEvent(`起動: 事前学習 ${fmt(meta.step)} step の重みを読込`); else addEvent('起動: 保存した学習内容を復元');
+      $('input').disabled = false; $('send').disabled = false; $('input').focus();
+      setStatus('準備完了', 'on');
+    } catch (e) {
+      $('loadText').textContent = '読み込みに失敗しました: ' + e.message; setStatus('エラー', '');
+    }
+  }
+  $('form').addEventListener('submit', (ev) => { ev.preventDefault(); send($('input').value); });
+  document.querySelectorAll('.tools button[data-q]').forEach((b) => b.addEventListener('click', () => { $('input').value = b.dataset.q; send(b.dataset.q); }));
+  $('resetBtn').addEventListener('click', async () => {
+    if (!confirm('この端末での学習内容をすべて消して、配布時の重みに戻します。よろしいですか？')) return;
+    await dbDel('snapshot'); location.reload();
+  });
+  window.addEventListener('resize', () => { if (state.summary) renderSummary(state.summary); if (state.last) drawAttention(state.last.best, state.last.promptPieces); if (state.meta) drawLoss($('preChart'), state.meta.loss_hist || [], getCss('--heat')); });
+  boot();
+})();
+</script>

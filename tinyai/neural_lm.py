@@ -127,6 +127,14 @@ class NeuralLM:
             seq += [CTX] + ctx_ids
         return seq + [USR] + u + [BOT] + b + [EOS]
 
+    @staticmethod
+    def loss_from(seq: list[int]) -> int:
+        """会話系列で本来の重みで学習し始める位置 (<bot> の次 = 応答の最初のトークン)。"""
+        try:
+            return seq.index(BOT) + 1
+        except ValueError:
+            return 0
+
     def prompt_dialog(self, user: str, context: str | None = None) -> list[int]:
         T = self.model.T
         ctx_ids = self.tok.encode(context, max_tokens=T // 2) if context else []
@@ -153,7 +161,7 @@ class NeuralLM:
             return
         ids = self.seq_dialog(user, bot, context)
         for _ in range(max(1, int(round(weight)))):
-            self.pool.add(ids)
+            self.pool.add(ids, loss_from=self.loss_from(ids))
 
     def add_copy_example(self, keyword: str, sentence: str, neighbors: str | None = None) -> None:
         """RAG の「文脈から抜き出す」練習: 文脈 (その文 + 周辺) を与え、キーワードについて聞かれたらその文を答える。"""
@@ -161,7 +169,8 @@ class NeuralLM:
             return
         context = f"{sentence} {neighbors}" if neighbors else sentence
         q = self.rng.choice([f"{keyword}について教えて", f"{keyword}とは？", f"{keyword}は？", f"{keyword}について"])
-        self.pool.add(self.seq_dialog(q, sentence, context))
+        ids = self.seq_dialog(q, sentence, context)
+        self.pool.add(ids, loss_from=self.loss_from(ids))
 
     def add_synthetic_qa(self, subject: str, relation: str, obj: str, answer: str, context: str) -> int:
         """事実から質問文を作り (テンプレート)、文脈付き/無しの両方で会話例にする。"""
@@ -173,9 +182,10 @@ class NeuralLM:
             qs = [f"{subject}の{relation}は？", f"{subject}の{relation}を教えて"]
         n = 0
         for q in qs[:2]:
-            self.pool.add(self.seq_dialog(q, answer, context))
-            self.pool.add(self.seq_dialog(q, answer, None))
-            n += 2
+            for ctx in (context, None):
+                ids = self.seq_dialog(q, answer, ctx)
+                self.pool.add(ids, loss_from=self.loss_from(ids))
+                n += 1
         return n
 
     # ------------------------------------------------------------ 学習
@@ -199,19 +209,21 @@ class NeuralLM:
         if self.model is None:
             return None
         ids = self.seq_dialog(user, bot, context)
-        self.pool.add(ids, weight)
+        lf = self.loss_from(ids)
+        self.pool.add(ids, weight, loss_from=lf)
         if len(self.pool) < 8:
             return None
         T = self.model.T
         B = 4
         x = neural.np.full((B, T), neural.PAD, dtype=neural.np.int64)
         y = neural.np.full((B, T), neural.PAD, dtype=neural.np.int64)
-        w = neural.np.ones(B, dtype=neural.np.float32)
+        w = neural.np.ones((B, T), dtype=neural.np.float32)
         seq = ids[: T + 1]
         L = len(seq) - 1
         x[0, :L] = seq[:L]
         y[0, :L] = seq[1 : L + 1]
-        w[0] = weight
+        tw = neural.SequencePool.token_weights(L, lf, weight)
+        w[0, :L] = tw if weight > 0 else -tw
         rx, ry, rw = self.pool.batch(B - 1, T)
         x[1:], y[1:], w[1:] = rx, ry, rw
         last = None
@@ -235,6 +247,7 @@ class NeuralLM:
             return False
         recent, before = sum(h[-10:]) / 10, sum(h[-20:-10]) / 10
         if before - recent < 0.02 and recent > 1.5:  # 改善が止まり、まだ十分に低くない
+            self.stop_parallel()  # パラメータの形が変わるので並列ワーカーは作り直す (次の train_some で再開)
             self.model.grow_layer()
             self.grown += 1
             self.loss_hist = []
@@ -249,6 +262,7 @@ class NeuralLM:
         units = self.tok.frequent_new_units(texts, top=top)
         n = self.tok.add_tokens(units)
         if n:
+            self.stop_parallel()  # 埋め込みの形が変わるので並列ワーカーは作り直す
             self.model.add_tokens(n)
             self.vocab_added += n
         return n
@@ -295,6 +309,9 @@ class NeuralLM:
                     return None
                 self.trained_tokens += steps * batch * self._parallel.workers * self.model.T
                 self.last_loss = r.get("loss")
+                self.loss_hist.append(r["loss"])
+                if len(self.loss_hist) > 200:
+                    del self.loss_hist[:100]
                 return r
         try:
             r = neural.train_steps(self.model, self.pool, steps=steps, batch=batch, lr=self.lr, total=self.total_steps)
