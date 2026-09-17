@@ -574,7 +574,9 @@ class Brain:
                 # データ側は自前の刈り込みで縮むので、モデルの成長は別枠で判断する。
                 grow_cost = self.neural.growth_bytes()
                 mem_ok = self.guard.pressure() + grow_cost / max(self.guard.soft, 1) < 0.95
-                if nl.maybe_grow(mem_ok, data_tokens=nl.corpus.tokens if nl.corpus else 0):
+                if nl.check_growth():                      # 前回の成長が裏目なら取り消す
+                    self.stats["neural_rollback"] += 1
+                elif nl.maybe_grow(mem_ok, data_tokens=nl.corpus.tokens if nl.corpus else 0):
                     self.stats["neural_grown"] += 1
                 # 語彙の進化: 学習に使っている文 (コーパス) から候補を採る。知識ベースだけを見ると
                 # 実際に学んでいる分布とずれる。1 語の追加コストは埋め込み 192 次元 × 4 系列 = 約 3 KB

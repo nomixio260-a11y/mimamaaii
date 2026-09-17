@@ -1551,6 +1551,33 @@ class GrowthTest(unittest.TestCase):
             nl.model.step = nl._last_grow_step + nl.GROW_WARMUP
             self.assertEqual(nl._effective_lr(), nl._depth_lr())           # 馴染んだら深さ補正のみに戻る
 
+    def test_bad_growth_is_rolled_back(self):
+        """成長後に大きく悪化していたら、成長前の重みに戻す。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.recent_ppl = 20.0
+            need = nl.TOKENS_PER_PARAM * nl.model.n_params()
+            layers = nl.model.L
+            self.assertTrue(nl.maybe_grow(True, data_tokens=need + 1))
+            self.assertEqual(nl.model.L, layers + 1)
+            self.assertTrue(nl._pregrow_path.exists())              # 成長前の重みを取ってある
+            nl.model.step = nl._last_grow_step + nl.GROW_COOLDOWN
+            nl.recent_ppl = 20.0 * nl.GROW_ROLLBACK_RATIO + 1       # 明らかに悪化
+            self.assertTrue(nl.check_growth())
+            self.assertEqual(nl.model.L, layers)                    # 元の層数に戻る
+
+    def test_good_growth_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.recent_ppl = 20.0
+            need = nl.TOKENS_PER_PARAM * nl.model.n_params()
+            self.assertTrue(nl.maybe_grow(True, data_tokens=need + 1))
+            layers = nl.model.L
+            nl.model.step = nl._last_grow_step + nl.GROW_COOLDOWN
+            nl.recent_ppl = 19.0                                    # 良くなっている
+            self.assertFalse(nl.check_growth())
+            self.assertEqual(nl.model.L, layers)
+
     def test_growth_has_a_cooldown(self):
         """一度成長したら、しばらくは次の成長を待つ (増やす→悪化→また増やす の悪循環を避ける)。"""
         with tempfile.TemporaryDirectory() as tmp:

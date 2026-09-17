@@ -100,6 +100,8 @@ class NeuralLM:
         self.recent_ppl: float | None = None
         self.recent_hist: list[float] = []           # 入れ替わる取り置き ppl の推移 (成長の判断に使う)
         self._last_grow_step = 0                     # 直近で成長したステップ (連続した成長を避ける)
+        self._pregrow_ppl: float | None = None       # 成長直前の ppl (成長が裏目に出ていないかの判定用)
+        self._pregrow_path = self.data_dir / "neural.pregrow.npz"
         self._last_save = 0.0
         self.batch = neural.PRESETS[self.size]["batch"] if self.available else 8
         self.lr = neural.PRESETS[self.size]["lr"] if self.available else 5e-4
@@ -431,6 +433,12 @@ class NeuralLM:
                 data_rich = worse > 1.0
             if plateau or data_rich:
                 self.stop_parallel()  # パラメータの形が変わるので並列ワーカーは作り直す (次の train_some で再開)
+                try:
+                    # 成長は元に戻せない操作なので、直前の重みを取っておく。
+                    # 成長が裏目に出た時 (実測: 3 層追加で対話 ppl 75 → 118) に戻せるようにする。
+                    self.model.save(self._pregrow_path, self.tok, meta={"step": self.model.step, "ppl": self.recent_ppl})
+                except Exception as e:
+                    log.warning("成長前の重みの保存に失敗: %s", e)
                 if self.model.L < max_layers:
                     self.model.grow_layer()
                     log.info("ニューラル LM: 層を追加 -> %d 層 (%d params)", self.model.L, self.model.n_params())
@@ -440,6 +448,7 @@ class NeuralLM:
                     log.info("ニューラル LM: 中間次元を拡張 -> ff=%d (%d params)", self.model.ff, self.model.n_params())
                 self.grown += 1
                 self._last_grow_step = self.model.step
+                self._pregrow_ppl = self.recent_ppl or self.holdout_ppl
                 if data_rich and not plateau:
                     log.info("データ量が容量を超えたので成長 (%.1fM トークン / %.1fM パラメータ)",
                              data_tokens / 1e6, self.model.n_params() / 1e6)
@@ -522,6 +531,43 @@ class NeuralLM:
             if len(self.loss_hist) > 200:
                 del self.loss_hist[:100]
             return r
+
+    GROW_ROLLBACK_RATIO = 1.4    # 成長前より ppl がこの倍率を超えて悪ければ、成長を取り消す
+
+    def check_growth(self) -> bool:
+        """成長の結果を確かめ、明らかに裏目なら成長前の重みに戻す。
+
+        関数を保つ成長でも、その後の学習で崩れることがある。「増やしたら必ず良くなる」とは限らないので、
+        増やした後に確かめて、駄目なら戻せるようにしておく。戻す判断は成長前の ppl との比較で行う。"""
+        with self.lock:
+            if self.model is None or not self.grown or self._pregrow_ppl is None:
+                return False
+            since = self.model.step - self._last_grow_step
+            if since < self.GROW_COOLDOWN:            # まだ馴染ませている途中
+                return False
+            now = self.recent_ppl or self.holdout_ppl
+            if now is None or now <= self._pregrow_ppl * self.GROW_ROLLBACK_RATIO:
+                self._pregrow_ppl = None              # 問題なし。以後は判定しない
+                return False
+            if not self._pregrow_path.exists():
+                self._pregrow_ppl = None
+                return False
+            try:
+                self.stop_parallel()
+                model, tok, meta = neural.TinyTransformer.load(self._pregrow_path)
+                model.dropout = self.dropout
+                self.model, self.tok = model, tok
+                log.warning("成長が裏目に出たため取り消し (ppl %.1f -> %.1f、%d 層へ戻す)",
+                            self._pregrow_ppl, now, self.model.L)
+                self.grown = max(0, self.grown - 1)
+                self._last_grow_step = self.model.step
+                self._pregrow_ppl = None
+                self.recent_hist, self.ppl_hist, self.loss_hist = [], [], []
+                return True
+            except Exception as e:
+                log.warning("成長の取り消しに失敗: %s", e)
+                self._pregrow_ppl = None
+                return False
 
     def evaluate(self, ngram_ppl: float | None = None) -> dict:
         with self.lock:
