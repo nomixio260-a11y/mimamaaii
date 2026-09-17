@@ -30,6 +30,9 @@ log = logging.getLogger("tinyai.neural")
 # 研究で見直した項目 (現在は copy_bonus) を捨てて新しい既定値から再開する。
 DECODE_VERSION = 1
 
+# 本文を指す言い回し (読解データ由来。文脈なしで学ぶと雑談にも出てくる)
+_PASSAGE_RE = re.compile(r"文章(に|では|から|によ)|文中|この記事(に|では)|上記の|与えられた文|本文(に|では)|記載されてい")
+
 _QA_TEMPLATES = {
     "definition": ["{s}とは？", "{s}って何？", "{s}について教えて"],
     "is": ["{s}とは？", "{s}は何？"],
@@ -242,6 +245,11 @@ class NeuralLM:
 
     def add_dialog(self, user: str, bot: str, context: str | None = None, weight: float = 1.0, history=None) -> None:
         if self.model is None:
+            return
+        # 「文章には記載されていません」のように本文を指す応答は、文脈を一緒に学ばないと
+        # 「文脈が無いのに本文の話をする」という対応づけを覚えてしまう (実測: 雑談でこの言い回しが出る)。
+        # 文脈つきの読解データとして学ぶ分には問題ないので、文脈が無い時だけ落とす。
+        if not context and _PASSAGE_RE.search(bot):
             return
         ids = self.seq_dialog(user, bot, context, history=history)
         if weight < 0:      # 選好データの「選ばれなかった応答」: unlikelihood で出しにくくする

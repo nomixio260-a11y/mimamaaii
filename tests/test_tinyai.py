@@ -2063,6 +2063,25 @@ class TermOveruseTest(unittest.TestCase):
         self.assertEqual(Brain._term_overuse("犬です。"), 0.0)
 
 
+class PassageReferenceTest(unittest.TestCase):
+    """本文を指す応答は、文脈と一緒でなければ学ばない。"""
+
+    def test_dropped_without_context(self):
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="small")
+            nl.min_sentences, nl.min_chars = 4, 40
+            nl.ensure_model(["こんにちは。今日はいい天気です。散歩に行きましょう。%d" % i for i in range(60)])
+            n0 = len(nl.pool)
+            nl.add_dialog("気候は?", "気候については文章には記載されていません。")
+            self.assertEqual(len(nl.pool), n0)                     # 文脈が無ければ学ばない
+            nl.add_dialog("気候は?", "気候については文章には記載されていません。", context="ある町の説明文。")
+            self.assertEqual(len(nl.pool), n0 + 1)                 # 文脈つきなら読解データとして学ぶ
+            nl.add_dialog("気候は?", "温暖で過ごしやすい気候です。")
+            self.assertEqual(len(nl.pool), n0 + 2)                 # 普通の応答はそのまま
+
+
 class QaTextFormatTest(unittest.TestCase):
     """answer が {"text": ...} の形のデータセットを読む (人手で書かれた日本語の回答)。"""
 
