@@ -1589,6 +1589,26 @@ class PoolCapacityTest(unittest.TestCase):
             big = make_brain(tmp, memory_mb=1024)
             self.assertEqual(big.neural.pool.capacity, 102400)         # 1 MB あたり 100 系列
 
+    def test_refill_makes_long_text_sequences(self):
+        """補充した平文の系列が長いこと (1 文ずつだと段落の流れを学べない)。"""
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            return
+        if not nn.available():
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp, memory_mb=200)
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "base"   # 文脈長 256
+            from tinyai.neural import SequencePool
+            b.neural.pool = SequencePool(600, seed=1)
+            b.learn_text("\n".join("第 %d 文です。これは十分な長さを持った説明文であり、続きものとして読めます。" % i
+                                    for i in range(10, 400)), "https://x/nn")
+            b.neural_step(budget_seconds=0.1)
+            lens = [len(it[0]) for i, it in enumerate(b.neural.pool.items) if b.neural.pool.kinds[i] == "text"]
+            self.assertTrue(lens)
+            self.assertGreater(sum(lens) / len(lens), 80)     # 1 文だけの短い系列ばかりではない
+
     def test_pool_is_filled_from_stored_memory(self):
         try:
             from tinyai import neural as nn

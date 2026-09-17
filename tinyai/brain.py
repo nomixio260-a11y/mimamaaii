@@ -536,12 +536,22 @@ class Brain:
                 # 同じ系列を何十周も学ぶより、手持ちの文をできるだけ一度ずつ通す方が過学習が少ない。
                 room = nl.pool.capacity - len(nl.pool)
                 if room > nl.pool.capacity * 0.5:
-                    for d in self.kb.random_docs(min(int(room * 0.6), len(self.kb)), self.rng):
-                        nl.add_text(d.text)
-                    for item in list(self.dialogs.pairs)[-int(room * 0.4):]:
+                    # まずディスクのコーパスから戻す (段落単位の長い系列が入っている)。
+                    # 知識ベースの文書は 1 文ずつなので、そのまま入れると平文の平均長が
+                    # 63 トークンまで落ちて段落の流れを学べない。文をつないでから渡す。
+                    got = nl.refresh_from_corpus(int(room * 0.7))
+                    rest = max(0, int(room * 0.7) - got)
+                    if rest > 0:
+                        span, span_len = [], 0
+                        for d in self.kb.random_docs(min(rest * 4, len(self.kb)), self.rng):
+                            span.append(d.text)
+                            span_len += len(d.text)
+                            if span_len >= 350:
+                                nl.add_text("".join(span))
+                                span, span_len = [], 0
+                    for item in list(self.dialogs.pairs)[-int(room * 0.3):]:
                         u, b, _, w = item[:4]
                         nl.add_dialog(u, b, weight=w, history=item[4] if len(item) > 4 else None)
-                    nl.refresh_from_corpus(int(room * 0.5))     # ディスクに貯めた過去の文も戻す
                     log.info("再生バッファを補充: %d 系列 (容量 %d, コーパス %d 系列)", len(nl.pool), nl.pool.capacity, len(nl.corpus or []))
             self._feed_neural()
         t0 = time.perf_counter()
