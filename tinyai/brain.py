@@ -651,6 +651,34 @@ class Brain:
                     self.neural.note_dialog_ppl(out["dialog_bpc"] * 100)   # 規則は同じ尺度で扱う
                 else:
                     self.neural.note_dialog_ppl(out["dialog_ppl"])
+        # 2b. 最近の会話でも同じ測り方をする。固定の取り置きは時間が経つほど今の分布から離れるので、
+        # そこだけを見ると「分布が動いた」のを「質が落ちた」と取り違える
+        # (実測: 固定 4.23 bpc / 削減 45.7% に対し、最近の会話では 3.35 bpc / 削減 49.0%)。
+        recent_pairs = [(u, bb) for u, bb, src, w, *_ in list(self.dialogs.pairs)[-4000:]
+                        if w > 0 and 10 <= len(bb) <= 200 and not src.startswith("aozora")]
+        if len(recent_pairs) >= 20:
+            recent_pairs = random.Random(self.rng.randrange(10 ** 6)).sample(recent_pairs, min(n_dialogs, len(recent_pairs)))
+            nats2 = chars2 = 0.0
+            with nl.lock, nl._infer():
+                for u, bb in recent_pairs:
+                    ids = nl.seq_dialog(u, bb)
+                    st = nl.loss_from(ids)
+                    seq = ids[max(0, st - 1):]
+                    if len(seq) < 3:
+                        continue
+                    nats2 += -nl.model.logprob(seq) * (len(seq) - 1)
+                    chars2 += len(bb)
+            if chars2:
+                from collections import Counter as _C2
+                c2 = _C2("".join(bb for _, bb in recent_pairs))
+                t2 = sum(c2.values())
+                uni2 = -sum(n / t2 * math.log2(n / t2) for n in c2.values())
+                out["dialog_bpc_fresh"] = round(nats2 / chars2 / math.log(2), 4)
+                if uni2:
+                    out["dialog_gain_fresh"] = round(1 - out["dialog_bpc_fresh"] / uni2, 3)
+                    # 規則には「基準からの削減率」を使う: 語彙が変わっても、取り置きの中身が変わっても比較できる
+                    nl.note_dialog_ppl((1 - out["dialog_gain_fresh"]) * 100)
+
         # 3. RAG 忠実性: 知識文を文脈に、その文のキーワードを質問にして、答えが文脈の句をどれだけ含むか
         grounded = kw = n = 0
         for d in self.kb.random_docs(min(n_docs * 3, len(self.kb)), self.rng):
