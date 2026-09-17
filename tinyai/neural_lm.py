@@ -22,6 +22,7 @@ from pathlib import Path
 from . import neural
 from .bpe import BOS, BOT, CTX, EOS, USR, SubwordTokenizer
 from .neural_parallel import ParallelTrainer
+from .textquality import good_prose
 
 log = logging.getLogger("tinyai.neural")
 
@@ -251,7 +252,7 @@ class NeuralLM:
             added = 0
             for para in re.split(r"\n{2,}", text[:max_chars]):
                 para = para.strip()
-                if len(para) < 40:
+                if len(para) < 40 or not good_prose(para):
                     continue
                 ids = self.tok.encode(para)
                 for i in range(0, len(ids), budget):    # 文脈長で切って詰める (段落の流れは保つ)

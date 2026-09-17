@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .dialog import extract_quote_pairs
+from .textquality import clean_field
 from .web import Fetcher, Page, html_to_text
 
 log = logging.getLogger("tinyai.collector")
@@ -334,7 +335,7 @@ class HuggingFaceDatasets(Source):
             turns: list[tuple[str, str]] = []      # これまでのやり取り (多ターンの学習用)
             for m in conv:
                 role = (m.get("from") or m.get("role") or "").lower()
-                val = (m.get("value") or m.get("content") or "").strip()
+                val = clean_field(m.get("value") or m.get("content"))
                 if role in ("human", "user", "prompter"):
                     prev = val
                 elif role in ("gpt", "assistant", "bot") and prev:
@@ -343,13 +344,13 @@ class HuggingFaceDatasets(Source):
                     turns.append((prev, val))
                     prev = None
         elif fmt == "instruction":
-            q = (row.get("instruction") or "").strip()
-            inp = (row.get("input") or "").strip()
-            a = (row.get("output") or row.get("response") or "").strip()
+            q = clean_field(row.get("instruction"))
+            inp = clean_field(row.get("input"))
+            a = clean_field(row.get("output") or row.get("response"))
             if q and a:
                 pairs.append((f"{q}\n{inp}" if inp else q, a))
         elif fmt == "qa":
-            q = (row.get("question") or row.get("title") or "").strip()
+            q = clean_field(row.get("question") or row.get("title"))
             a = (row.get("answer") or row.get("answers") or "").strip() if isinstance(row.get("answer") or row.get("answers"), str) else ""
             if q and a:
                 pairs.append((q, a))
@@ -368,15 +369,15 @@ class HuggingFaceDatasets(Source):
                     turns.append((pending, val))    # 選好データも多くは多ターン: 手前のやり取りを履歴にする
                     pending = None
             hist = turns[-2:]
-            chosen = (row.get("chosen") or "").strip()
-            rejected = (row.get("rejected") or "").strip()
+            chosen = clean_field(row.get("chosen"))
+            rejected = clean_field(row.get("rejected"))
             if last_user and chosen:
                 pairs.append((last_user, chosen, None, 1.0, list(hist)) if hist else (last_user, chosen))
                 if rejected and rejected != chosen:
                     pairs.append((last_user, rejected, None, -1.0, list(hist)))
         elif fmt == "squad":   # 読解: 文脈の中から答える練習 (RAG と同じ形)
-            q = (row.get("question") or "").strip()
-            ctx = (row.get("context") or "").strip()
+            q = clean_field(row.get("question"))
+            ctx = clean_field(row.get("context"))
             ans = row.get("answers") or {}
             texts = ans.get("text") if isinstance(ans, dict) else ans
             a = (texts[0] if isinstance(texts, list) and texts else texts if isinstance(texts, str) else "").strip()

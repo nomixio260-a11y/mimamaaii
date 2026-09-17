@@ -1683,5 +1683,37 @@ class BulkCorpusTest(unittest.TestCase):
             self.assertEqual(nl.add_corpus_text(""), 0)
 
 
+class TextQualityTest(unittest.TestCase):
+    """コーパスに入れる地の文の品質判定 (目次・数字の羅列・欠損値を落とす)。"""
+
+    def test_good_prose(self):
+        from tinyai.textquality import good_prose
+        self.assertTrue(good_prose("1960年代には、ビートルズやローリング・ストーンズなど有名なバンドが登場しました。"))
+        self.assertTrue(good_prose("This is an ordinary English paragraph. It has several sentences and reads naturally."))
+        self.assertFalse(good_prose("ホーム 会社概要 採用情報 お問い合わせ サイトマップ プライバシーポリシー 利用規約"))
+        self.assertFalse(good_prose("2020 1,234 5,678 9,012 3,456 7,890 1,234 5,678 9,012 3,456 7,890 1,234"))
+        self.assertFalse(good_prose("短い"))
+
+    def test_clean_field_drops_missing_values(self):
+        from tinyai.textquality import clean_field
+        self.assertEqual(clean_field("nan"), "")          # 欠損値が文字列で流れてくる
+        self.assertEqual(clean_field("NaN "), "")
+        self.assertEqual(clean_field(None), "")
+        self.assertEqual(clean_field(" 本文 "), "本文")
+
+    def test_corpus_skips_low_quality_paragraphs(self):
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="base", corpus_tokens=200_000)
+            nl.min_sentences, nl.min_chars = 4, 40
+            nl.ensure_model(["これは学習用の文章です。番号は %d 番です。" % i for i in range(200)])
+            junk = "\n\n".join("ホーム 会社概要 採用情報 お問い合わせ サイトマップ 利用規約 English 日本語" for _ in range(20))
+            self.assertEqual(nl.add_corpus_text(junk), 0)
+            good = "\n\n".join("これは意味のある段落です。日本語の文章として読めるように、読点も文末も入っています。" * 2
+                                 for _ in range(10))
+            self.assertGreater(nl.add_corpus_text(good), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
