@@ -405,9 +405,11 @@ class Brain:
         ctx = " ".join(parts)
         return ctx[:max_chars] if ctx else None
 
-    def feed_copy_examples(self, docs) -> int:
-        """RAG の写し取り練習を再生バッファへ: 文脈 = その文 (+ 隣の文、時々は無関係な文も混ぜて「選ぶ」練習)、
-        質問 = キーワード、答え = その文。"""
+    def feed_copy_examples(self, docs, retrieved_ratio: float = 0.5) -> int:
+        """RAG の写し取り練習を再生バッファへ。
+        文脈の作り方は 2 通り: (a) その文 (+ 隣の文、時々は無関係な文) を並べたもの、
+        (b) **実際にその質問で検索した結果** — 本番と同じ条件で「検索結果の中から使う文を選ぶ」練習になる。
+        (a) だけで学ぶと「文脈の先頭を写す」癖がつき、本番の検索結果 (順番も内容も違う) で効かない。"""
         nl = self.neural
         n = 0
         for d in docs:
@@ -416,13 +418,21 @@ class Brain:
             ks = [k for k in keywords(d.text, limit=2) if is_phrase(k)]
             if not ks:
                 continue
-            nb = self.kb.docs.get(d.id + 1)
-            neighbor = nb.text if nb and nb.source == d.source else None
-            if self.rng.random() < 0.3:
-                # 無関係な文を混ぜる (前でも後ろでも): 文脈の中から正しい文を選ぶ練習
-                other = next(iter(self.kb.random_docs(1, self.rng)), None)
-                if other is not None and other.id != d.id:
-                    neighbor = f"{other.text} {neighbor}" if neighbor and self.rng.random() < 0.5 else other.text
+            neighbor = None
+            if self.rng.random() < retrieved_ratio:
+                # 本番と同じ検索を通す: 取れた文を文脈にし、答えの文が無ければ混ぜ込む
+                hits = self._search(f"{ks[0]}について教えて", k=3)
+                texts = [h.text for _, h in hits if h.id != d.id][:2]
+                if texts:
+                    neighbor = " ".join(texts)
+            if neighbor is None:
+                nb = self.kb.docs.get(d.id + 1)
+                neighbor = nb.text if nb and nb.source == d.source else None
+                if self.rng.random() < 0.3:
+                    # 無関係な文を混ぜる (前でも後ろでも): 文脈の中から正しい文を選ぶ練習
+                    other = next(iter(self.kb.random_docs(1, self.rng)), None)
+                    if other is not None and other.id != d.id:
+                        neighbor = f"{other.text} {neighbor}" if neighbor and self.rng.random() < 0.5 else other.text
             nl.add_copy_example(ks[0], d.text, neighbor)
             n += 1
         return n
