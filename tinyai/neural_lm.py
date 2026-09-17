@@ -90,6 +90,7 @@ class NeuralLM:
         self._holdout: list[list[int]] = []          # 初期に固定した取り置き (忘却の検出用)
         self._holdout_recent: deque = deque(maxlen=150)  # 最近の文から入れ替わる取り置き (今の分布での汎化)
         self.recent_ppl: float | None = None
+        self.recent_hist: list[float] = []           # 入れ替わる取り置き ppl の推移 (成長の判断に使う)
         self._last_save = 0.0
         self.batch = neural.PRESETS[self.size]["batch"] if self.available else 8
         self.lr = neural.PRESETS[self.size]["lr"] if self.available else 5e-4
@@ -311,8 +312,11 @@ class NeuralLM:
             h = self.loss_hist
             if len(h) < 20:
                 return False
-            # 取り置き ppl が悪化し続けている = 過学習なので、容量を増やしても意味がない
-            ph = self.ppl_hist
+            recent, before = sum(h[-10:]) / 10, sum(h[-20:-10]) / 10
+            # 取り置き ppl が悪化し続けている = 過学習なので、容量を増やしても意味がない。
+            # 判断には「入れ替わる取り置き」を使う: 固定の取り置きは学習データから外れた古い文を含むので、
+            # 忘却による悪化と過学習による悪化を区別できない (忘却なら容量を増やす方が効く)。
+            ph = self.recent_hist if len(self.recent_hist) >= 4 else self.ppl_hist
             if len(ph) >= 4 and sum(ph[-2:]) / 2 > sum(ph[-4:-2]) / 2 * 1.15:
                 return False
             if before - recent < 0.02 and recent > 1.5:  # 改善が止まり、まだ十分に低くない
@@ -430,6 +434,9 @@ class NeuralLM:
             if len(self._holdout_recent) >= 30:
                 with self._infer():
                     self.recent_ppl = round(neural.perplexity(self.model, list(self._holdout_recent)), 2)
+                self.recent_hist.append(self.recent_ppl)
+                if len(self.recent_hist) > 100:
+                    del self.recent_hist[:50]
             self.ngram_ppl = ngram_ppl
             if self.holdout_ppl is not None:
                 if ngram_ppl is not None:

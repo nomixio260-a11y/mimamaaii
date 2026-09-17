@@ -1446,5 +1446,43 @@ class PoolPersistenceTest(unittest.TestCase):
             self.assertEqual(len(nl2.pool), before)          # 再開しても同じ系列が残っている
 
 
+class GrowthTest(unittest.TestCase):
+    """成長の判断: 損失が停滞したら層を増やす。悪化中は増やさない。"""
+
+    def _lm(self, tmp):
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        nl = NeuralLM(Path(tmp), size="small")
+        nl.min_sentences, nl.min_chars = 4, 40
+        nl.ensure_model(["こんにちは。今日はいい天気です。散歩に行きましょう。%d" % i for i in range(60)])
+        nl.loss_hist = [3.0] * 10 + [2.999] * 10        # 20 回分、ほぼ横ばい = 停滞
+        return nl
+
+    def test_grows_when_loss_plateaus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            layers = nl.model.L
+            self.assertTrue(nl.maybe_grow(True))        # 停滞していれば成長する
+            self.assertEqual(nl.model.L, layers + 1)
+
+    def test_does_not_grow_while_generalisation_worsens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.recent_hist = [10.0, 10.0, 20.0, 20.0]   # 今の分布でも悪化中 = 過学習
+            layers = nl.model.L
+            self.assertFalse(nl.maybe_grow(True))
+            self.assertEqual(nl.model.L, layers)
+
+    def test_forgetting_alone_does_not_block_growth(self):
+        """固定の取り置きだけが悪化 (= 忘却) なら、容量を増やす判断は止めない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.ppl_hist = [10.0, 10.0, 30.0, 30.0]      # 昔の文は忘れている
+            nl.recent_hist = [10.0, 10.0, 9.8, 9.7]     # 今の分布では悪化していない
+            layers = nl.model.L
+            self.assertTrue(nl.maybe_grow(True))
+            self.assertEqual(nl.model.L, layers + 1)
+
+
 if __name__ == "__main__":
     unittest.main()
