@@ -351,7 +351,8 @@ class NeuralLM:
             return {"loss": last, "weight": weight}
 
         # ------------------------------------------------------------ 進化 (成長・語彙・復号)
-    TOKENS_PER_PARAM = 20        # Chinchilla 則の目安: このトークン数を賄えるだけの容量があるべき
+    TOKENS_PER_PARAM = 20        # Chinchilla 則の目安 (一から学習する場合の計算最適)
+    TOKENS_PER_PARAM_SOFT = 5    # 継続学習でデータが増え続ける場合の、容量不足を疑い始める線
 
     def maybe_grow(self, memory_ok: bool = True, data_tokens: int = 0) -> bool:
         """容量を増やす判断。次のどちらかで、関数を保ったまま層 (または中間次元) を増やす。
@@ -374,11 +375,18 @@ class NeuralLM:
             # 判断には「入れ替わる取り置き」を使う: 固定の取り置きは学習データから外れた古い文を含むので、
             # 忘却による悪化と過学習による悪化を区別できない (忘却なら容量を増やす方が効く)。
             ph = self.recent_hist if len(self.recent_hist) >= 4 else self.ppl_hist
-            if len(ph) >= 4 and sum(ph[-2:]) / 2 > sum(ph[-4:-2]) / 2 * 1.15:
-                return False
+            worse = sum(ph[-2:]) / 2 / max(sum(ph[-4:-2]) / 2, 1e-9) if len(ph) >= 4 else 1.0
+            if worse > 1.25:
+                return False        # 急激に悪化している = 学習が不安定。容量の問題ではない
             plateau = before - recent < 0.02 and recent > 1.5     # 改善が止まり、まだ十分に低くない
-            # データ過多: 今の大きさでは与えたトークンを使い切れない (パラメータあたり 20 トークン超)
-            data_rich = bool(data_tokens) and data_tokens > self.TOKENS_PER_PARAM * self.model.n_params()
+            n_params = self.model.n_params()
+            # データ過多 (強): 計算最適の目安を超えた
+            data_rich = bool(data_tokens) and data_tokens > self.TOKENS_PER_PARAM * n_params
+            # データ過多 (弱): データは増え続けているのに、今の分布での ppl が良くなっていない。
+            # 継続学習では「データが増えても良くならない」ことが容量不足のいちばん素直な証拠になる
+            # (計算最適の目安 20 は、一から学習する場合の話であって、飽和の判定基準ではない)。
+            if not data_rich and data_tokens > self.TOKENS_PER_PARAM_SOFT * n_params and len(ph) >= 4:
+                data_rich = worse > 1.0
             if plateau or data_rich:
                 self.stop_parallel()  # パラメータの形が変わるので並列ワーカーは作り直す (次の train_some で再開)
                 if self.model.L < max_layers:

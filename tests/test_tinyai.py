@@ -1526,10 +1526,32 @@ class GrowthTest(unittest.TestCase):
             self.assertTrue(nl.maybe_grow(True, data_tokens=need + 1))
             self.assertEqual(nl.model.L, layers + 1)
 
+    def test_grows_when_more_data_stops_helping(self):
+        """データは増え続けているのに今の分布での ppl が良くならない = 容量不足とみなす。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.loss_hist = [3.0 - i * 0.05 for i in range(20)]        # 停滞ではない
+            nl.recent_hist = [20.0, 20.0, 21.0, 21.5]                 # 少しずつ悪化 (25% 未満)
+            soft = nl.TOKENS_PER_PARAM_SOFT * nl.model.n_params()
+            layers = nl.model.L
+            self.assertFalse(nl.maybe_grow(True, data_tokens=soft // 2))   # データがまだ少なければ成長しない
+            self.assertTrue(nl.maybe_grow(True, data_tokens=soft + 1))
+            self.assertEqual(nl.model.L, layers + 1)
+
+    def test_no_growth_when_data_is_still_helping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.loss_hist = [3.0 - i * 0.05 for i in range(20)]
+            nl.recent_hist = [22.0, 21.0, 20.0, 19.0]                 # 良くなっている = まだ余地がある
+            soft = nl.TOKENS_PER_PARAM_SOFT * nl.model.n_params()
+            layers = nl.model.L
+            self.assertFalse(nl.maybe_grow(True, data_tokens=soft * 2))
+            self.assertEqual(nl.model.L, layers)
+
     def test_data_rich_growth_still_respects_the_guard(self):
         with tempfile.TemporaryDirectory() as tmp:
             nl = self._lm(tmp)
-            nl.recent_hist = [10.0, 10.0, 20.0, 20.0]                 # 今の分布で悪化中 = 過学習
+            nl.recent_hist = [10.0, 10.0, 20.0, 20.0]                 # 急激に悪化 (2 倍) = 学習が不安定
             need = nl.TOKENS_PER_PARAM * nl.model.n_params()
             layers = nl.model.L
             self.assertFalse(nl.maybe_grow(True, data_tokens=need * 10))
