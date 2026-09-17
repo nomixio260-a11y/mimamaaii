@@ -191,7 +191,7 @@ class TinyTransformer:
         return int(sum(v.size for v in self.p.values()))
 
     # ------------------------------------------------------------ 順伝播
-    def forward(self, ids, train: bool = False):
+    def forward(self, ids, train: bool = False, with_logits: bool = True):
         p = self.p
         B, T = ids.shape
         dh = self.d // self.h
@@ -229,7 +229,7 @@ class TinyTransformer:
                 caches.append((h, c1, q, k, v, att, a, h2, c2, u, gt, sig, silu, act, m1, m2))
             x = x3
         xf, cf = _rms_forward(x, p["rmsf"])
-        logits = xf @ p["wte"].T
+        logits = xf @ p["wte"].T if with_logits else None
         return logits, (ids, caches, xf, cf)
 
     def loss_and_grads(self, ids, targets, weights=None):
@@ -237,38 +237,47 @@ class TinyTransformer:
         負なら unlikelihood (その系列を出しにくくする: L = -log(1 - p_target))。None なら全て +1。
         重み 0 のトークンは損失に入らない (損失マスク)。"""
         p = self.p
-        logits, (ids, caches, xf, cf) = self.forward(ids, train=True)
-        B, T, V = logits.shape
+        _, (ids, caches, xf, cf) = self.forward(ids, train=True, with_logits=False)
+        B, T = ids.shape
+        V = self.V
         dh = self.d // self.h
         cos, sin = self.cos[:T], self.sin[:T]
-        logits -= logits.max(-1, keepdims=True)
-        np.exp(logits, out=logits)
-        logits /= logits.sum(-1, keepdims=True)
-        probs = logits
-        valid = (targets != PAD)
-        n = max(int(valid.sum()), 1)
-        valid = valid.astype(self.dtype)
-        bi = np.arange(B)[:, None]
-        ti = np.arange(T)[None, :]
-        pt = probs[bi, ti, targets]
         if weights is None:
-            w = np.ones((B, 1), self.dtype)
+            w = np.ones((B, T), self.dtype)
         else:
             w = np.asarray(weights, self.dtype)
-            w = w.reshape(B, 1) if w.ndim == 1 else w.reshape(B, T)  # 系列ごと or トークンごとの重み
-        pos = (w > 0)
+            w = np.repeat(w.reshape(B, 1), T, axis=1) if w.ndim == 1 else w.reshape(B, T)  # 系列ごと or トークンごと
+        # 出力層 (語彙全体への射影) は 1 ステップの計算の約半分を占める。損失に効かない位置
+        # (pad と重み 0) は最初から除いてしまう: 負例や短い系列が多いほど無駄が減る
+        keep = ((targets != PAD) & (w != 0)).reshape(-1)
+        idx = np.flatnonzero(keep)
+        n = max(idx.size, 1)
+        xv = xf.reshape(-1, self.d)[idx]                      # (Nv, d)
+        tv = targets.reshape(-1)[idx]
+        wv = w.reshape(-1)[idx]
+        probs = xv @ p["wte"].T                               # (Nv, V)
+        probs -= probs.max(-1, keepdims=True)
+        np.exp(probs, out=probs)
+        probs /= probs.sum(-1, keepdims=True)
+        rows = np.arange(idx.size)
+        pt = probs[rows, tv]
+        pos = wv > 0
+        aw = np.abs(wv)
         # 損失: 正例は -log p、負例は -log(1-p)
         loss_pos = -np.log(np.maximum(pt, 1e-9))
         loss_neg = -np.log(np.maximum(1.0 - pt, 1e-9))
-        loss = float(((np.where(pos, loss_pos, loss_neg) * np.abs(w)) * valid).sum() / n)
+        per_tok = np.where(pos, loss_pos, loss_neg) * aw
+        loss = float(per_tok.sum() / n)
         g = {}
         dlogits = probs
-        dlogits[bi, ti, targets] -= 1.0          # = p - onehot  (交差エントロピーの勾配)
+        dlogits[rows, tv] -= 1.0                              # = p - onehot (交差エントロピーの勾配)
         # 負例: d(-log(1-p_t))/dz = -(p_t/(1-p_t)) (p - onehot)。係数は暴走しないよう 5 で頭打ち
-        factor = np.where(pos, 1.0, -np.minimum(pt / np.maximum(1.0 - pt, 1e-6), 5.0)) * np.abs(w)
-        dlogits *= (factor * valid / n)[:, :, None].astype(self.dtype)
-        g["wte"] = dlogits.reshape(-1, V).T @ xf.reshape(-1, self.d)
-        dxf = dlogits @ p["wte"]
+        factor = np.where(pos, 1.0, -np.minimum(pt / np.maximum(1.0 - pt, 1e-6), 5.0)) * aw / n
+        dlogits *= factor[:, None].astype(self.dtype)
+        g["wte"] = dlogits.T @ xv
+        dxf = np.zeros((B * T, self.d), self.dtype)
+        dxf[idx] = dlogits @ p["wte"]
+        dxf = dxf.reshape(B, T, self.d)
         dx, g["rmsf"] = _rms_backward(dxf, cf)
         for i in reversed(range(self.L)):
             h, c1, q, k, v, att, a, h2, c2, u, gt, sig, silu, act, m1, m2 = caches[i]
@@ -306,8 +315,12 @@ class TinyTransformer:
         uniq, start = np.unique(flat[order], return_index=True)
         g["wte"][uniq] += np.add.reduceat(dx.reshape(-1, self.d)[order], start, axis=0)
         # 系列 (行) ごとの平均損失: 再生バッファの優先度 (難しい系列を多く出す) に使う
-        row_valid = valid.sum(1)
-        self.last_row_loss = (np.where(pos, loss_pos, loss_neg) * valid).sum(1) / np.maximum(row_valid, 1)
+        row_of = idx // T
+        row_sum = np.zeros(B, np.float64)
+        row_cnt = np.zeros(B, np.float64)
+        np.add.at(row_sum, row_of, np.where(pos, loss_pos, loss_neg))
+        np.add.at(row_cnt, row_of, 1.0)
+        self.last_row_loss = row_sum / np.maximum(row_cnt, 1.0)
         return loss, g
 
     def adamw(self, grads, lr: float = 3e-4, beta1=0.9, beta2=0.99, wd=0.05, clip=1.0) -> float:
