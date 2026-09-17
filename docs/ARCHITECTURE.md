@@ -18,6 +18,7 @@ tinyai/
   neural.py       numpy だけで書いた LLaMA 系 Transformer (RMSNorm・RoPE・SwiGLU・KV キャッシュ・top-p・コサイン LR・系列パッキング)。勾配は有限差分で検査済み
   neural_lm.py    Brain との接続: 語彙学習 (十分なデータが溜まってから固定)、平文/会話/RAG/合成 QA/抽出練習の系列化、再生バッファ、継続学習、ppl による使用判定、RAG 生成 (候補を一括生成)
   neural_parallel.py データ並列学習: fork したワーカーが共有メモリ上のパラメータで勾配を計算し、親が平均して AdamW (同期 SGD)
+                  neural.py には unlikelihood 損失 (重み < 0 の系列)、関数保存の層追加 grow_layer、語彙拡張 add_tokens もある
   brain_types.py  質問タイプの判定とタイプ別リランク
   evolution.py    進化するパラメータ (Params) と自己評価・変異・採用の判定
   brain.py        中核: 学習パイプライン、会話パイプライン、関心・通知、整理、メモリ制御、保存
@@ -69,7 +70,18 @@ docs/
 * 文書を消すと `kb.on_remove` で事実も消える。転置索引に消えた文書は残らない (`_post_remove`)。
 * LM の `cont_total == sum(cont.values())` は剪定後も保たれる。
 
-### 会話
+### 会話 (ニューラル専用モード、既定)
+
+```
+発話 ─ コマンド (覚えて/👍/👎/もっと詳しく)
+     ─ 検索 (BM25 + 意味ベクトル) と事実ストアから文脈を作る
+     ─ Transformer が <ctx> 文脈 <usr> 発話 <bot> の続きを候補 4 本生成 → 接地率 + 自然さで 1 本選ぶ (mode neural)
+     ─ 直後に (発話, 応答, 文脈) で勾配更新 (online)。👍 → 重み 3 で更新、👎 → unlikelihood で更新
+常時学習スレッド (NeuralTrainer): 再生バッファ (平文・会話・RAG・合成 QA・抽出練習) で学習、200 ステップごとに評価、
+                                損失停滞で層を追加、新語で語彙を拡張、5 分ごとに保存
+```
+
+### 会話 (従来経路: --symbolic、または未学習の冷間起動時)
 
 ```
 発話 ─ コマンド (覚えて/👍/👎/もっと詳しく)

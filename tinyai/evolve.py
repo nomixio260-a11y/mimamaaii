@@ -21,6 +21,37 @@ from .web import Fetcher
 log = logging.getLogger("tinyai.evolve")
 
 
+class NeuralTrainer(threading.Thread):
+    """常時学習スレッド: 応答の合間にニューラル LM を学習し続ける (chat / serve 中も)。
+    応答中は譲る (Brain.lock を短く取る)。"""
+
+    def __init__(self, brain: Brain, seconds_per_round: float = 1.5, idle_sleep: float = 0.5):
+        super().__init__(name="tinyai-neural-trainer", daemon=True)
+        self.brain = brain
+        self.seconds = seconds_per_round
+        self.idle_sleep = idle_sleep
+        self.stop_event = threading.Event()
+        self.rounds = 0
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                r = self.brain.neural_step(steps=4, budget_seconds=self.seconds)
+                self.rounds += 1
+                if r is None:
+                    self.stop_event.wait(5.0)
+                else:
+                    self.stop_event.wait(self.idle_sleep)
+            except Exception as e:
+                log.warning("学習スレッド失敗: %s", e)
+                self.stop_event.wait(5.0)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.is_alive():
+            self.join(timeout=10)
+
+
 class Evolver(threading.Thread):
     def __init__(self, brain: Brain, fetcher: Fetcher | None = None, interval: float | None = None, max_cycles: int | None = None, max_seconds: float | None = None, collector: Collector | None = None):
         super().__init__(name="tinyai-evolver", daemon=True)

@@ -31,11 +31,31 @@ _QA_TEMPLATES = {
 
 
 class NeuralLM:
+    @staticmethod
+    def size_for_memory(memory_mb: int) -> str:
+        """メモリ上限から最大のプリセットを選ぶ (学習バッファと Adam 状態を含めた概算)。"""
+        if memory_mb >= 1024:
+            return "xl"
+        if memory_mb >= 512:
+            return "large"
+        if memory_mb >= 200:
+            return "base"
+        return "small"
+
     def __init__(self, data_dir: Path, size: str = "base", vocab_size: int = 6000, seed: int = 0):
         self.available = neural.available()
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / "neural.npz"
         self.size = size if size in neural.PRESETS else "base"
+        # 進化する復号パラメータ (👍/👎 の割合で山登り)
+        self.decode = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.3}
+        self._decode_trial: dict | None = None
+        self._fb = [0, 0]           # 現在の設定での (👍, 👎)
+        self._fb_best = 0.5         # 採用済み設定の 👍 率
+        self.loss_hist: list[float] = []
+        self.grown = 0
+        self.vocab_added = 0
+        self.online_steps = 0
         self.vocab_size = vocab_size
         self.model = None
         self.tok: SubwordTokenizer | None = None
@@ -74,6 +94,10 @@ class NeuralLM:
                 self.ready = bool(meta.get("ready", False))
                 self.size = meta.get("size", self.size)
                 self._holdout = [list(x) for x in meta.get("holdout", [])][:300]
+                self.decode.update(meta.get("decode", {}))
+                self.grown = int(meta.get("grown", 0))
+                self.vocab_added = int(meta.get("vocab_added", 0))
+                self.online_steps = int(meta.get("online_steps", 0))
                 self.batch = neural.PRESETS.get(self.size, {}).get("batch", self.batch)
                 self.lr = neural.PRESETS.get(self.size, {}).get("lr", self.lr)
                 log.info("ニューラル LM を読込: %s %d params, step=%d", self.size, self.model.n_params(), self.model.step)
@@ -168,6 +192,91 @@ class NeuralLM:
             self._parallel.stop()
             self._parallel = None
 
+    # ------------------------------------------------------------ リアルタイム学習 (1 ターンごと)
+    def learn_turn(self, user: str, bot: str, context: str | None = None, weight: float = 1.0, steps: int = 2) -> dict | None:
+        """今の対話を即座に学習する。weight > 0 は正例、< 0 は unlikelihood (その答えを出しにくくする)。
+        その系列 + 再生バッファからの少量を混ぜて数ステップ更新 (忘却を防ぐ)。"""
+        if self.model is None:
+            return None
+        ids = self.seq_dialog(user, bot, context)
+        self.pool.add(ids, weight)
+        if len(self.pool) < 8:
+            return None
+        T = self.model.T
+        B = 4
+        x = neural.np.full((B, T), neural.PAD, dtype=neural.np.int64)
+        y = neural.np.full((B, T), neural.PAD, dtype=neural.np.int64)
+        w = neural.np.ones(B, dtype=neural.np.float32)
+        seq = ids[: T + 1]
+        L = len(seq) - 1
+        x[0, :L] = seq[:L]
+        y[0, :L] = seq[1 : L + 1]
+        w[0] = weight
+        rx, ry, rw = self.pool.batch(B - 1, T)
+        x[1:], y[1:], w[1:] = rx, ry, rw
+        last = None
+        for _ in range(steps):
+            loss, g = self.model.loss_and_grads(x, y, w)
+            self.model.adamw(g, lr=self.lr * 0.5)
+            last = loss
+        self.online_steps += steps
+        self.trained_tokens += steps * B * T
+        return {"loss": last, "weight": weight}
+
+    # ------------------------------------------------------------ 進化 (成長・語彙・復号)
+    def maybe_grow(self, memory_ok: bool = True) -> bool:
+        """損失が停滞していて容量に余裕があれば、関数を保ったまま層を 1 つ追加する。"""
+        if self.model is None or not memory_ok:
+            return False
+        if self.model.L >= neural.MAX_LAYERS.get(self.size, 6):
+            return False
+        h = self.loss_hist
+        if len(h) < 20:
+            return False
+        recent, before = sum(h[-10:]) / 10, sum(h[-20:-10]) / 10
+        if before - recent < 0.02 and recent > 1.5:  # 改善が止まり、まだ十分に低くない
+            self.model.grow_layer()
+            self.grown += 1
+            self.loss_hist = []
+            log.info("ニューラル LM: 層を追加 -> %d 層 (%d params)", self.model.L, self.model.n_params())
+            return True
+        return False
+
+    def evolve_vocab(self, texts, top: int = 100) -> int:
+        """新しいテキストに頻出する未知の単位を語彙に足す (モデルの埋め込みも拡張)。"""
+        if self.model is None or self.tok is None:
+            return 0
+        units = self.tok.frequent_new_units(texts, top=top)
+        n = self.tok.add_tokens(units)
+        if n:
+            self.model.add_tokens(n)
+            self.vocab_added += n
+        return n
+
+    def feedback(self, positive: bool) -> None:
+        """👍/👎 で復号パラメータを山登り: 試行中の設定が採用済みより良ければ採用、悪ければ戻す。"""
+        self._fb[0 if positive else 1] += 1
+        n = sum(self._fb)
+        if n < 6:
+            return
+        rate = self._fb[0] / n
+        if self._decode_trial is not None:
+            if rate >= self._fb_best:
+                self._fb_best = rate
+            else:
+                self.decode = self._decode_trial  # 戻す
+            self._decode_trial = None
+        else:
+            self._fb_best = rate
+        # 次の試行: 1 つのパラメータを少し動かす
+        cand = dict(self.decode)
+        key = self.rng.choice(list(cand))
+        step = {"temperature": 0.1, "top_p": 0.05, "repetition_penalty": 0.1}[key]
+        cand[key] = round(min({"temperature": 1.2, "top_p": 0.99, "repetition_penalty": 2.0}[key], max({"temperature": 0.3, "top_p": 0.5, "repetition_penalty": 1.0}[key], cand[key] + self.rng.choice([-step, step]))), 3)
+        self._decode_trial = dict(self.decode)
+        self.decode = cand
+        self._fb = [0, 0]
+
     def train_some(self, steps: int = 4, batch: int | None = None) -> dict | None:
         if self.model is None or len(self.pool) < 32:
             return None
@@ -196,6 +305,9 @@ class NeuralLM:
             return None
         self.trained_tokens += steps * batch * self.model.T
         self.last_loss = r.get("loss")
+        self.loss_hist.append(r["loss"])
+        if len(self.loss_hist) > 200:
+            del self.loss_hist[:100]
         return r
 
     def evaluate(self, ngram_ppl: float | None = None) -> dict:
@@ -213,7 +325,8 @@ class NeuralLM:
     def save(self) -> None:
         if self.model is None or self.tok is None:
             return
-        self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300]})
+        self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300],
+                                                   "decode": self.decode, "grown": self.grown, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
         self._last_save = time.time()
 
     # ------------------------------------------------------------ 利用
@@ -228,7 +341,8 @@ class NeuralLM:
             return []
         prompt = self.prompt_dialog(user, context)
         out = []
-        for ids in self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=temperature, rng=self.nprng):
+        dec = self.decode
+        for ids in self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=dec["temperature"], top_p=dec["top_p"], repetition_penalty=dec["repetition_penalty"], rng=self.nprng):
             text = self.tok.decode(ids).strip()
             if len(text) >= 2:
                 out.append(text)
@@ -258,4 +372,9 @@ class NeuralLM:
             "holdout_ppl": self.holdout_ppl,
             "ngram_ppl": self.ngram_ppl,
             "ready": self.ready,
+            "layers": self.model.L if self.model else 0,
+            "grown_layers": self.grown,
+            "vocab_added": self.vocab_added,
+            "online_steps": self.online_steps,
+            "decode": dict(self.decode),
         }

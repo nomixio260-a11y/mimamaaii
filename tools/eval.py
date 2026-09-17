@@ -112,7 +112,7 @@ def load_sets(paths) -> list[tuple[str, list]]:
 
 
 def make_brain(tmp: str) -> Brain:
-    cfg = Config(data_dir=Path(tmp), memory_mb=256, hard_limit=False, web_enabled=False, seed=1)
+    cfg = Config(data_dir=Path(tmp), memory_mb=256, hard_limit=False, web_enabled=False, seed=1, tools=True)
     b = Brain(cfg)
     b.bootstrap()
     return b

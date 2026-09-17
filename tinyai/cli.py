@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .brain import Brain
 from .config import Config
-from .evolve import Evolver
+from .evolve import Evolver, NeuralTrainer
 from .web import Fetcher
 
 
@@ -30,6 +30,10 @@ def _build_config(args) -> Config:
         cfg.hard_limit = False
     if getattr(args, "interval", None) is not None:
         cfg.evolve_interval = args.interval
+    if getattr(args, "tools", False):
+        cfg.tools = True
+    if getattr(args, "symbolic", False):
+        cfg.neural_only = False
     return cfg
 
 
@@ -54,10 +58,15 @@ def cmd_chat(args) -> int:
     _setup_logging(cfg, args.verbose)
     brain = _open_brain(cfg)
     evolver = None
+    trainer = None
     if not args.no_auto:
         evolver = Evolver(brain)
         evolver.start()
-    print(f"tinyai v{__version__}  gen={brain.generation}  docs={len(brain.kb)}  mem={brain.guard.describe()['rss_mb']}MB")
+    if cfg.background_training and brain.neural.available:
+        trainer = NeuralTrainer(brain)
+        trainer.start()
+    ns = brain.neural.stats() if brain.neural.available else {}
+    print(f"tinyai v{__version__}  gen={brain.generation}  docs={len(brain.kb)}  mem={brain.guard.describe()['rss_mb']}MB  neural={ns.get('size')}/{ns.get('params', 0):,}params step={ns.get('steps', 0)} ready={ns.get('ready')}")
     print("終了: /quit  状態: /stats  保存: /save  新着学習: /news  教える: 覚えて: <文>  調べさせる: 調べて: <話題>  評価: 👍 / 👎")
     try:
         while True:
@@ -98,6 +107,8 @@ def cmd_chat(args) -> int:
     finally:
         if evolver:
             evolver.stop(wait=False)
+        if trainer:
+            trainer.stop()
         brain.save()
         print("保存しました。")
     return 0
@@ -255,9 +266,13 @@ def cmd_serve(args) -> int:
     _setup_logging(cfg, args.verbose)
     brain = _open_brain(cfg)
     evolver = None
+    trainer = None
     if not args.no_auto:
         evolver = Evolver(brain)
         evolver.start()
+    if cfg.background_training and brain.neural.available:
+        trainer = NeuralTrainer(brain)
+        trainer.start()
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, payload, ctype="application/json; charset=utf-8"):
@@ -315,6 +330,8 @@ def cmd_serve(args) -> int:
     finally:
         if evolver:
             evolver.stop(wait=False)
+        if trainer:
+            trainer.stop()
         brain.save()
     return 0
 
@@ -337,6 +354,8 @@ def main(argv=None) -> int:
     ap.add_argument("--offline", action="store_true", help="Web 探索を無効化")
     ap.add_argument("--no-hard-limit", action="store_true", help="OS のメモリ強制上限 (rlimit) を掛けない")
     ap.add_argument("--interval", type=float, help="自律学習サイクルの間隔 (秒)")
+    ap.add_argument("--tools", action="store_true", help="計算・日付・単位換算などの道具を有効にする (既定はニューラル生成のみ)")
+    ap.add_argument("--symbolic", action="store_true", help="ニューラル専用モードを切り、事実の即答や検索応答も使う")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--version", action="version", version=f"tinyai {__version__}")
     sub = ap.add_subparsers(dest="cmd")
@@ -363,7 +382,7 @@ def main(argv=None) -> int:
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--seconds", type=float, default=None)
     p.add_argument("--hours", type=float, default=None, help="収集しながら長時間学習する")
-    p.add_argument("--size", choices=["small", "base", "large"], default=None)
+    p.add_argument("--size", choices=["small", "base", "large", "xl"], default=None)
     p.add_argument("--workers", type=int, default=None, help="データ並列のプロセス数 (既定: CPU 数 - 1)")
     p.set_defaults(func=cmd_train)
 

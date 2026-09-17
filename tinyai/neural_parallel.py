@@ -52,8 +52,8 @@ def _worker_main(model, pool, grad_names, grad_shapes, conn, seed):
             if msg is None:
                 break
             batch, T = msg
-            x, y = pool.batch(batch, T)
-            loss, g = model.loss_and_grads(x, y)
+            x, y, w = pool.batch(batch, T)
+            loss, g = model.loss_and_grads(x, y, w)
             for k, gk in g.items():
                 grads[k][0][...] = gk
             conn.send(loss)

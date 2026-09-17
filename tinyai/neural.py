@@ -35,7 +35,10 @@ PRESETS = {
     "small": dict(d=128, layers=2, heads=4, ctx=64, ff=384, batch=32, lr=1e-3),
     "base": dict(d=192, layers=4, heads=6, ctx=128, ff=512, batch=12, lr=6e-4),
     "large": dict(d=256, layers=6, heads=8, ctx=128, ff=704, batch=8, lr=4e-4),
+    "xl": dict(d=384, layers=8, heads=8, ctx=160, ff=1024, batch=6, lr=3e-4),
 }
+# 成長の上限 (プリセット名 -> 最大層数)。層は損失が停滞した時に 1 層ずつ、関数を保ったまま追加される
+MAX_LAYERS = {"small": 4, "base": 6, "large": 8, "xl": 12}
 
 
 def available() -> bool:
@@ -125,6 +128,42 @@ class TinyTransformer:
         self.mask = np.triu(np.full((ctx, ctx), -1e9, self.dtype), 1)
         self.cos, self.sin = _rope_tables(ctx, d // heads, self.dtype)
 
+    def grow_layer(self) -> int:
+        """関数を保ったまま層を 1 つ追加する (Net2Net 型): 新しい層の出力射影 wo, w2 をゼロにすると
+        追加直後は恒等写像で、既に学んだ振る舞いを壊さずに容量だけ増える。"""
+        rng = np.random.default_rng(self.step + 7)
+        i = self.L
+        d, ff = self.d, self.ff
+        s = 0.02
+        new = {
+            f"l{i}.rms1": np.ones(d, self.dtype),
+            f"l{i}.wqkv": (rng.standard_normal((d, 3 * d)) * s).astype(self.dtype),
+            f"l{i}.wo": np.zeros((d, d), self.dtype),
+            f"l{i}.rms2": np.ones(d, self.dtype),
+            f"l{i}.w1": (rng.standard_normal((d, ff)) * s).astype(self.dtype),
+            f"l{i}.wg": (rng.standard_normal((d, ff)) * s).astype(self.dtype),
+            f"l{i}.w2": np.zeros((ff, d), self.dtype),
+        }
+        for k, v in new.items():
+            self.p[k] = v
+            self.m[k] = np.zeros_like(v)
+            self.v[k] = np.zeros_like(v)
+        self.L += 1
+        return self.L
+
+    def add_tokens(self, n: int) -> int:
+        """語彙を n 語増やす (新しい埋め込みは既存の平均 + 小さな乱数)。トークナイザ側と同期して呼ぶ。"""
+        if n <= 0:
+            return self.V
+        rng = np.random.default_rng(self.step + 11)
+        mean = self.p["wte"].mean(axis=0, keepdims=True)
+        extra = (mean + rng.standard_normal((n, self.d)) * 0.01).astype(self.dtype)
+        self.p["wte"] = np.concatenate([self.p["wte"], extra], axis=0)
+        self.m["wte"] = np.concatenate([self.m["wte"], np.zeros_like(extra)], axis=0)
+        self.v["wte"] = np.concatenate([self.v["wte"], np.zeros_like(extra)], axis=0)
+        self.V += n
+        return self.V
+
     @classmethod
     def from_preset(cls, vocab_size: int, name: str = "base", seed: int = 0) -> "TinyTransformer":
         cfg = PRESETS[name]
@@ -166,7 +205,9 @@ class TinyTransformer:
         logits = xf @ p["wte"].T
         return logits, (ids, caches, xf, cf)
 
-    def loss_and_grads(self, ids, targets):
+    def loss_and_grads(self, ids, targets, weights=None):
+        """weights: (B,) の系列ごとの重み。正なら通常の交差エントロピー、負なら unlikelihood
+        (その系列を出しにくくする: L = -log(1 - p_target))。None なら全て +1。"""
         p = self.p
         logits, (ids, caches, xf, cf) = self.forward(ids, train=True)
         B, T, V = logits.shape
@@ -180,11 +221,22 @@ class TinyTransformer:
         n = max(int(valid.sum()), 1)
         bi = np.arange(B)[:, None]
         ti = np.arange(T)[None, :]
-        loss = float((-np.log(np.maximum(probs[bi, ti, targets], 1e-9)) * valid).sum() / n)
+        pt = probs[bi, ti, targets]
+        if weights is None:
+            w = np.ones((B, 1), self.dtype)
+        else:
+            w = np.asarray(weights, self.dtype).reshape(B, 1)
+        pos = (w > 0)
+        # 損失: 正例は -log p、負例は -log(1-p)
+        loss_pos = -np.log(np.maximum(pt, 1e-9))
+        loss_neg = -np.log(np.maximum(1.0 - pt, 1e-9))
+        loss = float(((np.where(pos, loss_pos, loss_neg) * np.abs(w)) * valid).sum() / n)
         g = {}
         dlogits = probs
-        dlogits[bi, ti, targets] -= 1.0
-        dlogits *= (valid[:, :, None] / n).astype(self.dtype)
+        dlogits[bi, ti, targets] -= 1.0          # = p - onehot  (交差エントロピーの勾配)
+        # 負例: d(-log(1-p_t))/dz = -(p_t/(1-p_t)) (p - onehot)。係数は暴走しないよう 5 で頭打ち
+        factor = np.where(pos, 1.0, -np.minimum(pt / np.maximum(1.0 - pt, 1e-6), 5.0)) * np.abs(w)
+        dlogits *= (factor * valid / n)[:, :, None].astype(self.dtype)
         g["wte"] = dlogits.reshape(-1, V).T @ xf.reshape(-1, self.d)
         dxf = dlogits @ p["wte"]
         dx, g["rmsf"] = _rms_backward(dxf, cf)
@@ -432,33 +484,49 @@ class SequencePool:
         self.rng = np.random.default_rng(seed) if np is not None else None
         self.total_tokens = 0
 
-    def add(self, ids: list[int]) -> None:
+    def add(self, ids: list[int], weight: float = 1.0) -> None:
+        """weight < 0 は負例 (unlikelihood)。負例は詰め込まず単独の系列として学習する。"""
         if len(ids) < 3:
             return
+        item = (ids, float(weight))
         if len(self.items) < self.capacity:
-            self.items.append(ids)
+            self.items.append(item)
         else:
-            self.total_tokens -= len(self.items[self.pos])
-            self.items[self.pos] = ids
+            self.total_tokens -= len(self.items[self.pos][0])
+            self.items[self.pos] = item
             self.pos = (self.pos + 1) % self.capacity
         self.total_tokens += len(ids)
 
     def batch(self, B: int, T: int):
+        """(x, y, weights)。正例は複数系列を詰めて作り、負例は単独の系列 (pad) にする。"""
         x = np.full((B, T), PAD, dtype=np.int64)
         y = np.full((B, T), PAD, dtype=np.int64)
+        w = np.ones(B, dtype=np.float32)
         n = len(self.items)
         for b in range(B):
+            seq, wt = self.items[int(self.rng.integers(n))]
+            if wt < 0:
+                seq = seq[: T + 1]
+                L = len(seq) - 1
+                x[b, :L] = seq[:L]
+                y[b, :L] = seq[1 : L + 1]
+                w[b] = wt
+                continue
             buf: list[int] = []
             while len(buf) < T + 1:
-                seq = self.items[int(self.rng.integers(n))]
                 if len(seq) > T + 1:
-                    s = int(self.rng.integers(len(seq) - T))
-                    seq = seq[s : s + T + 1]
+                    s_ = int(self.rng.integers(len(seq) - T))
+                    seq = seq[s_ : s_ + T + 1]
                 buf.extend(seq)
+                if len(buf) < T + 1:
+                    seq, wt2 = self.items[int(self.rng.integers(n))]
+                    while wt2 < 0:
+                        seq, wt2 = self.items[int(self.rng.integers(n))]
             buf = buf[: T + 1]
             x[b] = buf[:-1]
             y[b] = buf[1:]
-        return x, y
+            w[b] = max(wt, 0.1)
+        return x, y, w
 
     def __len__(self) -> int:
         return len(self.items)
@@ -479,8 +547,8 @@ def train_steps(model: TinyTransformer, pool: SequencePool, steps: int, batch: i
     t0 = time.perf_counter()
     losses = []
     for _ in range(steps):
-        x, y = pool.batch(batch, model.T)
-        loss, g = model.loss_and_grads(x, y)
+        x, y, w = pool.batch(batch, model.T)
+        loss, g = model.loss_and_grads(x, y, w)
         model.adamw(g, lr=lr_at(model.step, lr, warmup, total))
         losses.append(loss)
         if log and model.step % 50 == 0:

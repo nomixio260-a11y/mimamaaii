@@ -26,7 +26,7 @@ from tinyai.web import html_to_text
 
 
 def make_brain(tmp: str, **kw) -> Brain:
-    cfg = Config(data_dir=Path(tmp), memory_mb=kw.pop("memory_mb", 128), hard_limit=False, web_enabled=False, seed=7, **kw)
+    cfg = Config(data_dir=Path(tmp), memory_mb=kw.pop("memory_mb", 128), hard_limit=False, web_enabled=False, seed=7, tools=True, **kw)
     b = Brain(cfg)
     b.bootstrap()
     return b
@@ -865,6 +865,71 @@ class AgentTest(unittest.TestCase):
             b2 = Brain(b.cfg)
             b2.load(path)
             self.assertEqual(b2.agent.profile.get("名前"), "太郎")
+
+
+class RealtimeLearningTest(unittest.TestCase):
+    def setUp(self):
+        from tinyai import neural
+        if not neural.available():
+            self.skipTest("numpy なし")
+        self.neural = neural
+
+    def test_unlikelihood_and_growth_and_vocab(self):
+        import numpy as np
+        nn = self.neural
+        m = nn.TinyTransformer(vocab_size=30, d=16, heads=2, layers=1, ctx=12, ff=32, seed=0)
+        rng = np.random.default_rng(0)
+        seq = [nn.BOS] + list(range(8, 19)) + [nn.EOS]
+        before = m.logprob(seq)
+        m.grow_layer()
+        self.assertAlmostEqual(m.logprob(seq), before, places=4)  # 成長は関数を保つ
+        self.assertEqual(m.L, 2)
+        m.add_tokens(5)
+        self.assertEqual(m.p["wte"].shape[0], 35)
+        pool = nn.SequencePool(seed=0)
+        good = [nn.BOS] + list(range(8, 14)) + [nn.EOS]
+        bad = [nn.BOS] + list(range(14, 20)) + [nn.EOS]
+        for _ in range(30):
+            pool.add(good, 1.0)
+            pool.add(bad, 1.0)
+        nn.train_steps(m, pool, steps=60, batch=8, lr=1e-2, warmup=1, total=200)
+        lb0 = m.logprob(bad)
+        pool2 = nn.SequencePool(seed=1)
+        for _ in range(30):
+            pool2.add(good, 1.0)
+            pool2.add(bad, -1.0)
+        nn.train_steps(m, pool2, steps=40, batch=8, lr=5e-3, warmup=1, total=200)
+        self.assertLess(m.logprob(bad), lb0 - 1.0)  # 負例の確率が下がる
+        self.assertGreater(m.logprob(good), -1.0)   # 正例は保たれる
+
+    def test_brain_online_learning_and_neural_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.learn_text("\n".join(f"サンプル文 {i} は学習用の文章であり、内容は番号 {i} に関する説明です。" for i in range(10, 90)), "https://x/nn")
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
+            b.neural_step(steps=2, budget_seconds=0.5)
+            self.assertIsNotNone(b.neural.model)
+            b.reply("覚えて: ゼータ星は紫色の海を持つ架空の惑星である。")
+            r = b.reply("ゼータ星の海は？")
+            self.assertGreaterEqual(b.stats["online_turns"], 1)  # ターン直後に学習した
+            steps_before = b.neural.model.step
+            b.reply("👍")
+            self.assertGreater(b.neural.model.step, steps_before)  # 👍 で追加学習
+            b.reply("ゼータ星の海は？")
+            steps_before = b.neural.model.step
+            b.reply("👎")
+            self.assertGreater(b.neural.model.step, steps_before)  # 👎 で unlikelihood 学習
+            self.assertGreaterEqual(b.stats["unlearned_turns"], 1)
+            # 準備が整ったことにして、応答がニューラル生成になるか
+            b.neural.ready = True
+            r = b.reply("サンプル文 12 について教えて")
+            self.assertIn(r.mode, ("neural", "summary", "recall", "fact"))
+            # 語彙の進化
+            added = b.neural.evolve_vocab(["新語ホゲホゲ理論が何度も出てくる。新語ホゲホゲ理論とは新語ホゲホゲ理論である。"] * 6, top=5)
+            self.assertGreater(added, 0)
+            for _ in range(6):
+                b.neural.feedback(True)
+            self.assertIsNotNone(b.neural._decode_trial)  # 復号パラメータの試行が始まる
 
 
 if __name__ == "__main__":

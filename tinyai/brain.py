@@ -133,7 +133,8 @@ class Brain:
         self.reranker = Reranker()                # 👍/👎 から学ぶリランカー
         self.dialogs = DialogStore()              # 会話データ (自分の会話 + 公開データ)
         self.agent = Agent(self)                  # 道具 (計算・日付・換算・比較・列挙・要約・調査・プロファイル)
-        self.neural = NeuralLM(self.cfg.data_dir, size=self.cfg.neural_size, seed=self.cfg.seed or 0)  # numpy があれば Transformer LM
+        size = self.cfg.neural_size if self.cfg.neural_size != "auto" else NeuralLM.size_for_memory(self.cfg.memory_mb)
+        self.neural = NeuralLM(self.cfg.data_dir, size=size, seed=self.cfg.seed or 0)  # Transformer LM (numpy)
         self._neural_pending_text: deque = deque(maxlen=5000)
         self._neural_pending_dialog: deque = deque(maxlen=2000)   # (発話, 応答, 文脈, 重み)
         self._qa_done: set[int] = set()                           # 合成 QA を作った文書 ID
@@ -143,6 +144,7 @@ class Brain:
         self._last_cover: dict[int, float] = {}
         self._guard_note: tuple[str, str, str] | None = None  # (種類, 主語, 属性) 直前の質問で「知らない」と判定した内容
         self._last_pair: tuple[str, str] | None = None
+        self._last_pair_ctx: str | None = None
         self.params = Params(use_order=min(3, self.cfg.max_order))
         self._apply_params()
         self.evolution = Evolution(self)          # 世代・適応度・変異幅はここが持つ
@@ -323,11 +325,13 @@ class Brain:
                     hosts.append(h)
         return f"{reply.text}（出典: {', '.join(hosts[:2])}）" if hosts else reply.text
 
-    def _neural_reply(self, text: str, hits, fallback: Reply) -> Reply | None:
-        """検索した文を文脈にして Transformer で応答を生成 (RAG)。知識に接地していない候補は捨てる。"""
+    def _neural_reply(self, text: str, hits, fallback: Reply, strict: bool = True) -> Reply | None:
+        """検索した文を文脈にして Transformer で応答を生成 (RAG)。
+        strict=True: 接地率と自然さで厳しく検査 (検索応答と併用する時)。
+        strict=False: ニューラル専用モード。候補の中から接地率 + 自然さが最良のものを返し、明らかに壊れた文だけ捨てる。"""
         ctx_docs = [d for c, d in hits[:3] if c >= self.params.answer_threshold * 0.5]
         context = " ".join(d.text for d in ctx_docs)[:240] or None
-        cands = self.neural.chat(text, context, n=3)
+        cands = self.neural.chat(text, context, n=4 if not strict else 3)
         if not cands:
             return None
         qphr = set(phrases(text))
@@ -337,14 +341,14 @@ class Brain:
             ph = set(phrases(c))
             grounded = len(ph & (cphr | qphr)) / max(len(ph), 1) if ph else 0.0
             fluency = self.neural.score(c)
-            # 受け入れ条件: 文脈/質問に接地 (句の 6 割以上)、モデル自身が自然だと思う (平均対数尤度)、文として終わる、崩れていない
-            if (context and grounded < 0.6) or fluency is None or fluency < -2.5:
+            if fluency is None or len(c) < 4 or _GARBLED_RE.search(c):
                 continue
-            if len(c) < 6 or c in text or not c.endswith(("。", "！", "？", ".", "!", "?", "です", "ます", "である")):
-                continue
-            if _GARBLED_RE.search(c):
-                continue
-            sc = grounded + fluency / 5.0
+            if strict:
+                if (context and grounded < 0.6) or fluency < -2.5:
+                    continue
+                if len(c) < 6 or c in text or not c.endswith(("。", "！", "？", ".", "!", "?", "です", "ます", "である")):
+                    continue
+            sc = grounded + fluency / 5.0 + (0.3 if c.endswith(("。", "！", "？", ".", "!", "?")) else 0.0)
             if sc > best_s:
                 best, best_s = c, sc
         if best is None:
@@ -421,6 +425,13 @@ class Brain:
             if nl.model.step % 200 < steps:
                 ngram = self.lm.perplexity(self.holdout) if self.holdout else None
                 nl.evaluate(ngram)
+                # 進化: 損失が停滞したら層を追加、新語が増えていれば語彙を拡張
+                mem_ok = self.guard.pressure() < 0.7
+                if nl.maybe_grow(mem_ok):
+                    self.stats["neural_grown"] += 1
+                added = nl.evolve_vocab([d.text for d in self.kb.random_docs(min(300, len(self.kb)), self.rng)], top=50)
+                if added:
+                    self.stats["neural_vocab_added"] += added
                 log.info("ニューラル LM: step=%d loss=%.3f %s", nl.model.step, r["loss"], nl.stats())
             if time.time() - nl._last_save > 300:
                 nl.save()
@@ -657,10 +668,11 @@ class Brain:
                 self.history.append(("ai", cmd.text))
                 return cmd
             self.history.append(("user", text))
-            # 道具で正確に答えられるものは道具で (計算・日付・換算・比較・列挙・要約・調査・プロファイル)
+            # 道具 (計算・日付・換算・比較・列挙・要約・調査・プロファイル) は cfg.tools の時だけ
             fmt_instruction = text
             text = strip_format(text)
-            tool = self.agent.handle(text, ja)
+            neural_mode = self.cfg.neural_only and self.neural.ready
+            tool = self.agent.handle(text, ja) if self.cfg.tools else None
             if tool is not None:
                 tool.text = apply_format(tool.text, fmt_instruction)
                 self.stats["tool_" + tool.mode.split(":")[-1]] += 1
@@ -692,7 +704,7 @@ class Brain:
                 topics = topics or list(self.last_topics)
             qtype = question_type(text)
             reply = None
-            if topics:
+            if topics and not neural_mode:
                 m = re.match(r"^(.+?)(について|の話を|のこと|に関して)\s*(教えて|話して|説明して|聞かせて|知りたい|まとめて)", text)
                 if m and is_phrase(m.group(1).lower()):
                     summ = self.summarize(m.group(1), ja=ja)
@@ -700,18 +712,26 @@ class Brain:
                         s_text, s_ids, s_srcs = summ
                         self.stats["summaries"] += 1
                         reply = Reply(s_text, 0.75, "summary", list(dict.fromkeys(s_srcs)), s_ids, [])
-            if reply is None:
+            if reply is None and not neural_mode:
                 reply = self._answer_from_facts(text, ja)
             if reply is None:
                 hits = self._search(query, exclude_id=new_doc.id if new_doc else None, qtype=qtype, subject=topics[0] if topics else None)
                 hits = self._guard_unknown(text, hits, ja)
                 reply = self._compose(text, hits, topics, ja, question, qtype)
-                # ニューラル生成が主経路になるのは「知識の検索が弱い」時。確信の高い想起 (正確な知識文) は残す。
-                weak = reply.mode in ("guess", "generate") or (reply.mode == "recall" and reply.confidence < self.cfg.neural_override_conf)
-                if self.cfg.neural_first and self.neural.ready and weak and self._guard_note is None:
-                    neural_reply = self._neural_reply(text, hits, reply)
+                if neural_mode:
+                    # 応答は常にニューラル生成。検索結果 (と事実) は文脈として渡すだけ
+                    fact_ans = self.facts.answer(text)
+                    if fact_ans is not None and fact_ans[1] in self.kb.docs:
+                        hits = [(1.0, self.kb.docs[fact_ans[1]])] + [h for h in hits if h[1].id != fact_ans[1]]
+                    neural_reply = self._neural_reply(text, hits, reply, strict=False)
                     if neural_reply is not None:
                         reply = neural_reply
+                elif self.cfg.neural_first and self.neural.ready and self._guard_note is None:
+                    weak = reply.mode in ("guess", "generate") or (reply.mode == "recall" and reply.confidence < self.cfg.neural_override_conf)
+                    if weak:
+                        neural_reply = self._neural_reply(text, hits, reply)
+                        if neural_reply is not None:
+                            reply = neural_reply
             reply = self._attach_notices(reply, topics, ja)
             reply.text = self._cite(reply)
             if reply.confidence >= 0.3:  # 「まだ知りません」のような短い定型には書式指示を適用しない
@@ -726,8 +746,17 @@ class Brain:
             self.cache_lm.push(self.lm.ids(tokenize(reply.text))[:60])
             if reply.mode in ("fact", "recall", "summary", "neural") and reply.confidence >= 0.6:
                 if self.dialogs.add(text, reply.text, source="chat"):
-                    self._neural_pending_dialog.append((text, reply.text, self._context_for(reply.doc_ids), 1.0))
+                    ctx_now = self._context_for(reply.doc_ids)
+                    if self.cfg.online_learning and self.neural.model is not None:
+                        # リアルタイム学習: このターンで即座に勾配更新 (数十〜数百 ms)
+                        t0 = time.perf_counter()
+                        self.neural.learn_turn(text, reply.text, ctx_now, weight=1.0, steps=1)
+                        self.timers["online"] += time.perf_counter() - t0
+                        self.stats["online_turns"] += 1
+                    else:
+                        self._neural_pending_dialog.append((text, reply.text, ctx_now, 1.0))
             self._last_pair = (text, reply.text)
+            self._last_pair_ctx = self._context_for(reply.doc_ids)
             self.last_question = text
             if topics:
                 self.last_topics = topics[:2]
@@ -1145,7 +1174,11 @@ class Brain:
             if self._last_pair:
                 u, b = self._last_pair
                 self.dialogs.add(u, b, source="chat+", weight=3.0)
-                self._neural_pending_dialog.append((u, b, self._context_for(self.last_docs), 3.0))
+                if self.neural.model is not None:
+                    self.neural.learn_turn(u, b, self._last_pair_ctx, weight=3.0, steps=2)  # 👍: 強く学ぶ
+                    self.neural.feedback(True)
+                else:
+                    self._neural_pending_dialog.append((u, b, self._context_for(self.last_docs), 3.0))
             for d in self.last_docs:
                 self.kb.feedback(d, +1.5)
                 if self.last_question:
@@ -1158,6 +1191,11 @@ class Brain:
             return Reply("ありがとう、覚えておきます。" if ja else "Thanks, noted.", 1.0, "command", [], [], [])
         if low in ("👎", "bad", "違う", "ちがう", "wrong", "no", "間違い", "まちがい"):
             self._train_reranker(positive=False)
+            if self._last_pair and self.neural.model is not None:
+                u, b = self._last_pair
+                self.neural.learn_turn(u, b, self._last_pair_ctx, weight=-1.0, steps=2)  # 👎: unlikelihood でその答えを出しにくく
+                self.neural.feedback(False)
+                self.stats["unlearned_turns"] += 1
             for d in self.last_docs:
                 self.kb.feedback(d, -2.0)
                 if self.last_question:

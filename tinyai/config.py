@@ -38,8 +38,12 @@ class Config:
     prefetch_workers: int = field(default_factory=lambda: _env_int("TINYAI_WORKERS", 2))  # 先読みスレッド数
     prefetch_depth: int = 4            # 先読みして貯めておくバッチ数
     neural_seconds_per_cycle: float = 2.0  # 自律ループ 1 サイクルあたりニューラル LM の学習に使う秒数 (numpy がある時)
-    neural_size: str = field(default_factory=lambda: os.environ.get("TINYAI_NEURAL", "base"))  # small / base / large
+    neural_size: str = field(default_factory=lambda: os.environ.get("TINYAI_NEURAL", "auto"))  # auto / small / base / large / xl (auto はメモリ上限から)
     neural_first: bool = True          # 学習が進んだら (ppl 基準) ニューラル生成を応答の主経路にする
+    neural_only: bool = True           # 準備が整ったら応答は常にニューラル生成 (検索は文脈の供給に回る、事実の即答も使わない)
+    tools: bool = False                # 計算・日付・単位換算などの道具を使う (既定オフ: 応答はネットワークが担う)
+    online_learning: bool = True       # 各ターンの直後にその対話で勾配更新する
+    background_training: bool = True   # chat / serve 中も裏で学習スレッドを回す
     neural_override_conf: float = 0.8  # 検索の確信度がこれ未満ならニューラル生成を優先 (これ以上は正確な知識文を返す)
     cite: bool = True                  # Web 由来の答えに出典 (ホスト名) を添える
     neural_workers: int = field(default_factory=lambda: _env_int("TINYAI_NEURAL_WORKERS", max(1, (os.cpu_count() or 2) - 1)))  # train コマンドのデータ並列数

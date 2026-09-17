@@ -115,6 +115,33 @@ class SubwordTokenizer:
     def __len__(self) -> int:
         return len(self.tokens)
 
+    def add_tokens(self, new: list[str]) -> int:
+        """語彙に新しい単位を追加 (モデル側の add_tokens と同期して呼ぶ)。追加数を返す。"""
+        added = 0
+        for t in new:
+            if t and t not in self.index and len(t) <= self.MAXLEN * 3:
+                self.index[t] = len(self.tokens)
+                self.tokens.append(t)
+                added += 1
+        if added:
+            self._rebuild()
+        return added
+
+    def frequent_new_units(self, texts, top: int = 200, min_count: int = 5) -> list[str]:
+        """新しいテキストに頻出するが語彙に無い 2〜4 文字の連続 (語彙の進化用)。"""
+        grams: Counter = Counter()
+        for text in texts:
+            text = self.normalize(text)
+            for m in _RUN_RE.finditer(text):
+                run = m.group(0)
+                for L in (2, 3, 4):
+                    for i in range(len(run) - L + 1):
+                        g = run[i : i + L]
+                        if g not in self.index:
+                            grams[g] += 1
+        ranked = sorted(((n * (len(g) - 1), g) for g, n in grams.items() if n >= min_count), reverse=True)
+        return [g for _, g in ranked[:top]]
+
     def save(self, path: Path) -> None:
         Path(path).write_text(json.dumps(self.tokens, ensure_ascii=False), encoding="utf-8")
 
