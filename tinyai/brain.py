@@ -518,20 +518,24 @@ class Brain:
         # 2. 会話の ppl (応答部だけ)。比較できるよう取り置き会話は一度決めたら固定する
         if not self.dialog_holdout and len(self.dialogs) >= n_dialogs * 2:
             rng = random.Random(12345)
-            cand = [(u, b) for u, b, _, w in list(self.dialogs.pairs) if w > 0 and 10 <= len(b) <= 200]
+            # 文学作品の会話 (文脈が無いと予測しようがない台詞) は評価から外す
+            cand = [(u, b) for u, b, src, w in list(self.dialogs.pairs) if w > 0 and 10 <= len(b) <= 200 and not src.startswith("aozora")]
             self.dialog_holdout = rng.sample(cand, min(n_dialogs, len(cand)))
         pairs = self.dialog_holdout or [(u, b) for u, b, _, w in list(self.dialogs.pairs)[-2000:] if w > 0][-n_dialogs:]
         if pairs:
-            lps = []
+            ppls = []
             with nl.lock, nl.model.use_ema():
                 for u, b in pairs:
                     ids = nl.seq_dialog(u, b)
                     start = nl.loss_from(ids)
                     if len(ids) - start < 2:
                         continue
-                    lps.append(nl.model.logprob(ids[max(0, start - 1):]))
-            if lps:
-                out["dialog_ppl"] = round(math.exp(-sum(lps) / len(lps)), 2)
+                    ppls.append(math.exp(-nl.model.logprob(ids[max(0, start - 1):])))
+            if ppls:
+                # 中央値で報告する: 固有名詞を含む 1 件が平均を 2 倍に押し上げる (実測: 平均 106 / 中央値 52)
+                ppls.sort()
+                out["dialog_ppl"] = round(ppls[len(ppls) // 2], 2)
+                out["dialog_ppl_mean"] = round(sum(ppls) / len(ppls), 2)
         # 3. RAG 忠実性: 知識文を文脈に、その文のキーワードを質問にして、答えが文脈の句をどれだけ含むか
         grounded = kw = n = 0
         for d in self.kb.random_docs(min(n_docs * 3, len(self.kb)), self.rng):
