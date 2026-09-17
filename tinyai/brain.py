@@ -649,6 +649,8 @@ class Brain:
             before = len(self.kb.index)
             surprise = self.neural.surprise(split_sentences(text)[:40:7]) if self.neural.model is not None else None
             n = self.learn_text(text, source=src)
+            # 本文は丸ごとディスクのコーパスへ: 知識ベースの上限とは別に、学習トークンだけを増やす
+            self.stats["corpus_tokens"] += self.neural.add_corpus_text(text)
             novelty = len(self.kb.index) - before
             total += n
             self.stats["new_terms"] += novelty

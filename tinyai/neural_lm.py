@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import threading
 import time
 from collections import deque
@@ -235,6 +236,32 @@ class NeuralLM:
             self.pool.add(ids, loss_from=self.loss_from(ids), kind="dialog")
         if self.corpus is not None:
             self.corpus.append(ids, loss_from=self.loss_from(ids), kind="dialog")
+
+    def add_corpus_text(self, text: str, max_chars: int = 400_000) -> int:
+        """ページ本文をそのままディスクのコーパスへ (知識ベースには入れない)。
+
+        知識ベースは重複判定・品質判定・事実抽出・意味ベクトルまで行うので重く、メモリ上限もある。
+        一方、言語モデルの学習に必要なのはトークン列だけで、1 トークン 4 バイトで済む。
+        読んだページの本文を丸ごとコーパスに流し込めば、知識ベースを太らせずに学習量だけを増やせる。
+        戻り値は追加したトークン数。"""
+        with self.lock:
+            if self.model is None or self.corpus is None or not text:
+                return 0
+            budget = self.model.T - 2
+            added = 0
+            for para in re.split(r"\n{2,}", text[:max_chars]):
+                para = para.strip()
+                if len(para) < 40:
+                    continue
+                ids = self.tok.encode(para)
+                for i in range(0, len(ids), budget):    # 文脈長で切って詰める (段落の流れは保つ)
+                    chunk = ids[i : i + budget]
+                    if len(chunk) < 16:
+                        break
+                    seq = [BOS] + list(chunk) + [EOS]
+                    if self.corpus.append(seq, kind="text"):
+                        added += len(seq)
+            return added
 
     def refresh_from_corpus(self, k: int) -> int:
         """ディスクのコーパスから k 本引いて再生バッファへ入れ直す。

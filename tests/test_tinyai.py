@@ -1605,5 +1605,26 @@ class SpanLearningTest(unittest.TestCase):
             self.assertEqual(nums, sorted(nums))          # 出てきた順のまま (並べ替えや欠落ではない)
 
 
+class BulkCorpusTest(unittest.TestCase):
+    """ページ本文を丸ごとディスクのコーパスへ流し込む (知識ベースを太らせずに学習量を増やす)。"""
+
+    def test_page_text_goes_into_the_corpus(self):
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="base", corpus_tokens=500_000)
+            nl.min_sentences, nl.min_chars = 4, 40
+            nl.ensure_model(["これは学習用の文章です。番号は %d 番です。" % i for i in range(200)])
+            page = "\n\n".join("段落 %d です。" % i + "この段落には十分な長さの文章が入っており、続きものとして意味が通ります。" * 3
+                                 for i in range(40))
+            added = nl.add_corpus_text(page)
+            self.assertGreater(added, 1000)                    # ページ 1 枚で数千トークン入る
+            self.assertGreater(len(nl.corpus), 10)
+            ids, lf, kind = nl.corpus.sample(1)[0]
+            self.assertEqual(kind, "text")
+            self.assertLessEqual(len(ids), nl.model.T)         # 文脈長を超える系列は作らない
+            self.assertEqual(nl.add_corpus_text(""), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
