@@ -1987,5 +1987,32 @@ class GrowthLogTest(unittest.TestCase):
             self.assertEqual(h["growth_log"][2]["value"], 6)
 
 
+class DialogBpcTest(unittest.TestCase):
+    """会話の質は 1 文字あたりのビット数でも測る (語彙を変えても比較できるように)。"""
+
+    def test_self_evaluate_reports_bpc(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            return
+        if not nn.available():
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
+            b.learn_text("\n".join("サンプル文 %d は学習用の文章です。内容は番号 %d の説明です。" % (i, i)
+                                    for i in range(10, 120)), "https://x/nn")
+            for i in range(40):
+                b.dialogs.add("質問 %d は何ですか" % i, "答え %d はこうです。理由も添えて説明します。" % i)
+            b.neural_step(budget_seconds=0.2)
+            r = b.self_evaluate(n_docs=4, n_dialogs=12)
+            if "dialog_ppl" not in r:
+                return
+            self.assertIn("dialog_bpc", r)
+            self.assertGreater(r["dialog_bpc"], 0)
+            self.assertLess(r["dialog_bpc"], 20)                  # 1 文字 20 ビットは超えない
+            self.assertTrue(b.neural.dialog_hist)                 # 規則が使う履歴に入る
+
+
 if __name__ == "__main__":
     unittest.main()

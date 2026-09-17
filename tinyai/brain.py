@@ -616,19 +616,31 @@ class Brain:
         pairs = self.dialog_holdout or [(u, b) for u, b, _, w, *_ in list(self.dialogs.pairs)[-2000:] if w > 0][-n_dialogs:]
         if pairs:
             ppls = []
+            nats = chars = 0.0
             with nl.lock, nl._infer():
                 for u, b in pairs:
                     ids = nl.seq_dialog(u, b)
                     start = nl.loss_from(ids)
                     if len(ids) - start < 2:
                         continue
-                    ppls.append(math.exp(-nl.model.logprob(ids[max(0, start - 1):])))
+                    seq = ids[max(0, start - 1):]
+                    mean_nat = -nl.model.logprob(seq)         # 1 トークンあたりの負の対数尤度
+                    ppls.append(math.exp(mean_nat))
+                    nats += mean_nat * (len(seq) - 1)
+                    chars += max(len(b), 1)
             if ppls:
                 # 中央値で報告する: 固有名詞を含む 1 件が平均を 2 倍に押し上げる (実測: 平均 106 / 中央値 52)
                 ppls.sort()
                 out["dialog_ppl"] = round(ppls[len(ppls) // 2], 2)
-                self.neural.note_dialog_ppl(out["dialog_ppl"])   # 成長の判断に使う
                 out["dialog_ppl_mean"] = round(sum(ppls) / len(ppls), 2)
+                if chars:
+                    # 1 文字あたりのビット数。語彙を増やすとトークンの区切りが変わり、
+                    # 1 トークンあたりの ppl は機械的に上がる (1 トークンが多くの文字を担うため)。
+                    # 文字あたりで測れば語彙の変更をまたいで比較できる。成長や学習率の判断にはこちらを使う。
+                    out["dialog_bpc"] = round(nats / chars / math.log(2), 4)
+                    self.neural.note_dialog_ppl(out["dialog_bpc"] * 100)   # 規則は同じ尺度で扱う
+                else:
+                    self.neural.note_dialog_ppl(out["dialog_ppl"])
         # 3. RAG 忠実性: 知識文を文脈に、その文のキーワードを質問にして、答えが文脈の句をどれだけ含むか
         grounded = kw = n = 0
         for d in self.kb.random_docs(min(n_docs * 3, len(self.kb)), self.rng):
