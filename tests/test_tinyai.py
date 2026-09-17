@@ -1804,5 +1804,28 @@ class TextQualityTest(unittest.TestCase):
             self.assertGreater(nl.add_corpus_text(good), 0)
 
 
+class VocabGrowthTest(unittest.TestCase):
+    """語彙の追加候補は、実際に減るトークン数で順位を付ける。"""
+
+    def test_candidates_ranked_by_real_savings(self):
+        from tinyai.bpe import SubwordTokenizer
+        texts = ["化学の実験をしました。化学の授業は化学室で行います。" for _ in range(10)]
+        tok = SubwordTokenizer.train(["あいうえお。かきくけこ。化学。実験。授業。"], size=200)
+        cand = tok.frequent_new_units(texts, top=10, min_count=3)
+        self.assertTrue(cand)
+        before = sum(len(tok.encode(t)) for t in texts)
+        tok.add_tokens(cand)
+        after = sum(len(tok.encode(t)) for t in texts)
+        self.assertLess(after, before)                    # 追加すると必ずトークン数が減る
+
+    def test_already_efficient_units_are_not_proposed(self):
+        """1 トークンで表せている単位は候補にしない (削減がゼロ)。"""
+        from tinyai.bpe import SubwordTokenizer
+        tok = SubwordTokenizer.train(["こんにちは。こんにちは。こんにちは。" for _ in range(5)], size=200)
+        cand = tok.frequent_new_units(["こんにちは。" * 10], top=20, min_count=3)
+        for c in cand:
+            self.assertGreater(len(tok.encode(c)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

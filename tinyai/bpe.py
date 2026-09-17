@@ -128,7 +128,12 @@ class SubwordTokenizer:
         return added
 
     def frequent_new_units(self, texts, top: int = 200, min_count: int = 5) -> list[str]:
-        """新しいテキストに頻出するが語彙に無い 2〜4 文字の連続 (語彙の進化用)。"""
+        """新しいテキストに頻出するが語彙に無い 2〜4 文字の連続 (語彙の進化用)。
+
+        実際に符号化した時に何トークン減るかで順位を付ける。単に「文字数 - 1」で数えると、
+        既にうまく分割できている英単語の断片 (velo, elop, dev …) が上位を占めてしまい、
+        1 トークンあたりの文字数 (実測 1.45 文字) が伸びない。日本語は 1 文字ずつに割れやすく、
+        まとめた時の削減が大きいので、実測の削減量で並べれば自然に日本語の語が上に来る。"""
         grams: Counter = Counter()
         for text in texts:
             text = self.normalize(text)
@@ -139,8 +144,20 @@ class SubwordTokenizer:
                         g = run[i : i + L]
                         if g not in self.index:
                             grams[g] += 1
-        ranked = sorted(((n * (len(g) - 1), g) for g, n in grams.items() if n >= min_count), reverse=True)
-        return [g for _, g in ranked[:top]]
+        scored = []
+        for g, n in grams.items():
+            if n < min_count:
+                continue
+            saved = len(self._encode_unit(g)) - 1      # 今は何トークンか → 1 トークンになると何個減るか
+            if saved <= 0:
+                continue
+            scored.append((n * saved, g))
+        scored.sort(reverse=True)
+        return [g for _, g in scored[:top]]
+
+    def _encode_unit(self, unit: str) -> list:
+        """1 つの連続を今の語彙で符号化した時のトークン列 (長さだけ使う)。"""
+        return self.encode(unit, max_tokens=len(unit) + 2)
 
     def save(self, path: Path) -> None:
         Path(path).write_text(json.dumps(self.tokens, ensure_ascii=False), encoding="utf-8")

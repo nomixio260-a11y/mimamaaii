@@ -576,7 +576,14 @@ class Brain:
                 mem_ok = self.guard.pressure() + grow_cost / max(self.guard.soft, 1) < 0.95
                 if nl.maybe_grow(mem_ok, data_tokens=nl.corpus.tokens if nl.corpus else 0):
                     self.stats["neural_grown"] += 1
-                added = nl.evolve_vocab([d.text for d in self.kb.random_docs(min(300, len(self.kb)), self.rng)], top=50)
+                # 語彙の進化: 学習に使っている文 (コーパス) から候補を採る。知識ベースだけを見ると
+                # 実際に学んでいる分布とずれる。1 語の追加コストは埋め込み 192 次元 × 4 系列 = 約 3 KB
+                # なので、まとめて増やしても安い (1 トークンあたりの文字数が増えれば、同じ文脈長で
+                # より多くの文が入る = 実質的に文脈が伸びる)。
+                vocab_texts = [d.text for d in self.kb.random_docs(min(300, len(self.kb)), self.rng)]
+                if nl.corpus is not None and len(nl.corpus):
+                    vocab_texts += [nl.tok.decode([int(t) for t in ids]) for ids, _, _ in nl.corpus.sample(300, nl.nprng)]
+                added = nl.evolve_vocab(vocab_texts, top=150)
                 if added:
                     self.stats["neural_vocab_added"] += added
                 log.info("ニューラル LM: step=%d loss=%.3f %s", nl.model.step, r["loss"], nl.stats())
