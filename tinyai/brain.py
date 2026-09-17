@@ -146,7 +146,7 @@ class Brain:
         self.neural = NeuralLM(self.cfg.data_dir, size=size, seed=self.cfg.seed or 0,
                                dropout=self.cfg.neural_dropout,
                                pool_capacity=max(30000, int(self.cfg.memory_mb) * 100),
-                               corpus_tokens=max(8_000_000, int(self.cfg.memory_mb) * 40_000))  # Transformer LM (numpy)
+                               corpus_tokens=max(8_000_000, int(self.cfg.memory_mb) * 80_000))  # Transformer LM (numpy)
         self.last_self_eval: dict | None = None
         self.dialog_holdout: list = []             # 評価用に固定した会話 (比較できるように)
         self._followup = False                     # 直前の発話が指示語・情報量の乏しい問いか
@@ -558,7 +558,7 @@ class Brain:
                 nl.evaluate(ngram)
                 # 進化: 損失が停滞したら層を追加、新語が増えていれば語彙を拡張
                 mem_ok = self.guard.pressure() < 0.7
-                if nl.maybe_grow(mem_ok):
+                if nl.maybe_grow(mem_ok, data_tokens=nl.corpus.tokens if nl.corpus else 0):
                     self.stats["neural_grown"] += 1
                 added = nl.evolve_vocab([d.text for d in self.kb.random_docs(min(300, len(self.kb)), self.rng)], top=50)
                 if added:

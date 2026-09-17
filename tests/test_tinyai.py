@@ -1474,6 +1474,26 @@ class GrowthTest(unittest.TestCase):
             self.assertFalse(nl.maybe_grow(True))
             self.assertEqual(nl.model.L, layers)
 
+    def test_grows_when_data_outgrows_capacity(self):
+        """損失が下がり続けていても、データ量が容量に対して多すぎれば先回りして大きくする。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.loss_hist = [3.0 - i * 0.05 for i in range(20)]       # まだ順調に下がっている = 停滞ではない
+            layers = nl.model.L
+            self.assertFalse(nl.maybe_grow(True))                     # データ量を渡さなければ成長しない
+            need = nl.TOKENS_PER_PARAM * nl.model.n_params()
+            self.assertTrue(nl.maybe_grow(True, data_tokens=need + 1))
+            self.assertEqual(nl.model.L, layers + 1)
+
+    def test_data_rich_growth_still_respects_the_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.recent_hist = [10.0, 10.0, 20.0, 20.0]                 # 今の分布で悪化中 = 過学習
+            need = nl.TOKENS_PER_PARAM * nl.model.n_params()
+            layers = nl.model.L
+            self.assertFalse(nl.maybe_grow(True, data_tokens=need * 10))
+            self.assertEqual(nl.model.L, layers)
+
     def test_forgetting_alone_does_not_block_growth(self):
         """固定の取り置きだけが悪化 (= 忘却) なら、容量を増やす判断は止めない。"""
         with tempfile.TemporaryDirectory() as tmp:

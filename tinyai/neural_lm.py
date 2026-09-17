@@ -350,8 +350,14 @@ class NeuralLM:
             return {"loss": last, "weight": weight}
 
         # ------------------------------------------------------------ 進化 (成長・語彙・復号)
-    def maybe_grow(self, memory_ok: bool = True) -> bool:
-        """損失が停滞していて容量に余裕があれば、関数を保ったまま層を 1 つ追加する。"""
+    TOKENS_PER_PARAM = 20        # Chinchilla 則の目安: このトークン数を賄えるだけの容量があるべき
+
+    def maybe_grow(self, memory_ok: bool = True, data_tokens: int = 0) -> bool:
+        """容量を増やす判断。次のどちらかで、関数を保ったまま層 (または中間次元) を増やす。
+          1. 損失が停滞した = 今の容量で学べることは学び切った
+          2. 手持ちのトークン数がモデルの容量に対して多すぎる (20 トークン/パラメータ超)
+        2 は Chinchilla 則の考え方で、データが増えたなら先回りして大きくする、という判断。
+        どちらの場合も「今の分布での取り置き ppl が悪化していない」ことを条件にする。"""
         with self.lock:
             if self.model is None or not memory_ok:
                 return False
@@ -369,7 +375,10 @@ class NeuralLM:
             ph = self.recent_hist if len(self.recent_hist) >= 4 else self.ppl_hist
             if len(ph) >= 4 and sum(ph[-2:]) / 2 > sum(ph[-4:-2]) / 2 * 1.15:
                 return False
-            if before - recent < 0.02 and recent > 1.5:  # 改善が止まり、まだ十分に低くない
+            plateau = before - recent < 0.02 and recent > 1.5     # 改善が止まり、まだ十分に低くない
+            # データ過多: 今の大きさでは与えたトークンを使い切れない (パラメータあたり 20 トークン超)
+            data_rich = bool(data_tokens) and data_tokens > self.TOKENS_PER_PARAM * self.model.n_params()
+            if plateau or data_rich:
                 self.stop_parallel()  # パラメータの形が変わるので並列ワーカーは作り直す (次の train_some で再開)
                 if self.model.L < max_layers:
                     self.model.grow_layer()
@@ -379,6 +388,9 @@ class NeuralLM:
                     self.widened += 1
                     log.info("ニューラル LM: 中間次元を拡張 -> ff=%d (%d params)", self.model.ff, self.model.n_params())
                 self.grown += 1
+                if data_rich and not plateau:
+                    log.info("データ量が容量を超えたので成長 (%.1fM トークン / %.1fM パラメータ)",
+                             data_tokens / 1e6, self.model.n_params() / 1e6)
                 self.loss_hist = []
                 return True
             return False
