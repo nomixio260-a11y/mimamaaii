@@ -1484,5 +1484,37 @@ class GrowthTest(unittest.TestCase):
             self.assertEqual(nl.model.L, layers + 1)
 
 
+class PoolMixTest(unittest.TestCase):
+    """再生バッファの種類の混ざり具合: 会話に偏らせない。"""
+
+    def test_dialog_share_is_capped(self):
+        import numpy as np
+        from tinyai.neural import SequencePool
+        p = SequencePool(1000, seed=0)
+        mix = ["dialog"] * 70 + ["text"] * 20 + ["copy"] * 7 + ["qa"] * 3   # 収集は会話に偏る
+        for i in range(12000):
+            p.add(np.array([8, 9, 10, 11, 12], dtype=np.int32), kind=mix[i % len(mix)])
+        n = len(p.items)
+        self.assertEqual(n, 1000)
+        share = {k: v / n for k, v in p.kind_counts.items()}
+        self.assertLessEqual(share["dialog"], 0.60)        # 会話は上限で頭打ちになる
+        self.assertGreater(share.get("text", 0), 0.15)     # 平文の居場所が残る
+
+    def test_rebalances_an_existing_dialog_heavy_pool(self):
+        """会話に偏ったバッファでも、平文を流し込めば比率が戻る。"""
+        import numpy as np
+        from tinyai.neural import SequencePool
+        p = SequencePool(500, seed=1)
+        ids = np.array([8, 9, 10, 11, 12], dtype=np.int32)
+        p.max_share = {}                                   # 上限を入れる前に貯めたバッファを模す
+        for _ in range(500):
+            p.add(ids, kind="dialog")
+        self.assertEqual(p.kind_counts["dialog"], 500)
+        p.max_share = SequencePool(1).max_share             # 以後は上限つきで運用する
+        for _ in range(2000):
+            p.add(ids, kind="text")
+        self.assertGreater(p.kind_counts.get("text", 0) / len(p.items), 0.3)
+
+
 if __name__ == "__main__":
     unittest.main()

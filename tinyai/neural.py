@@ -663,7 +663,10 @@ class SequencePool:
         self.journal: list | None = None       # ワーカー同期用: None なら記録しない
         self.kinds: list[str] = []             # 系列ごとの種類 (text / dialog / copy / qa)
         self.kind_counts: dict[str, int] = {}
-        self.max_share = {"copy": 0.30, "qa": 0.15}   # 種類ごとの上限 (比率)。偏ると自由な文生成が弱る
+        # 種類ごとの上限 (比率)。会話は収集量が桁違いに多く、放っておくとバッファのほとんどを占める
+        # (実測: 会話 80% / 平文 12%)。平文が痩せると素の言語モデルとしての予測力が落ちるので、
+        # 会話にも上限を置いて平文の居場所を残す。
+        self.max_share = {"dialog": 0.55, "copy": 0.25, "qa": 0.12}
 
     def add(self, ids, weight: float = 1.0, loss_from: int = 0, kind: str = "text") -> None:
         """weight < 0 は負例 (unlikelihood)。負例は詰め込まず単独の系列として学習する。
@@ -672,7 +675,9 @@ class SequencePool:
         if len(ids) < 3:
             return
         cap = self.max_share.get(kind)
-        if cap is not None and self.items and self.kind_counts.get(kind, 0) >= cap * len(self.items):
+        # 上限は容量に対する比率で見る。現在の件数を分母にすると、詰め始めの数件だけで比率が跳ね上がり、
+        # その種類がほとんど入らなくなる (会話 500 件を空のバッファに入れて 1 件しか残らない、という具合)。
+        if cap is not None and self.kind_counts.get(kind, 0) >= cap * self.capacity:
             return                              # その種類はもう十分 (比率の上限)
         if not isinstance(ids, np.ndarray):
             ids = np.asarray(ids, dtype=np.int32)
