@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import gzip
+import zlib
 import json
 import logging
 import os
@@ -155,6 +156,21 @@ def parse_feed(xml_text: str) -> list[tuple[str, str, str]]:
     return items
 
 
+def gunzip_prefix(data: bytes) -> bytes:
+    """gzip を展開する。上限で切られて終端記号が無い時は、読めたところまでを返す。
+
+    以前は OSError だけを握りつぶしていたが、途中で切れた gzip が投げるのは EOFError なので
+    例外がそのまま上まで抜け、上限を超える応答 (1 行が論文 1 本ぶんあるデータセットなど) は
+    「供給源失敗」として丸ごと捨てられていた。"""
+    try:
+        return gzip.decompress(data)
+    except (OSError, EOFError):
+        try:
+            return zlib.decompressobj(31).decompress(data)
+        except zlib.error:
+            return b""
+
+
 class Fetcher:
     def __init__(self, user_agent: str, timeout: float = 12.0, max_bytes: int = 400_000, per_host_delay: float = 2.0):
         self.user_agent = user_agent
@@ -211,13 +227,11 @@ class Fetcher:
     def _raw_get(self, url: str, limit: int | None = None) -> bytes:
         req = urllib.request.Request(url, headers={"User-Agent": self.user_agent, "Accept-Encoding": "gzip", "Accept-Language": "ja,en;q=0.7"})
         with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl) as r:
-            data = r.read((limit or self.max_bytes) + 1)
+            cap = limit or self.max_bytes
+            data = r.read(cap + 1)
             if r.headers.get("Content-Encoding") == "gzip":
-                try:
-                    data = gzip.decompress(data)
-                except OSError:
-                    pass
-            return data[: (limit or self.max_bytes)]
+                data = gunzip_prefix(data)
+            return data[:cap]
 
     # ------------------------------------------------------------ 公開 API
     def get(self, url: str, max_bytes: int | None = None) -> bytes | None:
@@ -258,8 +272,8 @@ class Fetcher:
             log.info("取得失敗 %s: %s", url, e)
             return None
 
-    def get_json(self, url: str):
-        data = self.get(url)
+    def get_json(self, url: str, max_bytes: int | None = None):
+        data = self.get(url, max_bytes=max_bytes)
         if data is None:
             return None
         try:

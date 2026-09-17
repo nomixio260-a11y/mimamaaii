@@ -2276,3 +2276,18 @@ class OffTopicRetrievalTest(unittest.TestCase):
             r = self._brain(tmp).reply("味噌汁の作り方を教えて")
             self.assertIn("味噌", r.text)
             self.assertNotIn("リコッタ", r.text)
+
+
+class GunzipPrefixTest(unittest.TestCase):
+    """上限で切られた gzip 応答から、読めたところまでを取り出す。"""
+
+    def test_full_and_truncated(self):
+        import gzip as _gzip
+        from tinyai.web import gunzip_prefix
+        body = ("日本語の長い本文。" * 4000).encode("utf-8")
+        blob = _gzip.compress(body)
+        self.assertEqual(gunzip_prefix(blob), body)
+        part = gunzip_prefix(blob[: len(blob) // 2])
+        self.assertGreater(len(part), 1000)                 # 圧縮バイト列ではなく本文が返る
+        self.assertTrue(body.startswith(part))
+        self.assertEqual(gunzip_prefix(b"not gzip at all"), b"")

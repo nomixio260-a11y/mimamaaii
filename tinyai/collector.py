@@ -309,10 +309,12 @@ class HuggingFaceDatasets(Source):
     kind = "stream"
     weight = 1.5      # 会話・指示・読解データは希少なので少し優先
     PAGE = 100
+    MAX_BYTES = 3_000_000      # 1 回の応答の上限 (既定の 40 万バイトだと長文のデータセットが落ちる)
 
     def __init__(self, col, lang="ja"):
         super().__init__(col, lang)
         self.offsets: dict[str, int] = {}
+        self.pages: dict[str, int] = {}     # データセットごとの 1 回に読む行数 (論文のように 1 行が大きいものは小さく)
         self.last_dialogs: list = []
 
     def _specs(self) -> list[tuple[str, str, str, str, float]]:
@@ -415,10 +417,18 @@ class HuggingFaceDatasets(Source):
             total = int((js0 or {}).get("num_rows_total") or 0)
             self.offsets[key] = random.randrange(0, total - self.PAGE) if total > self.PAGE * 2 else 0
         off = self.offsets.get(key, 0)
+        page = self.pages.get(key, self.PAGE)
         url = (f"https://datasets-server.huggingface.co/rows?dataset={urllib.parse.quote(ds, safe='')}&config={urllib.parse.quote(cfg)}"
-               f"&split={split}&offset={off}&length={self.PAGE}")
-        js = self.f.get_json(url)
-        rows = (js or {}).get("rows", [])
+               f"&split={split}&offset={off}&length={page}")
+        js = self.f.get_json(url, max_bytes=self.MAX_BYTES)
+        if js is None:
+            # 論文のように 1 行が大きいデータセットは、100 行まとめて読むと上限を超えて丸ごと落ちる。
+            # 読めるまで刻みを小さくする (実測: J-ResearchCorpus は 1 度も収集できていなかった)
+            if page > 2:
+                self.pages[key] = max(2, page // 5)
+                log.info("%s は 1 回に %d 行へ減らします (応答が大きすぎました)", ds, self.pages[key])
+            return []
+        rows = js.get("rows", [])
         if not rows:
             self.offsets[key] = 0  # 末尾まで来たら最初から
             return []
