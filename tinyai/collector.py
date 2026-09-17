@@ -296,7 +296,7 @@ class Aozora(Source):
         text = html_to_text(html)[0]
         if len(text) < 300:
             return []
-        self.last_dialogs = extract_quote_pairs(text)  # 会話文の応酬 (会話データ)
+        self.last_dialogs = extract_quote_pairs(text, with_history=True)  # 会話文の応酬 (履歴つきの多ターン会話)
         return [(url, f"『{title}』（{author}）\n" + text[:60000], [])]
 
 
@@ -356,15 +356,24 @@ class HuggingFaceDatasets(Source):
         elif fmt == "preference":   # 選好データ: 採用された応答は正例、不採用の応答は負例 (unlikelihood)
             conv = row.get("conversations") or []
             last_user = ""
+            turns: list[tuple[str, str]] = []
+            pending = None
             for m in conv:
-                if (m.get("from") or m.get("role") or "").lower() in ("human", "user", "prompter"):
-                    last_user = (m.get("value") or m.get("content") or "").strip()
+                role = (m.get("from") or m.get("role") or "").lower()
+                val = (m.get("value") or m.get("content") or "").strip()
+                if role in ("human", "user", "prompter"):
+                    last_user = val
+                    pending = val
+                elif role in ("gpt", "assistant", "bot") and pending:
+                    turns.append((pending, val))    # 選好データも多くは多ターン: 手前のやり取りを履歴にする
+                    pending = None
+            hist = turns[-2:]
             chosen = (row.get("chosen") or "").strip()
             rejected = (row.get("rejected") or "").strip()
             if last_user and chosen:
-                pairs.append((last_user, chosen))
+                pairs.append((last_user, chosen, None, 1.0, list(hist)) if hist else (last_user, chosen))
                 if rejected and rejected != chosen:
-                    pairs.append((last_user, rejected, None, -1.0))
+                    pairs.append((last_user, rejected, None, -1.0, list(hist)))
         elif fmt == "squad":   # 読解: 文脈の中から答える練習 (RAG と同じ形)
             q = (row.get("question") or "").strip()
             ctx = (row.get("context") or "").strip()

@@ -108,18 +108,30 @@ class DialogStore:
         return ds
 
 
-def extract_quote_pairs(text: str, max_pairs: int = 200) -> list[tuple[str, str]]:
+def extract_quote_pairs(text: str, max_pairs: int = 200, with_history: bool = False) -> list[tuple]:
     """文学作品などから「」で囲まれた発話の連続を (発話, 応答) のペアにする。
-    地の文が長く挟まる場合はペアにしない。"""
-    out = []
+    地の文が長く挟まる場合はペアにしない。
+
+    with_history=True なら、同じ応酬の中で手前に続いていたやり取りを履歴として付け、
+    (発話, 応答, None, 1.0, 履歴) の形で返す。台詞の応酬は人間どうしの会話そのものなので、
+    多ターンの練習に使える数少ない自然なデータ源になる。"""
+    out: list[tuple] = []
+    chain: list[tuple[str, str]] = []      # 続いている応酬 (地の文で切れたら空にする)
     last_end = None
     last_q = None
     for m in _QUOTE_RE.finditer(text):
         q = m.group(1).strip()
-        if last_q is not None and last_end is not None and m.start() - last_end <= 40:
+        linked = last_q is not None and last_end is not None and m.start() - last_end <= 40
+        if linked:
             if q != last_q:
-                out.append((last_q, q))
+                if with_history and chain:
+                    out.append((last_q, q, None, 1.0, list(chain[-2:])))
+                else:
+                    out.append((last_q, q))
+                chain.append((last_q, q))
                 if len(out) >= max_pairs:
                     break
+        else:
+            chain = []                      # 応酬が途切れた: 履歴を引き継がない
         last_q, last_end = q, m.end()
     return out

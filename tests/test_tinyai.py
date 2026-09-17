@@ -701,6 +701,10 @@ class DialogTest(unittest.TestCase):
         ds2 = DialogStore.from_state(ds.state())
         self.assertEqual(len(ds2), 5)
         self.assertEqual(extract_quote_pairs("「行くのか」と聞いた。「行くよ」と答えた。"), [("行くのか", "行くよ")])
+        chain = extract_quote_pairs("「行くのか」「行くよ」「いつだ」「明日だ」", with_history=True)
+        self.assertEqual(chain[0][:2], ("行くのか", "行くよ"))     # 最初の応酬には履歴が無い
+        self.assertEqual(chain[1][4], [("行くのか", "行くよ")])     # 次からは手前の応酬が履歴になる
+        self.assertEqual(len(chain[-1][4]), 2)                      # 履歴は直近 2 組まで
 
     def test_hf_row_parsing(self):
         from tinyai.collector import HuggingFaceDatasets
@@ -1126,8 +1130,10 @@ class RealtimeLearningTest(unittest.TestCase):
         row = {"conversations": [{"from": "human", "value": "質問"}, {"from": "gpt", "value": "途中の答え"}, {"from": "human", "value": "本題は？"}],
                "chosen": "良い答えです。", "rejected": "悪い答えです。"}
         pairs = HuggingFaceDatasets._pairs_from_row(row, "preference")
-        self.assertEqual(pairs[0], ("本題は？", "良い答えです。"))
+        self.assertEqual(pairs[0][:2], ("本題は？", "良い答えです。"))
+        self.assertEqual(pairs[0][4], [("質問", "途中の答え")])   # 手前のやり取りを履歴に持つ
         self.assertEqual(pairs[1][3], -1.0)      # 不採用の応答は負例
+        self.assertEqual(pairs[1][4], pairs[0][4])                # 負例も同じ履歴の続き
         try:
             from tinyai import neural as nn
         except Exception:
