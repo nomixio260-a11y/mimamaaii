@@ -2042,6 +2042,13 @@ class DialogBpcTest(unittest.TestCase):
                 self.assertLessEqual(r["dialog_gain_fresh"], 1.0)
                 again = b.self_evaluate(n_docs=4, n_dialogs=12)   # 続けて測っても同じ値 (比べられる)
                 self.assertEqual(again["dialog_bpc_fresh"], r["dialog_bpc_fresh"])
+            # 規則が見る履歴は 1 回の評価で 1 つだけ、しかも同じ尺度で入る
+            before = len(b.neural.dialog_hist)
+            b.self_evaluate(n_docs=4, n_dialogs=12)
+            self.assertEqual(len(b.neural.dialog_hist) - before, 1)
+            hist = b.neural.dialog_hist[-4:]
+            if len(hist) >= 2:
+                self.assertLess(max(hist) / max(min(hist), 1e-9), 4.0)   # 別尺度が混ざると 8 倍以上開く
             if "dialog_bpc_unigram" in r:
                 self.assertGreater(r["dialog_bpc_unigram"], 0)
                 self.assertAlmostEqual(r["dialog_bpc_gain"],

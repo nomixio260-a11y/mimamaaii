@@ -731,6 +731,11 @@ class Brain:
             return {}
         out: dict = {"step": nl.model.step}
         t0 = time.perf_counter()
+        # 成長・学習率・取り消しの規則が見る「会話の質」の履歴は 1 回の評価で 1 つだけ入れる。
+        # 以前は固定の取り置き (bpc×100 ≒ 410) と入れ替わる取り置き (削減率 ≒ 49) の**両方**を
+        # 同じ履歴に入れていたので、隣り合う値が別の尺度になり、規則が比べていたのは雑音だった。
+        # 入れ替わる取り置きの方が今の分布に近いので、両方測れた時はそちらを採る。
+        dialog_metric: float | None = None
         # 1. 取り置き文の ppl (言語としての予測力)
         if nl._holdout:
             out["ppl"] = round(neural_perplexity(nl), 2)
@@ -777,9 +782,9 @@ class Brain:
                     if uni:
                         out["dialog_bpc_unigram"] = round(uni, 3)
                         out["dialog_bpc_gain"] = round(1 - out["dialog_bpc"] / uni, 3)   # 0 = 頻度だけ、1 = 完全予測
-                    self.neural.note_dialog_ppl(out["dialog_bpc"] * 100)   # 規則は同じ尺度で扱う
+                    dialog_metric = out["dialog_bpc"] * 100       # 規則は同じ尺度で扱う
                 else:
-                    self.neural.note_dialog_ppl(out["dialog_ppl"])
+                    dialog_metric = out["dialog_ppl"]
         # 2b. 最近の会話でも同じ測り方をする。固定の取り置きは時間が経つほど今の分布から離れるので、
         # そこだけを見ると「分布が動いた」のを「質が落ちた」と取り違える
         # (実測: 固定 4.23 bpc / 削減 45.7% に対し、最近の会話では 3.35 bpc / 削減 49.0%)。
@@ -813,7 +818,10 @@ class Brain:
                 if uni2:
                     out["dialog_gain_fresh"] = round(1 - out["dialog_bpc_fresh"] / uni2, 3)
                     # 規則には「基準からの削減率」を使う: 語彙が変わっても、取り置きの中身が変わっても比較できる
-                    nl.note_dialog_ppl((1 - out["dialog_gain_fresh"]) * 100)
+                    dialog_metric = (1 - out["dialog_gain_fresh"]) * 100
+
+        if dialog_metric is not None:
+            nl.note_dialog_ppl(dialog_metric)
 
         # 3. RAG 忠実性: 知識文を文脈に、その文のキーワードを質問にして、答えが文脈の句をどれだけ含むか
         grounded = kw = n = 0
