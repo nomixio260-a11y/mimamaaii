@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading
 import time
 from pathlib import Path
 
@@ -45,6 +46,8 @@ class NeuralLM:
     def __init__(self, data_dir: Path, size: str = "base", vocab_size: int = 6000, seed: int = 0, dropout: float = 0.1):
         self.available = neural.available()
         self.dropout = float(dropout)
+        # 学習スレッドと会話スレッドが同じモデルを触るためのロック (EMA への切替中に更新が走ると壊れる)
+        self.lock = threading.RLock()
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / "neural.npz"
         self.size = size if size in neural.PRESETS else "base"
@@ -210,65 +213,68 @@ class NeuralLM:
     def learn_turn(self, user: str, bot: str, context: str | None = None, weight: float = 1.0, steps: int = 2) -> dict | None:
         """今の対話を即座に学習する。weight > 0 は正例、< 0 は unlikelihood (その答えを出しにくくする)。
         その系列 + 再生バッファからの少量を混ぜて数ステップ更新 (忘却を防ぐ)。"""
-        if self.model is None:
-            return None
-        ids = self.seq_dialog(user, bot, context)
-        lf = self.loss_from(ids)
-        self.pool.add(ids, weight, loss_from=lf)
-        T = self.model.T
-        B = 4 if len(self.pool) >= 8 else 1   # 再生バッファがまだ無ければその系列だけで学ぶ
-        x = neural.np.full((B, T), neural.PAD, dtype=neural.np.int64)
-        y = neural.np.full((B, T), neural.PAD, dtype=neural.np.int64)
-        w = neural.np.ones((B, T), dtype=neural.np.float32)
-        seq = ids[: T + 1]
-        L = len(seq) - 1
-        x[0, :L] = seq[:L]
-        y[0, :L] = seq[1 : L + 1]
-        tw = neural.SequencePool.token_weights(L, lf, weight)
-        w[0, :L] = tw if weight > 0 else -tw
-        if B > 1:
-            rx, ry, rw = self.pool.batch(B - 1, T)
-            x[1:], y[1:], w[1:] = rx, ry, rw
-        last = None
-        for _ in range(steps):
-            loss, g = self.model.loss_and_grads(x, y, w)
-            self.model.adamw(g, lr=self.lr * 0.5)
-            last = loss
-        self.online_steps += steps
-        self.trained_tokens += steps * B * T
-        return {"loss": last, "weight": weight}
+        with self.lock:
+            if self.model is None:
+                return None
+            ids = self.seq_dialog(user, bot, context)
+            lf = self.loss_from(ids)
+            self.pool.add(ids, weight, loss_from=lf)
+            T = self.model.T
+            B = 4 if len(self.pool) >= 8 else 1   # 再生バッファがまだ無ければその系列だけで学ぶ
+            x = neural.np.full((B, T), neural.PAD, dtype=neural.np.int64)
+            y = neural.np.full((B, T), neural.PAD, dtype=neural.np.int64)
+            w = neural.np.ones((B, T), dtype=neural.np.float32)
+            seq = ids[: T + 1]
+            L = len(seq) - 1
+            x[0, :L] = seq[:L]
+            y[0, :L] = seq[1 : L + 1]
+            tw = neural.SequencePool.token_weights(L, lf, weight)
+            w[0, :L] = tw if weight > 0 else -tw
+            if B > 1:
+                rx, ry, rw = self.pool.batch(B - 1, T)
+                x[1:], y[1:], w[1:] = rx, ry, rw
+            last = None
+            for _ in range(steps):
+                loss, g = self.model.loss_and_grads(x, y, w)
+                self.model.adamw(g, lr=self.lr * 0.5)
+                last = loss
+            self.online_steps += steps
+            self.trained_tokens += steps * B * T
+            return {"loss": last, "weight": weight}
 
-    # ------------------------------------------------------------ 進化 (成長・語彙・復号)
+        # ------------------------------------------------------------ 進化 (成長・語彙・復号)
     def maybe_grow(self, memory_ok: bool = True) -> bool:
         """損失が停滞していて容量に余裕があれば、関数を保ったまま層を 1 つ追加する。"""
-        if self.model is None or not memory_ok:
+        with self.lock:
+            if self.model is None or not memory_ok:
+                return False
+            if self.model.L >= neural.MAX_LAYERS.get(self.size, 6):
+                return False
+            h = self.loss_hist
+            if len(h) < 20:
+                return False
+            recent, before = sum(h[-10:]) / 10, sum(h[-20:-10]) / 10
+            if before - recent < 0.02 and recent > 1.5:  # 改善が止まり、まだ十分に低くない
+                self.stop_parallel()  # パラメータの形が変わるので並列ワーカーは作り直す (次の train_some で再開)
+                self.model.grow_layer()
+                self.grown += 1
+                self.loss_hist = []
+                log.info("ニューラル LM: 層を追加 -> %d 層 (%d params)", self.model.L, self.model.n_params())
+                return True
             return False
-        if self.model.L >= neural.MAX_LAYERS.get(self.size, 6):
-            return False
-        h = self.loss_hist
-        if len(h) < 20:
-            return False
-        recent, before = sum(h[-10:]) / 10, sum(h[-20:-10]) / 10
-        if before - recent < 0.02 and recent > 1.5:  # 改善が止まり、まだ十分に低くない
-            self.stop_parallel()  # パラメータの形が変わるので並列ワーカーは作り直す (次の train_some で再開)
-            self.model.grow_layer()
-            self.grown += 1
-            self.loss_hist = []
-            log.info("ニューラル LM: 層を追加 -> %d 層 (%d params)", self.model.L, self.model.n_params())
-            return True
-        return False
 
     def evolve_vocab(self, texts, top: int = 100) -> int:
         """新しいテキストに頻出する未知の単位を語彙に足す (モデルの埋め込みも拡張)。"""
-        if self.model is None or self.tok is None:
-            return 0
-        units = self.tok.frequent_new_units(texts, top=top)
-        n = self.tok.add_tokens(units)
-        if n:
-            self.stop_parallel()  # 埋め込みの形が変わるので並列ワーカーは作り直す
-            self.model.add_tokens(n)
-            self.vocab_added += n
-        return n
+        with self.lock:
+            if self.model is None or self.tok is None:
+                return 0
+            units = self.tok.frequent_new_units(texts, top=top)
+            n = self.tok.add_tokens(units)
+            if n:
+                self.stop_parallel()  # 埋め込みの形が変わるので並列ワーカーは作り直す
+                self.model.add_tokens(n)
+                self.vocab_added += n
+            return n
 
     def feedback(self, positive: bool) -> None:
         """👍/👎 で復号パラメータを山登り: 試行中の設定が採用済みより良ければ採用、悪ければ戻す。"""
@@ -295,78 +301,82 @@ class NeuralLM:
         self._fb = [0, 0]
 
     def train_some(self, steps: int = 4, batch: int | None = None) -> dict | None:
-        if self.model is None or len(self.pool) < 32:
-            return None
-        batch = batch or self.batch
-        if self.workers > 1:
-            if self._parallel is None:
-                self._parallel = ParallelTrainer(self.model, self.pool, workers=self.workers)
-                if not self._parallel.start():
-                    self._parallel = None
-                    self.workers = 1
-            if self._parallel is not None:
-                try:
-                    r = self._parallel.train(steps=steps, batch=batch, lr=self.lr, total=self.total_steps)
-                except MemoryError:
-                    self.batch = max(2, batch // 2)
-                    return None
-                self.trained_tokens += steps * batch * self._parallel.workers * self.model.T
-                self.last_loss = r.get("loss")
-                self.loss_hist.append(r["loss"])
-                if len(self.loss_hist) > 200:
-                    del self.loss_hist[:100]
-                return r
-        try:
-            r = neural.train_steps(self.model, self.pool, steps=steps, batch=batch, lr=self.lr, total=self.total_steps)
-        except MemoryError:
-            # メモリ上限に当たったらバッチを半分にして続ける
-            self.batch = max(2, batch // 2)
-            log.warning("ニューラル LM: メモリ不足のためバッチを %d に縮小", self.batch)
-            return None
-        self.trained_tokens += steps * batch * self.model.T
-        self.last_loss = r.get("loss")
-        self.loss_hist.append(r["loss"])
-        if len(self.loss_hist) > 200:
-            del self.loss_hist[:100]
-        return r
+        with self.lock:
+            if self.model is None or len(self.pool) < 32:
+                return None
+            batch = batch or self.batch
+            if self.workers > 1:
+                if self._parallel is None:
+                    self._parallel = ParallelTrainer(self.model, self.pool, workers=self.workers)
+                    if not self._parallel.start():
+                        self._parallel = None
+                        self.workers = 1
+                if self._parallel is not None:
+                    try:
+                        r = self._parallel.train(steps=steps, batch=batch, lr=self.lr, total=self.total_steps)
+                    except MemoryError:
+                        self.batch = max(2, batch // 2)
+                        return None
+                    self.trained_tokens += steps * batch * self._parallel.workers * self.model.T
+                    self.last_loss = r.get("loss")
+                    self.loss_hist.append(r["loss"])
+                    if len(self.loss_hist) > 200:
+                        del self.loss_hist[:100]
+                    return r
+            try:
+                r = neural.train_steps(self.model, self.pool, steps=steps, batch=batch, lr=self.lr, total=self.total_steps)
+            except MemoryError:
+                # メモリ上限に当たったらバッチを半分にして続ける
+                self.batch = max(2, batch // 2)
+                log.warning("ニューラル LM: メモリ不足のためバッチを %d に縮小", self.batch)
+                return None
+            self.trained_tokens += steps * batch * self.model.T
+            self.last_loss = r.get("loss")
+            self.loss_hist.append(r["loss"])
+            if len(self.loss_hist) > 200:
+                del self.loss_hist[:100]
+            return r
 
     def evaluate(self, ngram_ppl: float | None = None) -> dict:
-        if self.model is None or not self._holdout:
-            return {}
-        with self.model.use_ema():
-            self.holdout_ppl = round(neural.perplexity(self.model, self._holdout), 2)
-        self.ngram_ppl = ngram_ppl
-        if self.holdout_ppl is not None:
-            if ngram_ppl is not None:
-                self.ready = self.holdout_ppl <= ngram_ppl * self.ready_ratio
-            else:
-                self.ready = self.holdout_ppl <= self.ready_abs  # n-gram の取り置きが無い時の絶対基準
-        return {"neural_ppl": self.holdout_ppl, "ngram_ppl": ngram_ppl, "ready": self.ready}
+        with self.lock:
+            if self.model is None or not self._holdout:
+                return {}
+            with self.model.use_ema():
+                self.holdout_ppl = round(neural.perplexity(self.model, self._holdout), 2)
+            self.ngram_ppl = ngram_ppl
+            if self.holdout_ppl is not None:
+                if ngram_ppl is not None:
+                    self.ready = self.holdout_ppl <= ngram_ppl * self.ready_ratio
+                else:
+                    self.ready = self.holdout_ppl <= self.ready_abs  # n-gram の取り置きが無い時の絶対基準
+            return {"neural_ppl": self.holdout_ppl, "ngram_ppl": ngram_ppl, "ready": self.ready}
 
     def save(self) -> None:
-        if self.model is None or self.tok is None:
-            return
-        self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300],
-                                                   "decode": self.decode, "grown": self.grown, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
-        self._last_save = time.time()
+        with self.lock:
+            if self.model is None or self.tok is None:
+                return
+            self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300],
+                                                       "decode": self.decode, "grown": self.grown, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
+            self._last_save = time.time()
 
-    # ------------------------------------------------------------ データの価値 (驚き)
+        # ------------------------------------------------------------ データの価値 (驚き)
     def surprise(self, texts, max_texts: int = 6) -> float | None:
         """文の集合の平均トークン損失 (nat)。モデルにとって新しい情報ほど大きい。
         収集ソースの評価に使う: 低すぎる = 既知 (学ぶ価値が低い)、極端に高い = ジャンクや別言語。"""
-        if self.model is None or self.tok is None:
-            return None
-        texts = [t for t in texts if len(t) >= 8][:max_texts]
-        if not texts:
-            return None
-        drop, self.model.dropout = self.model.dropout, 0.0
-        try:
-            lp = [self.model.logprob(self.seq_text(t)) for t in texts]
-        finally:
-            self.model.dropout = drop
-        return round(-sum(lp) / len(lp), 3)
+        with self.lock:
+            if self.model is None or self.tok is None:
+                return None
+            texts = [t for t in texts if len(t) >= 8][:max_texts]
+            if not texts:
+                return None
+            drop, self.model.dropout = self.model.dropout, 0.0
+            try:
+                lp = [self.model.logprob(self.seq_text(t)) for t in texts]
+            finally:
+                self.model.dropout = drop
+            return round(-sum(lp) / len(lp), 3)
 
-    # ------------------------------------------------------------ 利用
+        # ------------------------------------------------------------ 利用
     def score(self, text: str) -> float | None:
         if self.model is None:
             return None
@@ -375,26 +385,28 @@ class NeuralLM:
 
     def chat(self, user: str, context: str | None = None, n: int = 2, max_new: int = 48, temperature: float = 0.7) -> list[str]:
         """RAG 形式で応答候補を n 本生成。"""
-        if self.model is None:
-            return []
-        prompt = self.prompt_dialog(user, context)
-        out = []
-        dec = self.decode
-        with self.model.use_ema():
-            gens = self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=dec["temperature"], top_p=dec["top_p"], repetition_penalty=dec["repetition_penalty"], rng=self.nprng)
-        for ids in gens:
-            text = self.tok.decode(ids).strip()
-            if len(text) >= 2:
-                out.append(text)
-        return out
+        with self.lock:
+            if self.model is None:
+                return []
+            prompt = self.prompt_dialog(user, context)
+            out = []
+            dec = self.decode
+            with self.model.use_ema():
+                gens = self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=dec["temperature"], top_p=dec["top_p"], repetition_penalty=dec["repetition_penalty"], rng=self.nprng)
+            for ids in gens:
+                text = self.tok.decode(ids).strip()
+                if len(text) >= 2:
+                    out.append(text)
+            return out
 
     def continue_text(self, seed_text: str, max_new: int = 40, temperature: float = 0.8) -> str:
-        if self.model is None:
-            return ""
-        prompt = [BOS] + self.tok.encode(seed_text, max_tokens=self.model.T // 2)
-        with self.model.use_ema():
-            ids = self.model.generate(prompt, max_new=max_new, temperature=temperature, rng=self.nprng)
-        return self.tok.decode(ids)
+        with self.lock:
+            if self.model is None:
+                return ""
+            prompt = [BOS] + self.tok.encode(seed_text, max_tokens=self.model.T // 2)
+            with self.model.use_ema():
+                ids = self.model.generate(prompt, max_new=max_new, temperature=temperature, rng=self.nprng)
+            return self.tok.decode(ids)
 
     def stats(self) -> dict:
         if not self.available:

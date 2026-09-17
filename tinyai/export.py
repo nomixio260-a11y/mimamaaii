@@ -8,7 +8,10 @@ model.bin の構成: meta.json の tensors に各テンソルの [名前, 形, �
 量子化で 4 分の 1 のサイズになり (base 2.9M params → 約 3 MB)、誤差は logits で 1% 程度。"""
 from __future__ import annotations
 
+import ast
+import base64
 import json
+import re
 import struct
 from pathlib import Path
 
@@ -60,7 +63,10 @@ def export_model(model: "neural.TinyTransformer", tok, out_dir: Path, meta_extra
         b += b"\0" * pad
         blobs.append(b)
         offset += len(b)
-    (out_dir / "model.bin").write_bytes(b"".join(blobs))
+    raw = b"".join(blobs)
+    (out_dir / "model.bin").write_bytes(raw)
+    # 静的ホスティング先によっては .bin を配信できないので base64 テキストも置く (ページ側が自動で選ぶ)
+    (out_dir / "model.b64.txt").write_text(base64.b64encode(raw).decode("ascii"), encoding="utf-8")
     meta = {
         "V": model.V, "d": model.d, "heads": model.h, "layers": model.L, "ctx": model.T, "ff": model.ff,
         "params": model.n_params(), "step": model.step, "bytes": offset, "tensors": tensors, "ema": src is not model.p,
@@ -90,7 +96,47 @@ def export_model(model: "neural.TinyTransformer", tok, out_dir: Path, meta_extra
     return meta
 
 
-def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1_500_000, replay: int = 400) -> dict:
+_STEP_RE = re.compile(r"^step (\d+) loss ([\d.]+) (\d+) tok/s\s+(\{.*?\})\s+経過 ([\d.]+) 分")
+_COLLECT_RE = re.compile(r"^\s+収集 \[(\w+)\] (.+?) : (\d+) 文, 会話 (\d+)(?: \(会話計 (\d+)\))?")
+
+
+def history_from_logs(paths, max_points: int = 400) -> dict:
+    """train コマンドのログから学習の経過 (ステップ・損失・取り置き ppl・速度) と収集の記録を取り出す。
+    ブラウザ版の「サーバー側の学習の様子」に渡す。"""
+    steps: list[dict] = []
+    collects: list[dict] = []
+    for path in paths:
+        path = Path(path)
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = _STEP_RE.match(line)
+            if m:
+                try:
+                    ev = ast.literal_eval(m.group(4))
+                except Exception:
+                    ev = {}
+                steps.append({"step": int(m.group(1)), "loss": round(float(m.group(2)), 3),
+                              "tok_s": int(m.group(3)), "ppl": ev.get("neural_ppl"), "ngram_ppl": round(ev.get("ngram_ppl"), 1) if ev.get("ngram_ppl") else None})
+                continue
+            m = _COLLECT_RE.match(line)
+            if m:
+                collects.append({"kind": m.group(1), "topic": m.group(2)[:60], "sentences": int(m.group(3)), "dialogs": int(m.group(4)),
+                                 "total_dialogs": int(m.group(5)) if m.group(5) else None})
+    steps.sort(key=lambda r: r["step"])
+    dedup: list[dict] = []
+    for r in steps:
+        if dedup and dedup[-1]["step"] == r["step"]:
+            dedup[-1] = r
+        else:
+            dedup.append(r)
+    if len(dedup) > max_points:                       # 間引く (先頭と末尾は残す)
+        k = len(dedup) / max_points
+        dedup = [dedup[min(int(i * k), len(dedup) - 1)] for i in range(max_points)]
+    return {"train_log": dedup, "collect_log": collects[-60:], "collect_total": len(collects)}
+
+
+def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1_500_000, replay: int = 400, logs=None) -> dict:
     """Brain 全体からブラウザ用の一式を書き出す (モデル + 知識文 + 再生用の会話例 + 進化の統計)。"""
     nl = brain.neural
     if nl.model is None or nl.tok is None:
@@ -116,6 +162,11 @@ def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1
         "grown_layers": nl.grown, "vocab_added": nl.vocab_added, "online_steps": nl.online_steps, "decode": nl.decode,
         "last_loss": stats.get("last_loss"), "loss_hist": [round(x, 3) for x in nl.loss_hist[-100:]],
         "kb_docs": len(brain.kb), "facts": brain.facts.count,
-        "dialogs": len(brain.dialogs), "exported_docs": len(docs),
+        "dialogs": len(brain.dialogs), "exported_docs": len(docs), "dialogs_by_source": brain.dialogs.by_source(),
+        "stats": {k: v for k, v in brain.stats.items() if isinstance(v, (int, float))},
     }
+    if logs:
+        extra.update(history_from_logs(logs))
+        if extra.get("train_log") and not extra.get("loss_hist"):
+            extra["loss_hist"] = [r["loss"] for r in extra["train_log"]]
     return export_model(nl.model, nl.tok, out_dir, extra)

@@ -83,8 +83,12 @@ python -m tinyai train --steps 2000 --seconds 600          # 手元の知識と�
 python -m tinyai train --hours 3 --size large              # 収集システムからデータを流し込みながら長時間
 TINYAI_NEURAL=small python -m tinyai chat                  # 小さいモデルで裏学習 (低スペック向け)
 
+# 学習しながら、その学習中のモデルと会話する (学習は止まらない)
+python -m tinyai train --hours 4 --workers 4 --serve 8799
+curl -s -X POST -d '{"text":"機械学習とは？"}' http://127.0.0.1:8799/ask   # 応答 + 思考過程 + 学習の状況
+
 # ブラウザ版の書き出し (web/ と同じ場所に置いて静的配信する)
-python -m tinyai export --out web/dist
+python -m tinyai export --out web/dist --log train.log
 cp web/index.html web/engine.js web/worker.js web/dist/ && python -m http.server -d web/dist 8080
 node web/validate.js web/dist         # JS 移植と numpy の一致検査 (トークナイザ・logits・損失・勾配)
 
@@ -243,7 +247,8 @@ python tools/bench.py corpus.txt --memory 256
 「学習の完了」は存在しない。どのモードでも学習は止まらない:
 
 * `chat` / `serve`: 収集スレッド (Evolver) が Web・公開データセット・会話データを集めて学び、学習スレッド (NeuralTrainer) が空き時間に Transformer を更新し続ける。会話のたびにそのターンで勾配更新
-* `train --hours N`: 1 分ごとに 1 バッチ収集しながらデータ並列で学習 (新しい系列は即座にワーカーへ同期)。N 時間で止まるのはコマンドであって学習ではなく、次回は続きから再開する
+* `train --hours N`: 1 分ごとに 1 バッチ収集しながらデータ並列で学習 (新しい系列は即座にワーカーへ同期)。N 時間で止まるのはコマンドであって学習ではなく、次回は続きから再開する。
+  `--serve PORT` を付けると**学習を続けたまま**会話 API が開き、いま学習中の重みでそのまま話せる (会話したターンもその場で学習される)
 * ブラウザ版: 会話ごとの更新に加えて常時学習 (3 秒ごとに 1 系列) が走り、重みは端末に保存される
 
 ## テスト・評価・実験

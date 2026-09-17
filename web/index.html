@@ -56,6 +56,14 @@ canvas { display: block; width: 100%; max-width: 100%; }
 .levelbar .bar { flex: 1; height: 8px; border-radius: 4px; background: var(--surface2); border: 1px solid var(--line2); overflow: hidden; }
 .levelbar .bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--heat)); width: 0; transition: width .6s; }
 .levelbar b { font-family: var(--mono); color: var(--ink); }
+.collectbox { grid-column: 1 / -1; border-top: 1px solid var(--line2); padding-top: 8px; min-width: 0; }
+.collectbox h3 { margin: 0 0 6px; font-size: 12px; color: var(--ink2); font-weight: 500; display: flex; gap: 10px; align-items: baseline; }
+.collectbox h3 span { font-family: var(--mono); color: var(--ink3); }
+.collectrow { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; }
+.chip { flex: 0 0 auto; border: 1px solid var(--line2); border-radius: 8px; padding: 4px 8px; background: var(--surface2); font-size: 11.5px; max-width: 230px; }
+.chip b { display: block; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chip span { font-family: var(--mono); color: var(--ink3); font-size: 11px; }
+.chip.dlg { border-color: var(--accent); background: var(--accent-soft); }
 
 /* 本体 2 カラム */
 .main { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 12px; align-items: start; }
@@ -138,12 +146,19 @@ details.about p { margin: 6px 0; }
     <div class="metric"><span class="k">取り置き PPL</span><span class="v" id="mPpl">–</span><span class="s">低いほど文を予測できる</span></div>
     <div class="metric"><span class="k">この端末での学習</span><span class="v" id="mOnline">–</span><span class="s" id="mOnlineTok">–</span></div>
     <div class="metric"><span class="k">直近の損失</span><span class="v" id="mLoss">–</span><span class="s" id="mLossTrend">–</span></div>
-    <div class="metric"><span class="k">知識文</span><span class="v" id="mDocs">–</span><span class="s" id="mReplay">–</span></div>
+    <div class="metric"><span class="k">知識文 / 事実</span><span class="v" id="mDocs">–</span><span class="s" id="mReplay">–</span></div>
+    <div class="metric"><span class="k">学んだ会話</span><span class="v" id="mDialogs">–</span><span class="s" id="mDialogSrc">–</span></div>
     <div class="metric"><span class="k">評価 👍 / 👎</span><span class="v" id="mFb">–</span><span class="s" id="mDecode">–</span></div>
     <div class="levelbar"><span>進化度</span><div class="bar"><i id="levelFill"></i></div><b id="levelText">Lv 0</b></div>
     <div class="chart">
-      <div class="chartbox"><h3>事前学習の損失 (サーバー側, 直近)<span id="preLossLast"></span></h3><canvas id="preChart" height="90"></canvas></div>
-      <div class="chartbox"><h3>あなたとの学習の損失 (この端末)<span id="onLossLast"></span></h3><canvas id="onChart" height="90"></canvas></div>
+      <div class="chartbox"><h3>サーバーでの学習 <span id="preLossLast"></span></h3><canvas id="preChart" height="104"></canvas>
+        <div class="legend"><span><i style="background:var(--accent)"></i>学習損失</span><span><i style="background:var(--heat)"></i>取り置き PPL (未知の文の予測しにくさ)</span></div></div>
+      <div class="chartbox"><h3>この端末での学習 <span id="onLossLast"></span></h3><canvas id="onChart" height="104"></canvas>
+        <div class="legend"><span><i style="background:var(--accent)"></i>会話・常時学習の損失</span></div></div>
+    </div>
+    <div class="collectbox" id="collectBox" hidden>
+      <h3>サーバーが読んで学んだもの <span id="collectSum"></span></h3>
+      <div class="collectrow" id="collectRow"></div>
     </div>
   </section>
 
@@ -277,8 +292,7 @@ details.about p { margin: 6px 0; }
     const lh = st.lossHist || [];
     $('mLoss').textContent = lh.length ? lh[lh.length - 1].toFixed(3) : (m.last_loss ? Number(m.last_loss).toFixed(3) : '–');
     if (lh.length >= 6) { const a = avg(lh.slice(-3)), b = avg(lh.slice(-6, -3)); $('mLossTrend').textContent = a < b ? `↓ 下がっている (${(b - a).toFixed(3)})` : `↑ 上がっている (${(a - b).toFixed(3)})`; } else $('mLossTrend').textContent = lh.length ? '学習中' : '事前学習の最終値';
-    $('mDocs').textContent = fmt(s.docs);
-    $('mReplay').textContent = `覚えた文 +${fmt(st.learnedDocs)} 再生 ${fmt(s.replay)} 会話`;
+    $('mReplay').textContent = `配布 ${fmt(m.exported_docs || s.docs)} 文 + 覚えた文 ${fmt(st.learnedDocs)}`;
     $('mFb').textContent = `${fmt(st.good)} / ${fmt(st.bad)}`;
     $('mDecode').textContent = `温度 ${s.decode.temperature} top-p ${s.decode.top_p} 反復 ${s.decode.repetition_penalty}`;
     // 進化度: 事前学習ステップ・オンライン学習・評価・語彙拡張から作る連続値 (対数)
@@ -286,6 +300,9 @@ details.about p { margin: 6px 0; }
     const lvl = Math.floor(score / 10);
     $('levelText').textContent = `Lv ${lvl} (${score.toFixed(1)})`;
     $('levelFill').style.width = Math.min(100, (score % 10) * 10) + '%';
+    $('mDialogs').textContent = fmt(m.dialogs || 0);
+    $('mDialogSrc').textContent = Object.entries(m.dialogs_by_source || {}).map(([k, v]) => `${k.replace(/:(ja|en)$/, '')} ${fmt(v)}`).join(' / ') || '–';
+    $('mDocs').textContent = `${fmt(s.docs)} / ${fmt(m.facts || 0)}`;
     drawLoss($('onChart'), lh, getCss('--accent'));
     $('onLossLast').textContent = lh.length ? `最新 ${lh[lh.length - 1].toFixed(3)} / 最小 ${Math.min.apply(null, lh).toFixed(3)}` : '';
   }
@@ -303,6 +320,48 @@ details.about p { margin: 6px 0; }
     c.strokeStyle = color; c.lineWidth = 1.6; c.beginPath();
     data.forEach((v, i) => { i ? c.lineTo(x(i), y(v)) : c.moveTo(x(i), y(v)); }); c.stroke();
     c.fillStyle = color; c.beginPath(); c.arc(x(data.length - 1), y(data[data.length - 1]), 2.5, 0, Math.PI * 2); c.fill();
+  }
+
+  // サーバー側の学習: 学習損失 (左軸) と取り置き PPL (右軸) を同じ時間軸で描く
+  function drawServer(cv, log) {
+    const dpr = window.devicePixelRatio || 1; const W = cv.clientWidth || 300, H = cv.clientHeight || 104;
+    cv.width = W * dpr; cv.height = H * dpr; const c = cv.getContext('2d'); c.scale(dpr, dpr); c.clearRect(0, 0, W, H);
+    c.font = '10px ' + getCss('--mono'); c.fillStyle = getCss('--ink3'); c.strokeStyle = getCss('--line2');
+    if (!log || log.length < 2) { c.fillText('学習の記録がありません', 6, H / 2); return; }
+    const pad = { l: 36, r: 40, t: 8, b: 16 };
+    const loss = log.map((r) => r.loss), ppl = log.map((r) => r.ppl).filter((v) => v != null);
+    const lo = Math.min.apply(null, loss), hi = Math.max.apply(null, loss), span = (hi - lo) || 1;
+    const plo = ppl.length ? Math.min.apply(null, ppl) : 0, phi = ppl.length ? Math.max.apply(null, ppl) : 1, pspan = (phi - plo) || 1;
+    const x = (i) => pad.l + (i / (log.length - 1)) * (W - pad.l - pad.r);
+    const y = (v) => pad.t + (1 - (v - lo) / span) * (H - pad.t - pad.b);
+    const yp = (v) => pad.t + (1 - (v - plo) / pspan) * (H - pad.t - pad.b);
+    for (const v of [lo, (lo + hi) / 2, hi]) { c.beginPath(); c.moveTo(pad.l, y(v)); c.lineTo(W - pad.r, y(v)); c.stroke(); c.fillStyle = getCss('--ink3'); c.fillText(v.toFixed(2), 2, y(v) + 3); }
+    if (ppl.length) { c.fillStyle = getCss('--heat'); for (const v of [plo, phi]) c.fillText(v.toFixed(0), W - pad.r + 4, yp(v) + 3); }
+    c.fillStyle = getCss('--ink3');
+    c.fillText('step ' + log[0].step, pad.l, H - 3);
+    const lastLabel = 'step ' + log[log.length - 1].step;
+    c.fillText(lastLabel, Math.max(pad.l + 60, W - pad.r - c.measureText(lastLabel).width), H - 3);
+    if (ppl.length) { c.strokeStyle = getCss('--heat'); c.lineWidth = 1.4; c.beginPath(); let started = false; log.forEach((r, i) => { if (r.ppl == null) return; started ? c.lineTo(x(i), yp(r.ppl)) : c.moveTo(x(i), yp(r.ppl)); started = true; }); c.stroke(); }
+    c.strokeStyle = getCss('--accent'); c.lineWidth = 1.8; c.beginPath();
+    log.forEach((r, i) => { i ? c.lineTo(x(i), y(r.loss)) : c.moveTo(x(i), y(r.loss)); }); c.stroke();
+    const last = log[log.length - 1];
+    c.fillStyle = getCss('--accent'); c.beginPath(); c.arc(x(log.length - 1), y(last.loss), 2.5, 0, Math.PI * 2); c.fill();
+    $('preLossLast').textContent = `step ${fmt(last.step)} · loss ${last.loss.toFixed(3)} · PPL ${last.ppl != null ? last.ppl.toFixed(1) : '–'} · ${fmt(last.tok_s)} トークン/秒`;
+  }
+  // サーバーが読んで学んだもの (収集の記録)
+  function renderCollect(meta) {
+    const rows = meta.collect_log || [];
+    const box = $('collectBox'); box.hidden = !rows.length;
+    if (!rows.length) return;
+    const sent = rows.reduce((a, r) => a + r.sentences, 0), dlg = rows.reduce((a, r) => a + r.dialogs, 0);
+    $('collectSum').textContent = `直近 ${rows.length} 回で ${fmt(sent)} 文 / ${fmt(dlg)} 会話 (学習中も増え続けています)`;
+    const row = $('collectRow'); row.innerHTML = '';
+    for (const r of rows.slice().reverse()) {
+      const el = document.createElement('div'); el.className = 'chip' + (r.dialogs ? ' dlg' : '');
+      const b = document.createElement('b'); b.textContent = r.topic; const sp = document.createElement('span');
+      sp.textContent = `${r.sentences} 文${r.dialogs ? ` · ${r.dialogs} 会話` : ''}`;
+      el.append(b, sp); row.appendChild(el);
+    }
   }
 
   function renderThinking(r) {
@@ -355,7 +414,9 @@ details.about p { margin: 6px 0; }
 
   // ---------------------------------------------------------- 会話
   async function send(text) {
-    text = (text || '').trim(); if (!text || state.busy) return;
+    text = (text || '').trim();
+    if (!text) return;
+    if (state.busy) { state.queued = text; setStatus('前の処理を待っています…', 'busy'); return; }  // 取りこぼさない
     state.busy = true; $('send').disabled = true; $('input').value = '';
     addMsg('user', text);
     const teach = text.match(/^(覚えて|おぼえて|教える|remember)[:：]\s*(.+)$/);
@@ -379,6 +440,7 @@ details.about p { margin: 6px 0; }
       setStatus('準備完了', 'on');
     } catch (e) { addMsg('sys', 'エラー: ' + e.message); setStatus('エラー', ''); }
     state.busy = false; $('send').disabled = false; $('input').focus();
+    if (state.queued) { const q = state.queued; state.queued = null; send(q); }
   }
   function addMeta(msgEl, text, turn) {
     const meta = document.createElement('div'); meta.className = 'meta'; const s = document.createElement('span'); s.textContent = text; meta.appendChild(s);
@@ -422,15 +484,25 @@ details.about p { margin: 6px 0; }
     for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); got += value.length; onProgress(got / total); }
     const out = new Uint8Array(got); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; } return out.buffer;
   }
+  // 重み: model.bin をそのまま、置けない配信先では model.b64.txt (base64) を読む
+  async function fetchWeights(onProgress) {
+    try { return await fetchProgress('model.bin', onProgress); } catch (e) { /* 次へ */ }
+    const buf = await fetchProgress('model.b64.txt', (f) => onProgress(f * 0.8));
+    const text = new TextDecoder().decode(new Uint8Array(buf)).replace(/\s+/g, '');
+    const bin = atob(text); const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    onProgress(1);
+    return u8.buffer;
+  }
   async function boot() {
     try {
       const [meta, vocab, kb] = await Promise.all([fetch('meta.json').then((r) => r.json()), fetch('vocab.json').then((r) => r.json()), fetch('kb.json').then((r) => r.json())]);
       state.meta = meta; state.vocab = vocab.filter((t) => SPECIALS.indexOf(t) < 0);
       $('loadText').textContent = `重み ${(meta.bytes / 1e6).toFixed(1)} MB (int8) を取得中`;
-      const bin = await fetchProgress('model.bin', (f) => { $('loadBar').style.width = Math.round(f * 100) + '%'; });
+      const bin = await fetchWeights((f) => { $('loadBar').style.width = Math.round(f * 100) + '%'; });
       $('loadText').textContent = '重みを float32 に展開しています';
-      drawLoss($('preChart'), meta.loss_hist || [], getCss('--heat'));
-      $('preLossLast').textContent = meta.loss_hist && meta.loss_hist.length ? `最終 ${meta.loss_hist[meta.loss_hist.length - 1].toFixed(3)}` : '';
+      drawServer($('preChart'), meta.train_log || []);
+      renderCollect(meta);
       startWorker();
       if (!state.worker) await loadScript('engine.js');
       const snapshot = await dbGet('snapshot');
@@ -449,10 +521,10 @@ details.about p { margin: 6px 0; }
     }
   }
   // 常時学習: 会話していない間も 3 秒ごとに 1 系列学ぶ (Worker があれば画面は止まらない)
-  let idleCount = 0, idleLossSum = 0;
+  let idleCount = 0, idleLossSum = 0, idleRunning = false;
   async function idleTick() {
-    if (!state.summary || state.busy || !$('idleToggle').checked || document.hidden) return;
-    state.busy = true;
+    if (!state.summary || state.busy || idleRunning || !$('idleToggle').checked || document.hidden) return;
+    idleRunning = true;   // 利用者の操作を止めない (Worker が呼び出しを順番に処理する)
     try {
       const r = await call({ op: 'idle' });
       if (r.result) {
@@ -462,7 +534,7 @@ details.about p { margin: 6px 0; }
         if (idleCount % 20 === 0) { addEvent(`常時学習 ${idleCount} step (平均 loss ${(idleLossSum / 20).toFixed(3)})`); idleLossSum = 0; scheduleSave(); }
       }
     } catch (e) { $('idleInfo').textContent = 'エラー'; }
-    state.busy = false;
+    idleRunning = false;
   }
   setInterval(idleTick, 3000);
   $('form').addEventListener('submit', (ev) => { ev.preventDefault(); send($('input').value); });
@@ -471,7 +543,7 @@ details.about p { margin: 6px 0; }
     if (!confirm('この端末での学習内容をすべて消して、配布時の重みに戻します。よろしいですか？')) return;
     await dbDel('snapshot'); location.reload();
   });
-  window.addEventListener('resize', () => { if (state.summary) renderSummary(state.summary); if (state.last) drawAttention(state.last.best, state.last.promptPieces); if (state.meta) drawLoss($('preChart'), state.meta.loss_hist || [], getCss('--heat')); });
+  window.addEventListener('resize', () => { if (state.summary) renderSummary(state.summary); if (state.last) drawAttention(state.last.best, state.last.promptPieces); if (state.meta) drawServer($('preChart'), state.meta.train_log || []); });
   boot();
 })();
 </script>

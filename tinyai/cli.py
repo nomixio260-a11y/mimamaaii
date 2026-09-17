@@ -217,6 +217,14 @@ def cmd_train(args) -> int:
     print(f"写し取り練習 {n_copy} 例を追加")
     nl.set_workers(args.workers if args.workers is not None else cfg.neural_workers)
     print(f"モデル {nl.size}: パラメータ {nl.model.n_params():,}, 語彙 {len(nl.tok)}, プール {len(nl.pool)} 系列 / {nl.pool.total_tokens:,} トークン, 会話 {len(brain.dialogs)}, 並列 {nl.workers}")
+    srv = None
+    if args.serve:
+        state = {"step": 0, "loss": None, "tok_s": None, "ppl": None, "started": time.time(), "collected": 0}
+        srv = serve_background(brain, args.serve_host, args.serve, status=lambda: dict(
+            state, elapsed_min=round((time.time() - state["started"]) / 60, 1), neural=nl.stats()))
+        print(f"学習中のモデルと会話できます: http://{args.serve_host}:{args.serve}/  (/ask, /stats)")
+    else:
+        state = None
     collector = None
     if args.hours and cfg.web_enabled:
         from .collector import Collector
@@ -248,6 +256,8 @@ def cmd_train(args) -> int:
                 if batch is not None:
                     n = brain.learn_batch(batch, collector)
                     brain.background_step(budget_docs=400)
+                    if state is not None:
+                        state["collected"] += n
                     print(f"  収集 [{batch.kind}] {batch.topic[:30]} : {n} 文, 会話 {len(batch.dialogs)} (会話計 {len(brain.dialogs)})")
             before = nl.model.step
             r = brain.neural_step(steps=10, budget_seconds=60)
@@ -255,6 +265,8 @@ def cmd_train(args) -> int:
                 print("学習データが足りません")
                 break
             done += nl.model.step - before
+            if state is not None:
+                state.update(step=nl.model.step, loss=round(r["loss"], 3), tok_s=r.get("tokens_per_s"), ppl=nl.holdout_ppl)
             if done - last_log >= 100:
                 last_log = done
                 ev = nl.evaluate(brain.lm.perplexity(brain.holdout) if brain.holdout else None)
@@ -263,6 +275,8 @@ def cmd_train(args) -> int:
     except KeyboardInterrupt:
         pass
     nl.evaluate(brain.lm.perplexity(brain.holdout) if brain.holdout else None)
+    if srv is not None:
+        srv.shutdown()
     nl.stop_parallel()
     brain.save()
     print(json.dumps(nl.stats(), ensure_ascii=False))
@@ -285,7 +299,7 @@ def cmd_export(args) -> int:
     from .export import export_brain
 
     try:
-        meta = export_brain(brain, Path(args.out), max_docs=args.max_docs)
+        meta = export_brain(brain, Path(args.out), max_docs=args.max_docs, logs=args.log)
     except RuntimeError as e:
         print(e)
         return 1
@@ -303,18 +317,8 @@ def cmd_stats(args) -> int:
 
 
 # ---------------------------------------------------------------- serve
-def cmd_serve(args) -> int:
-    cfg = _build_config(args)
-    _setup_logging(cfg, args.verbose)
-    brain = _open_brain(cfg)
-    evolver = None
-    trainer = None
-    if not args.no_auto:
-        evolver = Evolver(brain)
-        evolver.start()
-    if cfg.background_training and brain.neural.available:
-        trainer = NeuralTrainer(brain)
-        trainer.start()
+def _make_handler(brain, evolver=None, status=None):
+    """HTTP ハンドラを作る (serve と train --serve が共用)。status は追加情報を返す関数。"""
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, payload, ctype="application/json; charset=utf-8"):
@@ -333,6 +337,8 @@ def cmd_serve(args) -> int:
                 d = brain.describe()
                 if evolver:
                     d["evolver"] = evolver.describe()
+                if status:
+                    d["training"] = status()
                 self._send(200, d)
             elif u.path == "/ask":
                 q = parse_qs(u.query).get("q", [""])[0]
@@ -364,7 +370,30 @@ def cmd_serve(args) -> int:
         def log_message(self, fmt, *a):
             logging.getLogger("tinyai.http").info(fmt, *a)
 
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    return Handler
+
+
+def serve_background(brain, host: str, port: int, evolver=None, status=None):
+    """学習を続けながら HTTP で会話できるようにする (デーモンスレッド)。サーバーを返す。"""
+    srv = ThreadingHTTPServer((host, port), _make_handler(brain, evolver, status))
+    t = threading.Thread(target=srv.serve_forever, daemon=True, name="tinyai-http")
+    t.start()
+    return srv
+
+
+def cmd_serve(args) -> int:
+    cfg = _build_config(args)
+    _setup_logging(cfg, args.verbose)
+    brain = _open_brain(cfg)
+    evolver = None
+    trainer = None
+    if not args.no_auto:
+        evolver = Evolver(brain)
+        evolver.start()
+    if cfg.background_training and brain.neural.available:
+        trainer = NeuralTrainer(brain)
+        trainer.start()
+    srv = ThreadingHTTPServer((args.host, args.port), _make_handler(brain, evolver))
     print(f"http://{args.host}:{args.port}/  (Ctrl+C で終了)")
     try:
         srv.serve_forever()
@@ -427,6 +456,8 @@ def main(argv=None) -> int:
     p.add_argument("--hours", type=float, default=None, help="収集しながら長時間学習する")
     p.add_argument("--size", choices=["small", "base", "large", "xl"], default=None)
     p.add_argument("--workers", type=int, default=None, help="データ並列のプロセス数 (既定: CPU 数 - 1)")
+    p.add_argument("--serve", type=int, default=None, metavar="PORT", help="学習しながらこのポートで会話 API を開く (学習中のモデルとそのまま話せる)")
+    p.add_argument("--serve-host", default="127.0.0.1")
     p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("stats", help="状態を表示")
@@ -435,6 +466,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("export", help="ブラウザ版 (web/) 用にモデルを int8 で書き出す")
     p.add_argument("--out", default="web/dist")
     p.add_argument("--max-docs", type=int, default=12000)
+    p.add_argument("--log", action="append", help="train のログ (学習曲線と収集の記録をページに載せる)")
     p.set_defaults(func=cmd_export)
 
     p = sub.add_parser("serve", help="HTTP API + 簡易 Web UI")
