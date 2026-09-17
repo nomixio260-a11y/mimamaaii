@@ -118,7 +118,7 @@ def neural_perplexity(nl) -> float:
     """取り置き文のパープレキシティ (EMA 重みで)。"""
     from . import neural as _neural
 
-    with nl.lock, nl.model.use_ema():
+    with nl.lock, nl._infer():
         return _neural.perplexity(nl.model, nl._holdout)
 
 
@@ -543,7 +543,7 @@ class Brain:
         pairs = self.dialog_holdout or [(u, b) for u, b, _, w in list(self.dialogs.pairs)[-2000:] if w > 0][-n_dialogs:]
         if pairs:
             ppls = []
-            with nl.lock, nl.model.use_ema():
+            with nl.lock, nl._infer():
                 for u, b in pairs:
                     ids = nl.seq_dialog(u, b)
                     start = nl.loss_from(ids)

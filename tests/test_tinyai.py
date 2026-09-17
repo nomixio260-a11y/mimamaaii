@@ -1200,6 +1200,36 @@ class RealtimeLearningTest(unittest.TestCase):
             turns = b.recent_turns(2)
             self.assertTrue(turns and turns[-1][0] == "元気ですか")
 
+    def test_ema_guard_falls_back_to_raw_weights(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp:
+            from tinyai.neural_lm import NeuralLM
+            nl = NeuralLM(Path(tmp), size="small")
+            texts = [f"文 {i} は EMA 検査のための文章であり、番号 {i} を説明する。" for i in range(200)]
+            nl.min_sentences, nl.min_chars = 10, 100
+            self.assertTrue(nl.ensure_model(texts))
+            for t in texts:
+                nl.add_text(t)
+            nl.train_some(steps=5, batch=4)
+            nl._holdout = [nl.seq_text(t) for t in texts[:20]]
+            # EMA をわざと壊す (学習が速いと EMA が遅れて悪くなる状況の再現)
+            nl.model.update_ema()
+            for k in nl.model.ema:
+                nl.model.ema[k] = nl.model.ema[k] + np.float32(0.5)
+            ev = nl.evaluate()
+            self.assertFalse(nl.use_ema)                      # 悪い EMA は使わない
+            self.assertIsNotNone(nl.ema_ppl)
+            raw = nn.perplexity(nl.model, nl._holdout)
+            self.assertLess(abs(ev["neural_ppl"] - raw), raw * 0.2)   # 報告値は生の重みの側
+            # 作り直された EMA は重みと一致する
+            self.assertLess(float(max(np.abs(nl.model.ema[k] - nl.model.p[k]).max() for k in nl.model.p)), 1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()

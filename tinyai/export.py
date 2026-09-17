@@ -34,12 +34,12 @@ def dequantize_rows(q, scale):
     return (q.astype(neural.np.float32) * scale[:, None]).astype(neural.np.float32)
 
 
-def export_model(model: "neural.TinyTransformer", tok, out_dir: Path, meta_extra: dict | None = None) -> dict:
+def export_model(model: "neural.TinyTransformer", tok, out_dir: Path, meta_extra: dict | None = None, use_ema: bool = True) -> dict:
     """model.bin / meta.json / vocab.json / test.json を書く。返り値は meta。"""
     np = neural.np
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    src = model.ema if model.ema is not None and all(k in model.ema and model.ema[k].shape == v.shape for k, v in model.p.items()) else model.p
+    src = model.ema if use_ema and model.ema is not None and all(k in model.ema and model.ema[k].shape == v.shape for k, v in model.p.items()) else model.p
     names = ["wte"]
     for i in range(model.L):
         names += [f"l{i}.rms1", f"l{i}.wqkv", f"l{i}.wo", f"l{i}.rms2", f"l{i}.w1", f"l{i}.wg", f"l{i}.w2"]
@@ -179,4 +179,4 @@ def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1
         extra.update(history_from_logs(logs))
         if extra.get("train_log") and not extra.get("loss_hist"):
             extra["loss_hist"] = [r["loss"] for r in extra["train_log"]]
-    return export_model(nl.model, nl.tok, out_dir, extra)
+    return export_model(nl.model, nl.tok, out_dir, extra, use_ema=getattr(nl, "use_ema", True))

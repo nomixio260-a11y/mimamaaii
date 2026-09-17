@@ -58,6 +58,8 @@ class NeuralLM:
         self._fb_best = 0.5         # 採用済み設定の 👍 率
         self.loss_hist: list[float] = []
         self.ppl_hist: list[float] = []      # 取り置き ppl の推移 (成長の判断に使う)
+        self.use_ema = True                  # EMA (平均重み) を推論に使うか。評価で悪ければ自動で切る
+        self.ema_ppl = None
         self.grown = 0
         self.widened = 0
         self.vocab_added = 0
@@ -382,8 +384,21 @@ class NeuralLM:
         with self.lock:
             if self.model is None or not self._holdout:
                 return {}
-            with self.model.use_ema():
-                self.holdout_ppl = round(neural.perplexity(self.model, self._holdout), 2)
+            # EMA と生の重みを比べ、良い方を推論に使う (学習が速いと EMA が遅れて悪くなることがある)
+            raw_ppl = round(neural.perplexity(self.model, self._holdout), 2)
+            ema_ppl = None
+            if self.model.ema is not None:
+                with self.model.use_ema():
+                    ema_ppl = round(neural.perplexity(self.model, self._holdout), 2)
+            if ema_ppl is not None and ema_ppl > raw_ppl * 1.05:
+                if self.use_ema:
+                    log.info("EMA 重みが劣るため生の重みに切替 (EMA %.1f > 生 %.1f)。EMA を作り直します", ema_ppl, raw_ppl)
+                self.use_ema = False
+                self.model.ema = {k: v.copy() for k, v in self.model.p.items()}   # 作り直す
+            elif ema_ppl is not None:
+                self.use_ema = True
+            self.ema_ppl = ema_ppl
+            self.holdout_ppl = min(raw_ppl, ema_ppl) if ema_ppl is not None else raw_ppl
             self.ppl_hist.append(self.holdout_ppl)
             if len(self.ppl_hist) > 100:
                 del self.ppl_hist[:50]
@@ -403,7 +418,15 @@ class NeuralLM:
                                                        "decode": self.decode, "grown": self.grown, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
             self._last_save = time.time()
 
-        # ------------------------------------------------------------ データの価値 (驚き)
+    def _infer(self):
+        """推論に使う重みの文脈 (EMA が良ければ EMA、悪ければ生の重み)。"""
+        import contextlib
+
+        if self.use_ema and self.model is not None and self.model.ema is not None:
+            return self.model.use_ema()
+        return contextlib.nullcontext()
+
+    # ------------------------------------------------------------ データの価値 (驚き)
     def surprise(self, texts, max_texts: int = 6) -> float | None:
         """文の集合の平均トークン損失 (nat)。モデルにとって新しい情報ほど大きい。
         収集ソースの評価に使う: 低すぎる = 既知 (学ぶ価値が低い)、極端に高い = ジャンクや別言語。"""
@@ -424,7 +447,7 @@ class NeuralLM:
     def score(self, text: str) -> float | None:
         if self.model is None:
             return None
-        with self.model.use_ema():
+        with self._infer():
             return self.model.logprob(self.seq_text(text))
 
     def chat(self, user: str, context: str | None = None, n: int = 2, max_new: int = 48, temperature: float = 0.7, history=None, copy_bonus: float | None = None) -> list[str]:
@@ -438,7 +461,7 @@ class NeuralLM:
             # 文脈に出てくるトークンを少し出やすくする (検索した文を実際に使わせる)
             copy_ids = self.tok.encode(context, max_tokens=self.model.T) if context else None
             bonus = dec.get("copy_bonus", 0.0) if copy_bonus is None else copy_bonus
-            with self.model.use_ema():
+            with self._infer():
                 gens = self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=dec["temperature"], top_p=dec["top_p"], repetition_penalty=dec["repetition_penalty"], rng=self.nprng,
                                                  copy_ids=copy_ids, copy_bonus=bonus)
             for ids in gens:
@@ -452,7 +475,7 @@ class NeuralLM:
             if self.model is None:
                 return ""
             prompt = [BOS] + self.tok.encode(seed_text, max_tokens=self.model.T // 2)
-            with self.model.use_ema():
+            with self._infer():
                 ids = self.model.generate(prompt, max_new=max_new, temperature=temperature, rng=self.nprng)
             return self.tok.decode(ids)
 
@@ -481,7 +504,8 @@ class NeuralLM:
             "online_steps": self.online_steps,
             "decode": dict(self.decode),
             "dropout": self.model.dropout if self.model else self.dropout,
-            "ema": self.model.ema is not None if self.model else False,
+            "ema": bool(self.use_ema and self.model is not None and self.model.ema is not None),
+            "ema_ppl": self.ema_ppl,
             "priority_mean": round(float(self.pool.priority[: len(self.pool)].mean()), 3) if len(self.pool) else None,
             "pool_kinds": dict(self.pool.kind_counts),
         }

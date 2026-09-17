@@ -225,7 +225,10 @@ def cmd_train(args) -> int:
         state = {"step": 0, "loss": None, "tok_s": None, "ppl": None, "started": time.time(), "collected": 0}
         srv = serve_background(brain, args.serve_host, args.serve, status=lambda: dict(
             state, elapsed_min=round((time.time() - state["started"]) / 60, 1), neural=nl.stats()))
-        print(f"学習中のモデルと会話できます: http://{args.serve_host}:{args.serve}/  (/ask, /stats)")
+        if srv is not None:
+            print(f"学習中のモデルと会話できます: http://{args.serve_host}:{srv.bound_port}/  (/ask, /stats)")
+        else:
+            print("会話 API は開けませんでした (別のプロセスが使用中)。学習は続けます")
     else:
         state = None
     collector = None
@@ -400,12 +403,24 @@ def _make_handler(brain, evolver=None, status=None):
     return Handler
 
 
-def serve_background(brain, host: str, port: int, evolver=None, status=None):
-    """学習を続けながら HTTP で会話できるようにする (デーモンスレッド)。サーバーを返す。"""
-    srv = ThreadingHTTPServer((host, port), _make_handler(brain, evolver, status))
-    t = threading.Thread(target=srv.serve_forever, daemon=True, name="tinyai-http")
-    t.start()
-    return srv
+def serve_background(brain, host: str, port: int, evolver=None, status=None, tries: int = 5):
+    """学習を続けながら HTTP で会話できるようにする (デーモンスレッド)。
+    ポートが空いていなければ次の番号を試し、それでも駄目なら None を返す
+    (会話 API が開けなくても学習は止めない)。"""
+    handler = _make_handler(brain, evolver, status)
+    for i in range(max(1, tries)):
+        try:
+            srv = ThreadingHTTPServer((host, port + i), handler)
+        except OSError as e:
+            log = logging.getLogger("tinyai.http")
+            log.warning("ポート %d は使用中 (%s)", port + i, e)
+            continue
+        t = threading.Thread(target=srv.serve_forever, daemon=True, name="tinyai-http")
+        t.start()
+        srv.bound_port = port + i
+        return srv
+    logging.getLogger("tinyai.http").warning("会話 API を開けませんでした (学習は続けます)")
+    return None
 
 
 def cmd_serve(args) -> int:
