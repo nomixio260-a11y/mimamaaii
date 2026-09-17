@@ -479,14 +479,18 @@ class TinyTransformer:
         return xf @ p["wte"].T  # (B, V)
 
     def generate_batch(self, prompt: list[int], n: int = 3, max_new: int = 40, temperature: float = 0.8, top_k: int = 40, top_p: float = 0.9, repetition_penalty: float = 1.3, rng=None, stop=(EOS,),
-                       copy_ids=None, copy_bonus: float = 0.0, no_repeat_ngram: int = 0, min_new: int = 0) -> list[list[int]]:
+                       copy_ids=None, copy_bonus: float = 0.0, no_repeat_ngram: int = 0, min_new: int = 0,
+                       temp_spread: float = 0.0) -> list[list[int]]:
         """同じプロンプトから n 本の候補を同時に生成 (1 本ずつより約 n 倍速い)。
         copy_ids / copy_bonus: 文脈 (検索した文) に現れるトークンの対数確率を少し持ち上げる = 写し取りの手掛かり。
         小さなモデルは文脈を無視して「それらしい文」を作りがちなので、復号の時点で文脈側に寄せる
         (Context-aware decoding の簡易版。追加の順伝播は不要)。
         no_repeat_ngram: 生成済みの n-gram をもう一度作る候補を禁止する。反復ペナルティと違って
         「同じ単語を二度使うこと」ではなく「同じ言い回しの繰り返し」だけを止めるので、自由な文が壊れにくい。
-        min_new: この長さに達するまで終端トークンを抑制し、極端に短い返事を防ぐ。"""
+        min_new: この長さに達するまで終端トークンを抑制し、極端に短い返事を防ぐ。
+        temp_spread: 候補ごとに温度を変える幅。同じ温度で n 本引くと、分布が尖っている時に
+        まったく同じ文が並び、候補を出して選ぶ意味が無くなる (実測: 2 本とも同一)。
+        低温の候補は無難に、高温の候補は冒険的になるので、選ぶ側に幅が生まれる。"""
         rng = rng or np.random.default_rng()
         prompt = prompt[-(self.T - 1):]
         cache = [(None, None) for _ in range(self.L)]
@@ -500,6 +504,10 @@ class TinyTransformer:
             if uniq.size:
                 copy_vec[uniq] = copy_bonus
         outs: list[list[int]] = [[] for _ in range(n)]
+        if temp_spread and n > 1:
+            temps = [temperature * f for f in np.linspace(1.0 - temp_spread, 1.0 + temp_spread, n)]
+        else:
+            temps = [temperature] * n
         alive = np.ones(n, dtype=bool)
         pos = len(prompt)
         for _ in range(max_new):
@@ -524,7 +532,7 @@ class TinyTransformer:
                 if min_new and len(outs[b]) < min_new:
                     for t in stop:
                         zb[t] = -1e9
-                zb = zb / max(temperature, 1e-3)
+                zb = zb / max(temps[b], 1e-3)
                 if top_k and top_k < len(zb):
                     thr = np.partition(zb, -top_k)[-top_k]
                     zb[zb < thr] = -1e9

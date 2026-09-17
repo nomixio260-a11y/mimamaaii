@@ -61,7 +61,7 @@ class NeuralLM:
         self.size = size if size in neural.PRESETS else "base"
         # 進化する復号パラメータ (👍/👎 の割合で山登り)
         self.decode = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.3, "copy_bonus": 1.0,
-                       "no_repeat_ngram": 3, "min_new": 6}
+                       "no_repeat_ngram": 3, "min_new": 6, "temp_spread": 0.25}
         self._decode_trial: dict | None = None
         self._fb = [0, 0]           # 現在の設定での (👍, 👎)
         self._fb_best = 0.5         # 採用済み設定の 👍 率
@@ -568,11 +568,12 @@ class NeuralLM:
             with self._infer():
                 gens = self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=dec["temperature"], top_p=dec["top_p"], repetition_penalty=dec["repetition_penalty"], rng=self.nprng,
                                                  copy_ids=copy_ids, copy_bonus=bonus,
+                                                 temp_spread=float(dec.get("temp_spread", 0.25)),
                                                  no_repeat_ngram=int(dec.get("no_repeat_ngram", 0)),
                                                  min_new=min(int(dec.get("min_new", 0)), max(max_new // 4, 1)))
             for ids in gens:
                 text = self.tok.decode(ids).strip()
-                if len(text) >= 2:
+                if len(text) >= 2 and text not in out:      # 同じ文が並んでも選ぶ意味が無い
                     out.append(text)
             return out
 

@@ -1264,6 +1264,31 @@ class RealtimeLearningTest(unittest.TestCase):
 
 
 
+class CandidateDiversityTest(unittest.TestCase):
+    """候補ごとに温度を変え、同じ文が並ぶのを防ぐ。"""
+
+    def test_temp_spread_changes_rows(self):
+        import numpy as np
+        from tinyai.neural import TinyTransformer
+        m = TinyTransformer(vocab_size=60, d=32, heads=4, layers=1, ctx=40, ff=64, seed=3)
+        m.p["wte"][12] *= 30.0                             # 分布を尖らせる (同じ文が並びやすい状態)
+        same = m.generate_batch([3, 4], n=4, max_new=10, temperature=0.7, rng=np.random.default_rng(1))
+        spread = m.generate_batch([3, 4], n=4, max_new=10, temperature=0.7, rng=np.random.default_rng(1),
+                                  temp_spread=0.5)
+        self.assertEqual(len(spread), 4)
+        self.assertNotEqual([tuple(x) for x in same], [tuple(x) for x in spread])   # 引き方が変わる
+
+    def test_chat_drops_duplicate_candidates(self):
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="small")
+            nl.min_sentences, nl.min_chars = 4, 40
+            nl.ensure_model(["こんにちは。今日はいい天気です。散歩に行きましょう。%d" % i for i in range(60)])
+            outs = nl.chat("こんにちは", None, n=4, max_new=12)
+            self.assertEqual(len(outs), len(set(outs)))    # 同じ文は 1 本にまとめる
+
+
 class DecodeQualityTest(unittest.TestCase):
     """自由生成のための復号: 言い回しのループ禁止、最短長、既定値の世代管理。"""
 
