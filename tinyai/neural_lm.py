@@ -247,7 +247,12 @@ class NeuralLM:
         if weight < 0:      # 選好データの「選ばれなかった応答」: unlikelihood で出しにくくする
             self.pool.add(ids, weight, loss_from=self.loss_from(ids), kind="dialog")
             return
-        for _ in range(max(1, int(round(weight)))):
+        # 履歴つき (多ターン) の会話は、人が実際にやり取りしている数少ないデータなので厚めに学ぶ。
+        # 指示データの 1 往復に埋もれると、前の発話を踏まえて答える練習がほとんどできない。
+        reps = max(1, int(round(weight)))
+        if history:
+            reps = max(reps, 2)
+        for _ in range(reps):
             self.pool.add(ids, loss_from=self.loss_from(ids), kind="dialog")
         if self.corpus is not None:
             self.corpus.append(ids, loss_from=self.loss_from(ids), kind="dialog")

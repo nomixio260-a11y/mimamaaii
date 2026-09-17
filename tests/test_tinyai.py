@@ -1377,6 +1377,23 @@ class DialogHistoryTest(unittest.TestCase):
         d.add("長い履歴", "返事", history=long_hist)
         self.assertLessEqual(len(d.pairs[-1][4][0][0]), DialogStore.MAX_HISTORY_CHARS)
 
+    def test_multiturn_dialogues_are_weighted_higher(self):
+        """履歴つきの会話は再生バッファに厚めに入れる (前の発話を踏まえる練習を増やす)。"""
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="small")
+            nl.min_sentences, nl.min_chars = 4, 40
+            nl.ensure_model(["こんにちは。今日はいい天気です。散歩に行きましょう。%d" % i for i in range(60)])
+            n0 = len(nl.pool)
+            nl.add_dialog("質問", "答えです。")
+            single = len(nl.pool) - n0
+            n1 = len(nl.pool)
+            nl.add_dialog("質問2", "答えです2。", history=[("前の質問", "前の答え")])
+            multi = len(nl.pool) - n1
+            self.assertEqual(single, 1)
+            self.assertEqual(multi, 2)
+
     def test_history_survives_save_and_restore(self):
         from tinyai.dialog import DialogStore
         d = DialogStore(10)
