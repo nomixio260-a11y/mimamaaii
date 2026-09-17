@@ -626,6 +626,7 @@ class Brain:
                 # 中央値で報告する: 固有名詞を含む 1 件が平均を 2 倍に押し上げる (実測: 平均 106 / 中央値 52)
                 ppls.sort()
                 out["dialog_ppl"] = round(ppls[len(ppls) // 2], 2)
+                self.neural.note_dialog_ppl(out["dialog_ppl"])   # 成長の判断に使う
                 out["dialog_ppl_mean"] = round(sum(ppls) / len(ppls), 2)
         # 3. RAG 忠実性: 知識文を文脈に、その文のキーワードを質問にして、答えが文脈の句をどれだけ含むか
         grounded = kw = n = 0

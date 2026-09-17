@@ -1551,6 +1551,33 @@ class GrowthTest(unittest.TestCase):
             nl.model.step = nl._last_grow_step + nl.GROW_WARMUP
             self.assertEqual(nl._effective_lr(), nl._depth_lr())           # 馴染んだら深さ補正のみに戻る
 
+    def test_growth_stops_when_dialogue_gets_worse(self):
+        """平文の指標が良くても、会話の質が落ちていれば成長させない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.recent_hist = [20.0, 20.0, 19.5, 19.0]                 # 平文は改善中
+            nl.dialog_hist = [75.0, 80.0, 100.0, 110.0]               # 会話は悪化中
+            need = nl.TOKENS_PER_PARAM * nl.model.n_params()
+            layers = nl.model.L
+            self.assertFalse(nl.maybe_grow(True, data_tokens=need * 10))
+            self.assertEqual(nl.model.L, layers)
+            nl.dialog_hist = [110.0, 100.0, 80.0, 75.0]               # 会話も改善したら成長できる
+            self.assertTrue(nl.maybe_grow(True, data_tokens=need * 10))
+
+    def test_rollback_also_looks_at_dialogue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.recent_ppl = 20.0
+            nl.dialog_hist = [70.0, 70.0, 70.0, 70.0]
+            need = nl.TOKENS_PER_PARAM * nl.model.n_params()
+            layers = nl.model.L
+            self.assertTrue(nl.maybe_grow(True, data_tokens=need + 1))
+            nl.model.step = nl._last_grow_step + nl.GROW_COOLDOWN
+            nl.recent_ppl = 20.0                                       # 平文は変わらず
+            nl.dialog_hist.append(70.0 * nl.GROW_ROLLBACK_RATIO + 1)   # 会話だけ大きく悪化
+            self.assertTrue(nl.check_growth())
+            self.assertEqual(nl.model.L, layers)
+
     def test_bad_growth_is_rolled_back(self):
         """成長後に大きく悪化していたら、成長前の重みに戻す。"""
         with tempfile.TemporaryDirectory() as tmp:

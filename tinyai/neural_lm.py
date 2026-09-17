@@ -101,6 +101,8 @@ class NeuralLM:
         self.recent_hist: list[float] = []           # 入れ替わる取り置き ppl の推移 (成長の判断に使う)
         self._last_grow_step = 0                     # 直近で成長したステップ (連続した成長を避ける)
         self._pregrow_ppl: float | None = None       # 成長直前の ppl (成長が裏目に出ていないかの判定用)
+        self._pregrow_dialog: float | None = None    # 成長直前の対話 ppl
+        self.dialog_hist: list[float] = []           # 対話 ppl の推移 (成長の判断に使う)
         self._pregrow_path = self.data_dir / "neural.pregrow.npz"
         self._last_save = 0.0
         self.batch = neural.PRESETS[self.size]["batch"] if self.available else 8
@@ -386,6 +388,15 @@ class NeuralLM:
             return lr
         return lr * (0.3 + 0.7 * since / self.GROW_WARMUP)
 
+    def note_dialog_ppl(self, value: float | None) -> None:
+        """自己評価で測った対話 ppl を記録する (成長の判断に使う)。"""
+        if value is None:
+            return
+        with self.lock:
+            self.dialog_hist.append(float(value))
+            if len(self.dialog_hist) > 60:
+                del self.dialog_hist[:30]
+
     def growth_bytes(self) -> int:
         """次の成長で増えるメモリの見積り (重み + Adam の 1 次/2 次 + EMA)。"""
         if self.model is None:
@@ -422,6 +433,11 @@ class NeuralLM:
             worse = sum(ph[-2:]) / 2 / max(sum(ph[-4:-2]) / 2, 1e-9) if len(ph) >= 4 else 1.0
             if worse > 1.25:
                 return False        # 急激に悪化している = 学習が不安定。容量の問題ではない
+            # 平文の指標だけで判断すると、会話の質が落ちているのに成長を続けてしまう
+            # (実測: 層 6 → 9 + 中間次元の拡張で、平文の ppl は回復したのに対話 ppl は 75 → 141)。
+            dh = self.dialog_hist
+            if len(dh) >= 4 and sum(dh[-2:]) / 2 > sum(dh[-4:-2]) / 2 * 1.10:
+                return False
             plateau = before - recent < 0.02 and recent > 1.5     # 改善が止まり、まだ十分に低くない
             n_params = self.model.n_params()
             # データ過多 (強): 計算最適の目安を超えた
@@ -449,6 +465,7 @@ class NeuralLM:
                 self.grown += 1
                 self._last_grow_step = self.model.step
                 self._pregrow_ppl = self.recent_ppl or self.holdout_ppl
+                self._pregrow_dialog = self.dialog_hist[-1] if self.dialog_hist else None
                 if data_rich and not plateau:
                     log.info("データ量が容量を超えたので成長 (%.1fM トークン / %.1fM パラメータ)",
                              data_tokens / 1e6, self.model.n_params() / 1e6)
@@ -546,8 +563,11 @@ class NeuralLM:
             if since < self.GROW_COOLDOWN:            # まだ馴染ませている途中
                 return False
             now = self.recent_ppl or self.holdout_ppl
-            if now is None or now <= self._pregrow_ppl * self.GROW_ROLLBACK_RATIO:
-                self._pregrow_ppl = None              # 問題なし。以後は判定しない
+            bad_text = now is not None and now > self._pregrow_ppl * self.GROW_ROLLBACK_RATIO
+            bad_dialog = (self._pregrow_dialog is not None and self.dialog_hist
+                          and self.dialog_hist[-1] > self._pregrow_dialog * self.GROW_ROLLBACK_RATIO)
+            if not bad_text and not bad_dialog:
+                self._pregrow_ppl = self._pregrow_dialog = None   # 問題なし。以後は判定しない
                 return False
             if not self._pregrow_path.exists():
                 self._pregrow_ppl = None
@@ -561,12 +581,12 @@ class NeuralLM:
                             self._pregrow_ppl, now, self.model.L)
                 self.grown = max(0, self.grown - 1)
                 self._last_grow_step = self.model.step
-                self._pregrow_ppl = None
+                self._pregrow_ppl = self._pregrow_dialog = None
                 self.recent_hist, self.ppl_hist, self.loss_hist = [], [], []
                 return True
             except Exception as e:
                 log.warning("成長の取り消しに失敗: %s", e)
-                self._pregrow_ppl = None
+                self._pregrow_ppl = self._pregrow_dialog = None
                 return False
 
     def evaluate(self, ngram_ppl: float | None = None) -> dict:
