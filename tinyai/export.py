@@ -17,6 +17,7 @@ from pathlib import Path
 
 from . import neural
 from .bpe import BOS, BOT, USR
+from .textquality import strip_broken
 
 
 def quantize_rows(w):
@@ -158,14 +159,15 @@ def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1
     docs = []
     total = 0
     for d in sorted(brain.kb.docs.values(), key=lambda d: (-(d.hits + d.score), d.id)):
-        t = d.text.strip()
+        t = strip_broken(d.text).strip()      # 文字化けの記号は落とす (JSON に読めない文字を出さない)
         if len(t) < 8 or len(t) > 300:
             continue
         docs.append(t)
         total += len(t)
         if len(docs) >= max_docs or total >= max_chars:
             break
-    pairs = [[u, b] for u, b, _, w, *_ in list(brain.dialogs.pairs)[-replay * 3 :] if w > 0 and len(b) <= 200][-replay:]
+    pairs = [[strip_broken(u), strip_broken(b)] for u, b, _, w, *_ in list(brain.dialogs.pairs)[-replay * 3 :]
+             if w > 0 and len(b) <= 200][-replay:]
     kb = {"docs": docs, "replay": pairs}
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "kb.json").write_text(json.dumps(kb, ensure_ascii=False), encoding="utf-8")

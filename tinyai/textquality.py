@@ -22,6 +22,8 @@ def good_prose(text: str, min_len: int = 40) -> bool:
     t = text.strip()
     if len(t) < min_len:
         return False
+    if t.count("\ufffd") > len(t) * 0.002:     # 文字化け (復号に失敗したページ)
+        return False
     marks = t.count("。") + t.count("！") + t.count("？") + t.count(".") + t.count("!") + t.count("?")
     if marks < max(1, len(t) // 200):          # 200 字に 1 つも文末が無ければ目次・表の類
         return False
@@ -37,9 +39,14 @@ def good_prose(text: str, min_len: int = 40) -> bool:
     return True
 
 
+def strip_broken(text: str) -> str:
+    """文字化けの記号 (U+FFFD) を落とす。JSON に出すと読めない文字として残るため。"""
+    return text.replace("\ufffd", "")
+
+
 def clean_field(value) -> str:
     """データセットの欠損値が文字列として流れてくるのを防ぐ ("nan" などが本文に混ざる)。"""
     if value is None:
         return ""
-    t = str(value).strip()
+    t = strip_broken(str(value)).strip()
     return "" if t.lower() in _BAD_WORDS else t
