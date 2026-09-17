@@ -143,6 +143,11 @@ class NeuralLM:
                 self.grown = int(meta.get("grown", 0))
                 self._last_grow_step = int(meta.get("last_grow_step", 0))
                 self.lr_scale = float(meta.get("lr_scale", 1.0))
+                # 品質の履歴も引き継ぐ。10 分ごとに再開する運用では、履歴が消えると
+                # 「続けて悪化したら学習率を下げる」ような規則が一度も発火しない
+                self.dialog_hist = [float(x) for x in meta.get("dialog_hist", [])]
+                self.recent_hist = [float(x) for x in meta.get("recent_hist", [])]
+                self._last_damp_step = int(meta.get("last_damp_step", 0))
                 self.vocab_added = int(meta.get("vocab_added", 0))
                 self.online_steps = int(meta.get("online_steps", 0))
                 self.batch = neural.PRESETS.get(self.size, {}).get("batch", self.batch)
@@ -672,7 +677,9 @@ class NeuralLM:
             except Exception as e:
                 log.warning("再生バッファの保存に失敗: %s", e)
             self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300], "holdout_recent": [list(x) for x in self._holdout_recent],
-                                                       "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "last_grow_step": self._last_grow_step, "lr_scale": self.lr_scale, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
+                                                       "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "last_grow_step": self._last_grow_step, "lr_scale": self.lr_scale,
+                                                       "dialog_hist": self.dialog_hist[-20:], "recent_hist": self.recent_hist[-20:],
+                                                       "last_damp_step": self._last_damp_step, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
             self._last_save = time.time()
 
     def _infer(self):

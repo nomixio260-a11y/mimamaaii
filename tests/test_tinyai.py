@@ -1551,6 +1551,25 @@ class GrowthTest(unittest.TestCase):
             nl.model.step = nl._last_grow_step + nl.GROW_WARMUP
             self.assertEqual(nl._effective_lr(), nl._depth_lr())           # 馴染んだら深さ補正のみに戻る
 
+    def test_quality_history_survives_restart(self):
+        """品質の履歴は保存する (10 分ごとに再開する運用で規則が発火しないのを防ぐ)。"""
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            nl = NeuralLM(d, size="small")
+            nl.min_sentences, nl.min_chars = 4, 40
+            nl.ensure_model(["こんにちは。今日はいい天気です。散歩に行きましょう。%d" % i for i in range(60)])
+            nl.dialog_hist = [75.0, 74.0, 76.0, 75.0, 110.0, 115.0]
+            nl.recent_hist = [20.0, 21.0]
+            nl.lr_scale = 0.5
+            nl.save()
+            nl2 = NeuralLM(d, size="small")
+            nl2.ensure_model()
+            self.assertEqual(len(nl2.dialog_hist), 6)
+            self.assertEqual(nl2.recent_hist[-1], 21.0)
+            self.assertEqual(nl2.lr_scale, 0.5)
+
     def test_learning_rate_is_damped_when_dialogue_keeps_falling(self):
         """会話の質が続けて落ちたら学習率を自動で下げる。"""
         with tempfile.TemporaryDirectory() as tmp:
