@@ -144,6 +144,7 @@ class Brain:
         size = self.cfg.neural_size if self.cfg.neural_size != "auto" else NeuralLM.size_for_memory(self.cfg.memory_mb)
         self.neural = NeuralLM(self.cfg.data_dir, size=size, seed=self.cfg.seed or 0)  # Transformer LM (numpy, dropout=cfg.neural_dropout)
         self.last_self_eval: dict | None = None
+        self.dialog_holdout: list = []             # 評価用に固定した会話 (比較できるように)
         self.last_thought: dict | None = None      # 直近のニューラル応答の思考過程 (下書き → 再検索 → 検証)
         self._neural_pending_text: deque = deque(maxlen=5000)
         self._neural_pending_dialog: deque = deque(maxlen=2000)   # (発話, 応答, 文脈, 重み)
@@ -514,8 +515,12 @@ class Brain:
         # 1. 取り置き文の ppl (言語としての予測力)
         if nl._holdout:
             out["ppl"] = round(neural_perplexity(nl), 2)
-        # 2. 会話の ppl (応答部だけ: 会話としての予測力)
-        pairs = [(u, b) for u, b, _, w in list(self.dialogs.pairs)[-2000:] if w > 0][-n_dialogs:]
+        # 2. 会話の ppl (応答部だけ)。比較できるよう取り置き会話は一度決めたら固定する
+        if not self.dialog_holdout and len(self.dialogs) >= n_dialogs * 2:
+            rng = random.Random(12345)
+            cand = [(u, b) for u, b, _, w in list(self.dialogs.pairs) if w > 0 and 10 <= len(b) <= 200]
+            self.dialog_holdout = rng.sample(cand, min(n_dialogs, len(cand)))
+        pairs = self.dialog_holdout or [(u, b) for u, b, _, w in list(self.dialogs.pairs)[-2000:] if w > 0][-n_dialogs:]
         if pairs:
             lps = []
             with nl.lock, nl.model.use_ema():
@@ -1511,7 +1516,7 @@ class Brain:
                 "interest": self.interest,
                 "semantic": self.semantic.state(),
                 "reranker": self.reranker.state(),
-                "dialogs": self.dialogs.state(),
+                "dialog_holdout": list(self.dialog_holdout), "dialogs": self.dialogs.state(),
                 "agent": self.agent.state(),
                 "params": asdict(self.params),
                 "generation": self.generation,
@@ -1574,6 +1579,7 @@ class Brain:
             self.interest = state.get("interest", {})
             self.semantic = SemanticSpace.from_state(state["semantic"]) if "semantic" in state else SemanticSpace()
             self.reranker = Reranker.from_state(state.get("reranker", {}))
+            self.dialog_holdout = [tuple(x) for x in state.get("dialog_holdout", [])]
             self.dialogs = DialogStore.from_state(state.get("dialogs", []))
             self.agent.load_state(state.get("agent", {}))
             self._semantic_queue = deque(maxlen=50000)

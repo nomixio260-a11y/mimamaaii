@@ -608,24 +608,35 @@ class SequencePool:
         self._cum = None
         self._cum_n = -1
         self.journal: list | None = None       # ワーカー同期用: None なら記録しない
+        self.kinds: list[str] = []             # 系列ごとの種類 (text / dialog / copy / qa)
+        self.kind_counts: dict[str, int] = {}
+        self.max_share = {"copy": 0.30, "qa": 0.15}   # 種類ごとの上限 (比率)。偏ると自由な文生成が弱る
 
-    def add(self, ids, weight: float = 1.0, loss_from: int = 0) -> None:
+    def add(self, ids, weight: float = 1.0, loss_from: int = 0, kind: str = "text") -> None:
         """weight < 0 は負例 (unlikelihood)。負例は詰め込まず単独の系列として学習する。
         loss_from: この添字以降のトークンを本来の重みで学習する (それより前はプロンプト部)。
         系列は int32 配列で持つ (Python のリストは 1 トークン約 36 バイト、int32 なら 4 バイト)。"""
         if len(ids) < 3:
             return
+        cap = self.max_share.get(kind)
+        if cap is not None and self.items and self.kind_counts.get(kind, 0) >= cap * len(self.items):
+            return                              # その種類はもう十分 (比率の上限)
         if not isinstance(ids, np.ndarray):
             ids = np.asarray(ids, dtype=np.int32)
         item = (ids, float(weight), int(loss_from))
         if len(self.items) < self.capacity:
             self.priority[len(self.items)] = self.init_priority
             self.items.append(item)
+            self.kinds.append(kind)
         else:
             self.total_tokens -= len(self.items[self.pos][0])
+            old_kind = self.kinds[self.pos]
+            self.kind_counts[old_kind] = max(0, self.kind_counts.get(old_kind, 1) - 1)
             self.items[self.pos] = item
+            self.kinds[self.pos] = kind
             self.priority[self.pos] = self.init_priority
             self.pos = (self.pos + 1) % self.capacity
+        self.kind_counts[kind] = self.kind_counts.get(kind, 0) + 1
         self.total_tokens += len(ids)
         self._cum_n = -1
         if self.journal is not None:

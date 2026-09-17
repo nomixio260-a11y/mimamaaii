@@ -165,17 +165,17 @@ class NeuralLM:
         if self.rng.random() < 0.02 and len(self._holdout) < 300:
             self._holdout.append(ids)
         else:
-            self.pool.add(ids)
+            self.pool.add(ids, kind="text")
 
     def add_dialog(self, user: str, bot: str, context: str | None = None, weight: float = 1.0) -> None:
         if self.model is None:
             return
         ids = self.seq_dialog(user, bot, context)
         if weight < 0:      # 選好データの「選ばれなかった応答」: unlikelihood で出しにくくする
-            self.pool.add(ids, weight, loss_from=self.loss_from(ids))
+            self.pool.add(ids, weight, loss_from=self.loss_from(ids), kind="dialog")
             return
         for _ in range(max(1, int(round(weight)))):
-            self.pool.add(ids, loss_from=self.loss_from(ids))
+            self.pool.add(ids, loss_from=self.loss_from(ids), kind="dialog")
 
     def add_copy_example(self, keyword: str, sentence: str, neighbors: str | None = None) -> None:
         """RAG の「文脈から抜き出す」練習: 文脈 (その文 + 周辺) を与え、キーワードについて聞かれたらその文を答える。"""
@@ -185,7 +185,7 @@ class NeuralLM:
         context = (f"{sentence} {neighbors}" if self.rng.random() < 0.5 else f"{neighbors} {sentence}") if neighbors else sentence
         q = self.rng.choice([f"{keyword}について教えて", f"{keyword}とは？", f"{keyword}は？", f"{keyword}について", f"{keyword}を説明して", f"{keyword}って何？"])
         ids = self.seq_dialog(q, sentence, context)
-        self.pool.add(ids, loss_from=self.loss_from(ids))
+        self.pool.add(ids, loss_from=self.loss_from(ids), kind="copy")
 
     def add_synthetic_qa(self, subject: str, relation: str, obj: str, answer: str, context: str) -> int:
         """事実から質問文を作り (テンプレート)、文脈付き/無しの両方で会話例にする。"""
@@ -199,7 +199,7 @@ class NeuralLM:
         for q in qs[:2]:
             for ctx in (context, None):
                 ids = self.seq_dialog(q, answer, ctx)
-                self.pool.add(ids, loss_from=self.loss_from(ids))
+                self.pool.add(ids, loss_from=self.loss_from(ids), kind="qa")
                 n += 1
         return n
 
@@ -452,4 +452,5 @@ class NeuralLM:
             "dropout": self.model.dropout if self.model else self.dropout,
             "ema": self.model.ema is not None if self.model else False,
             "priority_mean": round(float(self.pool.priority[: len(self.pool)].mean()), 3) if len(self.pool) else None,
+            "pool_kinds": dict(self.pool.kind_counts),
         }
