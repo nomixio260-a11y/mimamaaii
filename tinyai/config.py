@@ -25,6 +25,8 @@ class Config:
     # tools/experiment.py の結果: 数千文規模では 4 次は 3 次とパープレキシティが同じで、
     # エントリ数 1.8 倍・学習時間 1.6 倍。大規模コーパスなら 4 に上げる。
     max_order: int = _env_int("TINYAI_MAX_ORDER", 3)
+    # 保持する会話の最大数 (0 ならメモリ上限から自動: 1MB あたり 120 組。500MB なら 6 万組)
+    max_dialogs: int = 0
     # 知識ベースに保持する最大文数 (0 ならメモリ上限から自動で決める: 1MB あたり 400 文)。
     # 実際にはメモリ予算とどちらか厳しい方が効く
     max_docs: int = 0
@@ -62,6 +64,8 @@ class Config:
 
 
     def __post_init__(self):
+        if not self.max_dialogs:
+            self.max_dialogs = max(20000, int(self.memory_mb) * 120)
         if not self.max_docs:
             # メモリ 1MB あたり 400 文 (500MB なら 20 万文)。知識ベースの取り分は予算の 30%
             self.max_docs = max(20000, int(self.memory_mb) * 400)

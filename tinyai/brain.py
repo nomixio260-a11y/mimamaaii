@@ -139,7 +139,7 @@ class Brain:
         self._suffix_dirty = 0                    # 前回構築以降に増えた文書数
         self.cache_lm = CacheLM()                 # 会話キャッシュ LM
         self.reranker = Reranker()                # 👍/👎 から学ぶリランカー
-        self.dialogs = DialogStore()              # 会話データ (自分の会話 + 公開データ)
+        self.dialogs = DialogStore(self.cfg.max_dialogs)   # 会話データ (自分の会話 + 公開データ)
         self.agent = Agent(self)                  # 道具 (計算・日付・換算・比較・列挙・要約・調査・プロファイル)
         size = self.cfg.neural_size if self.cfg.neural_size != "auto" else NeuralLM.size_for_memory(self.cfg.memory_mb)
         self.neural = NeuralLM(self.cfg.data_dir, size=size, seed=self.cfg.seed or 0)  # Transformer LM (numpy, dropout=cfg.neural_dropout)
@@ -1629,7 +1629,7 @@ class Brain:
             self.semantic = SemanticSpace.from_state(state["semantic"]) if "semantic" in state else SemanticSpace()
             self.reranker = Reranker.from_state(state.get("reranker", {}))
             self.dialog_holdout = [tuple(x) for x in state.get("dialog_holdout", [])]
-            self.dialogs = DialogStore.from_state(state.get("dialogs", []))
+            self.dialogs = DialogStore.from_state(state.get("dialogs", []), self.cfg.max_dialogs)
             self.agent.load_state(state.get("agent", {}))
             self._semantic_queue = deque(maxlen=50000)
             if not self.semantic.vec:
