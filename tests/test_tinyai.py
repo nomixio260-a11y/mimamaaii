@@ -1330,11 +1330,13 @@ class DecodeQualityTest(unittest.TestCase):
             meta.pop("decode_version")                            # 古い書き出しを模す
             meta["decode"]["copy_bonus"] = 3.0
             meta["decode"]["temperature"] = 0.55
+            meta["decode"]["min_new"] = 9
             meta_path.write_text(json.dumps(meta))
             nl2 = NeuralLM(d, size="small")
             nl2.ensure_model()
             self.assertEqual(nl2.decode["copy_bonus"], 1.0)       # 見直した項目は既定値から
-            self.assertEqual(nl2.decode["temperature"], 0.55)     # それ以外は保存値のまま
+            self.assertEqual(nl2.decode["temperature"], 0.85)     # 温度も見直したので既定値から
+            self.assertEqual(nl2.decode["min_new"], 9)            # 見直していない項目は保存値のまま
 
 
 class DialogHistoryTest(unittest.TestCase):
@@ -2099,6 +2101,27 @@ class PassageReferenceTest(unittest.TestCase):
             self.assertEqual(len(nl.pool), n0 + 1)                 # 文脈つきなら読解データとして学ぶ
             nl.add_dialog("気候は?", "温暖で過ごしやすい気候です。")
             self.assertEqual(len(nl.pool), n0 + 2)                 # 普通の応答はそのまま
+
+
+class FreeGenerationDefaultsTest(unittest.TestCase):
+    """自由な生成のための復号既定値 (長さと言い回しの幅を広げる)。"""
+
+    def test_defaults(self):
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="small")
+            self.assertEqual(nl.decode["temperature"], 0.85)
+            self.assertEqual(nl.decode["top_p"], 0.95)
+            self.assertEqual(nl.decode["repetition_penalty"], 1.15)   # 繰り返しは n-gram 禁止が担う
+            self.assertEqual(nl.decode["no_repeat_ngram"], 3)
+
+    def test_chat_length_follows_retrieval(self):
+        """検索が弱い雑談では長く、検索が効いている時は短く書く。"""
+        import inspect
+        from tinyai.brain import Brain
+        src = inspect.getsource(Brain._neural_reply)
+        self.assertIn("max_new = 110 if weak else 60", src)
 
 
 class QaTextFormatTest(unittest.TestCase):

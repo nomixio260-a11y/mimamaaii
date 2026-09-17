@@ -411,7 +411,9 @@ class Brain:
         weak = best_score < self.params.answer_threshold * 1.5 or getattr(self, "_followup", False)
         bonus = base_bonus * 0.3 if weak else base_bonus
         n = 4 if not strict else 3
-        cands = self.neural.chat(text, context, n=n, history=history, copy_bonus=bonus)
+        # 検索が弱い = 雑談なので長く自由に書かせる。検索が効いている時は短く的確に答える
+        max_new = 110 if weak else 60
+        cands = self.neural.chat(text, context, n=n, history=history, copy_bonus=bonus, max_new=max_new)
         thought = {"query": text, "context": [d.text[:80] for d in ctx_docs], "draft": list(cands), "rethink": [], "context2": [], "scores": [],
                    "history": [u for u, _ in history], "copy_bonus": round(bonus, 2), "retrieval_score": round(float(best_score), 3)}
         # 2. 読み直し: 下書きに出てきた句で再検索 (質問だけでは引けなかった文が見つかる)
@@ -423,7 +425,7 @@ class Brain:
                 if new_docs:
                     ctx_docs = (ctx_docs + new_docs)[:4]
                     context2 = " ".join(d.text for d in ctx_docs)[:240]
-                    more = self.neural.chat(text, context2, n=max(2, n - 1), history=history, copy_bonus=bonus)
+                    more = self.neural.chat(text, context2, n=max(2, n - 1), history=history, copy_bonus=bonus, max_new=max_new)
                     thought["rethink"], thought["context2"] = list(more), [d.text[:80] for d in new_docs]
                     cands = cands + more
                     context = context2

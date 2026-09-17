@@ -19,3 +19,4 @@ kunishou/hh-rlhf-49k-ja	default	train	instruction
 Aratako/Magpie-Tanuki-8B-97k	default	train	conversations
 llm-jp/oasst2-33k-en	default	train	conversations
 baobab-trees/wikipedia-human-retrieval-ja	default	train	qa_text
+kunishou/oasst1-chat-44k-ja	default	train	conversations
