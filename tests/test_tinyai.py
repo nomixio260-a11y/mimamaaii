@@ -1516,5 +1516,33 @@ class PoolMixTest(unittest.TestCase):
         self.assertGreater(p.kind_counts.get("text", 0) / len(p.items), 0.3)
 
 
+class PoolCapacityTest(unittest.TestCase):
+    """再生バッファの容量はメモリに比例し、手持ちの記憶で埋める。"""
+
+    def test_capacity_scales_with_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            small = make_brain(tmp, memory_mb=200)
+            self.assertEqual(small.neural.pool.capacity, 30000)        # 下限は 3 万
+        with tempfile.TemporaryDirectory() as tmp:
+            big = make_brain(tmp, memory_mb=1024)
+            self.assertEqual(big.neural.pool.capacity, 102400)         # 1 MB あたり 100 系列
+
+    def test_pool_is_filled_from_stored_memory(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            return
+        if not nn.available():
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp, memory_mb=200)
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
+            from tinyai.neural import SequencePool
+            b.neural.pool = SequencePool(400, seed=1)                   # 小さくして埋まり方を見る
+            b.learn_text("\n".join("文 %d は学習用の文章であり、内容は番号 %d に関する説明です。" % (i, i) for i in range(10, 300)), "https://x/nn")
+            b.neural_step(budget_seconds=0.1)
+            self.assertGreater(len(b.neural.pool), 50)                  # 手持ちの知識文で埋まる
+
+
 if __name__ == "__main__":
     unittest.main()

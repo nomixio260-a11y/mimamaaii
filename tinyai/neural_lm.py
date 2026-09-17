@@ -48,7 +48,7 @@ class NeuralLM:
             return "base"
         return "small"
 
-    def __init__(self, data_dir: Path, size: str = "base", vocab_size: int = 6000, seed: int = 0, dropout: float = 0.1):
+    def __init__(self, data_dir: Path, size: str = "base", vocab_size: int = 6000, seed: int = 0, dropout: float = 0.1, pool_capacity: int = 0):
         self.available = neural.available()
         self.dropout = float(dropout)
         # 学習スレッドと会話スレッドが同じモデルを触るためのロック (EMA への切替中に更新が走ると壊れる)
@@ -74,7 +74,10 @@ class NeuralLM:
         self.vocab_size = vocab_size
         self.model = None
         self.tok: SubwordTokenizer | None = None
-        self.pool = neural.SequencePool(seed=seed) if self.available else None
+        # 再生バッファの容量は使えるメモリに比例させる。容量が小さいと同じ系列を何十周も学ぶことになり
+        # (実測: 3 万系列 = 276 万トークンに対し学習済み 1.13 億トークン = 約 41 周)、学習損失は下がるのに
+        # 取り置き ppl が上がる = 過学習になる。系列 1 本あたり約 370 バイト (平均 92 トークン × int32)。
+        self.pool = neural.SequencePool(capacity=pool_capacity or 30000, seed=seed) if self.available else None
         self.rng = random.Random(seed)
         self.nprng = neural.np.random.default_rng(seed) if self.available else None
         self.trained_tokens = 0
