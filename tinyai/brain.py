@@ -558,6 +558,8 @@ class Brain:
         # 1. 取り置き文の ppl (言語としての予測力)
         if nl._holdout:
             out["ppl"] = round(neural_perplexity(nl), 2)
+        if nl.recent_ppl is not None:
+            out["recent_ppl"] = nl.recent_ppl      # 入れ替わる取り置き: 今の分布での汎化 (ppl との差が忘却の量)
         # 2. 会話の ppl (応答部だけ)。比較できるよう取り置き会話は一度決めたら固定する
         if not self.dialog_holdout and len(self.dialogs) >= n_dialogs * 2:
             rng = random.Random(12345)

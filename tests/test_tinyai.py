@@ -1352,5 +1352,51 @@ class DialogHistoryTest(unittest.TestCase):
             self.assertGreater(with_hist, plain)                     # 履歴の分だけ長い系列になる
 
 
+class ReplayReservoirTest(unittest.TestCase):
+    """再生バッファの入れ替え: 一部を貯水池抽出にして古い分布を残す。"""
+
+    def test_reservoir_keeps_old_sequences(self):
+        import numpy as np
+        from tinyai.neural import SequencePool
+        cap, total = 400, 4000
+        share = SequencePool.RESERVOIR_SHARE
+        try:
+            SequencePool.RESERVOIR_SHARE = 0.0
+            fifo = SequencePool(cap, seed=1)
+            SequencePool.RESERVOIR_SHARE = 0.25
+            res = SequencePool(cap, seed=1)
+            for i in range(total):
+                ids = np.array([8, 9, 10, 11], dtype=np.int32)
+                fifo.add(ids, weight=float(i))
+                res.add(ids, weight=float(i))
+            self.assertEqual(len(fifo.items), cap)
+            self.assertEqual(len(res.items), cap)
+            old_fifo = sum(1 for it in fifo.items if it[1] < total * 0.25)
+            old_res = sum(1 for it in res.items if it[1] < total * 0.25)
+            self.assertEqual(old_fifo, 0)              # 先入れ先出しは古い系列を全部押し出す
+            self.assertGreater(old_res, cap * 0.02)    # 貯水池には古い時期の系列が残る
+            newest = max(it[1] for it in res.items)
+            self.assertGreaterEqual(newest, total - 10)  # 新しい系列にもきちんと追従する
+        finally:
+            SequencePool.RESERVOIR_SHARE = share
+
+    def test_recent_holdout_is_separate(self):
+        """入れ替わる取り置きは学習に使わず、固定の取り置きとは別に持つ。"""
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="small")
+            nl.min_sentences, nl.min_chars = 4, 40
+            nl.ensure_model(["こんにちは。今日はいい天気です。散歩に行きましょう。%d" % i for i in range(60)])
+            nl._holdout = [[8, 9, 10, 11]] * 300        # 固定分は満杯にしておく
+            before = len(nl.pool)
+            for i in range(3000):
+                nl.add_text("これは取り置きの確認のための文です。番号は %d 番。" % i)
+            self.assertGreater(len(nl._holdout_recent), 0)
+            self.assertLessEqual(len(nl._holdout_recent), 150)
+            self.assertEqual(len(nl._holdout), 300)     # 固定分は増えない
+            self.assertGreater(len(nl.pool), before)
+
+
 if __name__ == "__main__":
     unittest.main()

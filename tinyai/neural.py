@@ -641,9 +641,15 @@ class SequencePool:
     PROMPT_WEIGHT = 0.2
     PRIORITY_ALPHA = 0.6      # 優先度の鋭さ (0 で一様)
     PRIORITY_MIX = 0.5        # 一様サンプリングと混ぜる割合 (過学習と忘却の両方を避ける)
+    RESERVOIR_SHARE = 0.25    # 長期保管に回す割合 (残りは新しい系列で順に置き換える)
 
     def __init__(self, capacity: int = 30000, seed: int = 0):
         self.capacity = capacity
+        # 二段階の入れ替え: 先頭 RESERVOIR_SHARE は貯水池抽出 (これまでに見た全系列の一様標本) として
+        # 古い分布を残し、残りは先入れ先出しで新しい系列に追従する。全部を先入れ先出しにすると
+        # 収集が進むほど古い文が押し出され、取り置き ppl が悪化していく (破滅的忘却)。
+        self.reservoir = int(capacity * self.RESERVOIR_SHARE)
+        self.seen = 0
         self.items: list[tuple[list[int], float, int]] = []
         self.pos = 0
         self.rng = np.random.default_rng(seed) if np is not None else None
@@ -671,23 +677,34 @@ class SequencePool:
         if not isinstance(ids, np.ndarray):
             ids = np.asarray(ids, dtype=np.int32)
         item = (ids, float(weight), int(loss_from))
+        self.seen += 1
         if len(self.items) < self.capacity:
             self.priority[len(self.items)] = self.init_priority
             self.items.append(item)
             self.kinds.append(kind)
         else:
-            self.total_tokens -= len(self.items[self.pos][0])
-            old_kind = self.kinds[self.pos]
+            slot = self._evict_slot()
+            self.total_tokens -= len(self.items[slot][0])
+            old_kind = self.kinds[slot]
             self.kind_counts[old_kind] = max(0, self.kind_counts.get(old_kind, 1) - 1)
-            self.items[self.pos] = item
-            self.kinds[self.pos] = kind
-            self.priority[self.pos] = self.init_priority
-            self.pos = (self.pos + 1) % self.capacity
+            self.items[slot] = item
+            self.kinds[slot] = kind
+            self.priority[slot] = self.init_priority
         self.kind_counts[kind] = self.kind_counts.get(kind, 0) + 1
         self.total_tokens += len(ids)
         self._cum_n = -1
         if self.journal is not None:
             self.journal.append(item)
+
+    def _evict_slot(self) -> int:
+        """置き換える枠を選ぶ。確率 reservoir/seen で長期保管の枠 (一様に選ぶ) を、
+        それ以外は先入れ先出しの枠を使う。前者が貯水池抽出そのもので、これまでに見た系列の
+        一様標本が残る = 古い分布を忘れにくい。"""
+        if self.reservoir > 0 and self.seen > 0 and self.rng.random() < self.reservoir / self.seen:
+            return int(self.rng.integers(0, self.reservoir))
+        slot = self.reservoir + self.pos
+        self.pos = (self.pos + 1) % max(1, self.capacity - self.reservoir)
+        return slot
 
     def _pick(self) -> int:
         """優先度 ∝ (損失)^α と一様の混合でサンプリング。"""

@@ -15,6 +15,7 @@ import logging
 import random
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from . import neural
@@ -85,7 +86,9 @@ class NeuralLM:
         self.ready_ratio = 2.0        # 取り置き ppl が n-gram の何倍以内なら生成に使うか (サブワードと文字で単位が違うため緩め)
         self.ready_abs = 40.0         # n-gram の取り置きが無い時: サブワード ppl がこれ以下なら生成に使う
         self.total_steps = 30000      # コサイン減衰の想定総ステップ
-        self._holdout: list[list[int]] = []
+        self._holdout: list[list[int]] = []          # 初期に固定した取り置き (忘却の検出用)
+        self._holdout_recent: deque = deque(maxlen=150)  # 最近の文から入れ替わる取り置き (今の分布での汎化)
+        self.recent_ppl: float | None = None
         self._last_save = 0.0
         self.batch = neural.PRESETS[self.size]["batch"] if self.available else 8
         self.lr = neural.PRESETS[self.size]["lr"] if self.available else 5e-4
@@ -112,6 +115,7 @@ class NeuralLM:
                 self.ready = bool(meta.get("ready", False))
                 self.size = meta.get("size", self.size)
                 self._holdout = [list(x) for x in meta.get("holdout", [])][:300]
+                self._holdout_recent = deque([list(x) for x in meta.get("holdout_recent", [])], maxlen=150)
                 saved = dict(meta.get("decode", {}))
                 # 既定値を変えた項目は、山登りで動かした形跡がない限り新しい既定値を使う
                 # (古いチェックポイントの復号設定が新しい研究結果を上書きしてしまうのを防ぐ)
@@ -196,10 +200,15 @@ class NeuralLM:
         ids = self.seq_text(text)
         if len(ids) < 4:
             return
-        if self.rng.random() < 0.02 and len(self._holdout) < 300:
-            self._holdout.append(ids)
-        else:
-            self.pool.add(ids, kind="text")
+        if self.rng.random() < 0.02:
+            # 取り置きは学習に使わない。固定の 300 本は「昔の分布を忘れていないか」、
+            # 入れ替わる 150 本は「今の分布にどれだけ汎化しているか」を測るためのもの
+            if len(self._holdout) < 300:
+                self._holdout.append(ids)
+            else:
+                self._holdout_recent.append(ids)
+            return
+        self.pool.add(ids, kind="text")
 
     def add_dialog(self, user: str, bot: str, context: str | None = None, weight: float = 1.0, history=None) -> None:
         if self.model is None:
@@ -413,19 +422,22 @@ class NeuralLM:
             self.ppl_hist.append(self.holdout_ppl)
             if len(self.ppl_hist) > 100:
                 del self.ppl_hist[:50]
+            if len(self._holdout_recent) >= 30:
+                with self._infer():
+                    self.recent_ppl = round(neural.perplexity(self.model, list(self._holdout_recent)), 2)
             self.ngram_ppl = ngram_ppl
             if self.holdout_ppl is not None:
                 if ngram_ppl is not None:
                     self.ready = self.holdout_ppl <= ngram_ppl * self.ready_ratio
                 else:
                     self.ready = self.holdout_ppl <= self.ready_abs  # n-gram の取り置きが無い時の絶対基準
-            return {"neural_ppl": self.holdout_ppl, "ngram_ppl": ngram_ppl, "ready": self.ready}
+            return {"neural_ppl": self.holdout_ppl, "recent_ppl": self.recent_ppl, "ngram_ppl": ngram_ppl, "ready": self.ready}
 
     def save(self) -> None:
         with self.lock:
             if self.model is None or self.tok is None:
                 return
-            self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300],
+            self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300], "holdout_recent": [list(x) for x in self._holdout_recent],
                                                        "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
             self._last_save = time.time()
 
@@ -504,7 +516,7 @@ class NeuralLM:
             "trained_tokens": self.trained_tokens,
             "pool": len(self.pool),
             "pool_tokens": self.pool.total_tokens,
-            "holdout": len(self._holdout),
+            "holdout": len(self._holdout), "holdout_recent": len(self._holdout_recent), "recent_ppl": self.recent_ppl,
             "last_loss": round(self.last_loss, 3) if self.last_loss is not None else None,
             "holdout_ppl": self.holdout_ppl,
             "ngram_ppl": self.ngram_ppl,
