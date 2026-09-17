@@ -866,12 +866,16 @@ class TokenCorpus:
     def _open(self, create: bool = True):
         if self._mm is not None:
             return self._mm
+        want = self.max_tokens * 4
         if not self.path.exists():
             if not create:
                 return None
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.path, "wb") as f:      # 疎ファイルとして確保 (実際に使った分だけ場所を取る)
-                f.truncate(self.max_tokens * 4)
+                f.truncate(want)
+        elif self.path.stat().st_size != want:    # 容量設定が変わったらファイルの大きさを合わせる
+            with open(self.path, "r+b") as f:
+                f.truncate(want)
         self._mm = np.memmap(self.path, dtype=np.int32, mode="r+", shape=(self.max_tokens,))
         return self._mm
 
@@ -938,8 +942,14 @@ class TokenCorpus:
             kinds = z["kinds"] if "kinds" in z.files else np.array(["text"] * len(self.offs))
             self.meta = [(int(lf[i]), str(kinds[i])) for i in range(len(self.offs))]
             self.head, saved_max, self.written = (int(x) for x in z["meta"])
-            if saved_max != self.max_tokens:       # 容量が変わったら索引は捨てて貯め直す
-                self.offs, self.lens, self.meta, self.head = [], [], [], 0
+            if saved_max > self.max_tokens:
+                # 容量を減らした: 新しい大きさに収まる系列だけ残す (貯めた分を捨てないで済ませる)
+                keep = [i for i in range(len(self.offs)) if self.offs[i] + self.lens[i] <= self.max_tokens]
+                self.offs = [self.offs[i] for i in keep]
+                self.lens = [self.lens[i] for i in keep]
+                self.meta = [self.meta[i] for i in keep]
+                self.head = min(self.head, self.max_tokens)
+            # 容量を増やした場合は、既存の位置がそのまま使えるので索引を保つ
         except Exception:
             self.offs, self.lens, self.meta, self.head = [], [], [], 0
         return len(self.offs)

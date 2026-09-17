@@ -1591,6 +1591,27 @@ class TokenCorpusTest(unittest.TestCase):
             self.assertEqual(len(d), len(c))
             self.assertEqual(d.sample(1, np.random.default_rng(0))[0][2], "dialog")
 
+    def test_capacity_change_keeps_what_fits(self):
+        """容量を変えても貯めたトークンを捨てない (増やす時はそのまま、減らす時は収まる分だけ)。"""
+        import numpy as np
+        from pathlib import Path
+        from tinyai.neural import TokenCorpus
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "corpus.bin"
+            c = TokenCorpus(f, max_tokens=1000)
+            for i in range(50):
+                c.append(np.arange(8, 18, dtype=np.int32) + i)
+            c.save()
+            big = TokenCorpus(f, max_tokens=4000)
+            self.assertEqual(len(big), 50)                     # 増やした時は索引をそのまま使える
+            for i in range(50):
+                big.append(np.arange(8, 18, dtype=np.int32) + i + 100)
+            big.save()
+            self.assertEqual(big.tokens, 1000)
+            small = TokenCorpus(f, max_tokens=600)
+            self.assertEqual(small.tokens, 600)                # 減らした時は収まる分だけ残る
+            self.assertEqual(len(small.sample(1)[0][0]), 10)   # 残った系列はちゃんと読める
+
     def test_refresh_from_corpus_feeds_the_pool(self):
         from pathlib import Path
         from tinyai.neural_lm import NeuralLM
