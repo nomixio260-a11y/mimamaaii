@@ -1544,5 +1544,45 @@ class PoolCapacityTest(unittest.TestCase):
             self.assertGreater(len(b.neural.pool), 50)                  # 手持ちの知識文で埋まる
 
 
+class TokenCorpusTest(unittest.TestCase):
+    """ディスクの追記型コーパス: RAM に入りきらない分の学習トークンを貯めて循環させる。"""
+
+    def test_ring_keeps_newest_and_survives_restart(self):
+        import numpy as np
+        from pathlib import Path
+        from tinyai.neural import TokenCorpus
+        with tempfile.TemporaryDirectory() as tmp:
+            c = TokenCorpus(Path(tmp) / "corpus.bin", max_tokens=1000)
+            for i in range(300):
+                c.append(np.arange(8, 18, dtype=np.int32) + i, loss_from=3, kind="dialog")
+            self.assertEqual(c.tokens, 1000)                 # 容量までしか持たない
+            self.assertEqual(c.written, 3000)                # 書いた総数は数え続ける
+            self.assertEqual(len(c), 100)
+            got = c.sample(5, np.random.default_rng(0))
+            self.assertEqual(len(got), 5)
+            for ids, lf, kind in got:
+                self.assertEqual(len(ids), 10)
+                self.assertEqual(lf, 3)
+                self.assertEqual(kind, "dialog")
+                self.assertGreaterEqual(int(ids[0]), 8 + 200)   # 上書きされた古い分は残っていない
+            c.save()
+            d = TokenCorpus(Path(tmp) / "corpus.bin", max_tokens=1000)
+            self.assertEqual(len(d), len(c))
+            self.assertEqual(d.sample(1, np.random.default_rng(0))[0][2], "dialog")
+
+    def test_refresh_from_corpus_feeds_the_pool(self):
+        from pathlib import Path
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="small")
+            nl.min_sentences, nl.min_chars = 4, 40
+            nl.ensure_model(["こんにちは。今日はいい天気です。散歩に行きましょう。%d" % i for i in range(60)])
+            for i in range(300):
+                nl.add_text("学習用の文です。番号は %d 番になります。" % i)
+            self.assertGreater(len(nl.corpus), 100)          # 読んだ文はコーパスにも入る
+            n = nl.refresh_from_corpus(50)
+            self.assertGreater(n, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

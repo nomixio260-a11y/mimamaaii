@@ -48,7 +48,7 @@ class NeuralLM:
             return "base"
         return "small"
 
-    def __init__(self, data_dir: Path, size: str = "base", vocab_size: int = 6000, seed: int = 0, dropout: float = 0.1, pool_capacity: int = 0):
+    def __init__(self, data_dir: Path, size: str = "base", vocab_size: int = 6000, seed: int = 0, dropout: float = 0.1, pool_capacity: int = 0, corpus_tokens: int = 0):
         self.available = neural.available()
         self.dropout = float(dropout)
         # 学習スレッドと会話スレッドが同じモデルを触るためのロック (EMA への切替中に更新が走ると壊れる)
@@ -78,6 +78,9 @@ class NeuralLM:
         # (実測: 3 万系列 = 276 万トークンに対し学習済み 1.13 億トークン = 約 41 周)、学習損失は下がるのに
         # 取り置き ppl が上がる = 過学習になる。系列 1 本あたり約 370 バイト (平均 92 トークン × int32)。
         self.pool = neural.SequencePool(capacity=pool_capacity or 30000, seed=seed) if self.available else None
+        # 読んだ文はディスクのコーパスにも貯める (RAM の再生バッファに入りきらない分の置き場)。
+        # 1 トークン 4 バイトなので、数千万トークンでも RAM を使わずに回せる。
+        self.corpus = neural.TokenCorpus(self.data_dir / "corpus.bin", max_tokens=corpus_tokens or 16_000_000) if self.available else None
         self.rng = random.Random(seed)
         self.nprng = neural.np.random.default_rng(seed) if self.available else None
         self.trained_tokens = 0
@@ -218,6 +221,8 @@ class NeuralLM:
                 self._holdout_recent.append(ids)
             return
         self.pool.add(ids, kind="text")
+        if self.corpus is not None:
+            self.corpus.append(ids, kind="text")
 
     def add_dialog(self, user: str, bot: str, context: str | None = None, weight: float = 1.0, history=None) -> None:
         if self.model is None:
@@ -228,6 +233,21 @@ class NeuralLM:
             return
         for _ in range(max(1, int(round(weight)))):
             self.pool.add(ids, loss_from=self.loss_from(ids), kind="dialog")
+        if self.corpus is not None:
+            self.corpus.append(ids, loss_from=self.loss_from(ids), kind="dialog")
+
+    def refresh_from_corpus(self, k: int) -> int:
+        """ディスクのコーパスから k 本引いて再生バッファへ入れ直す。
+        バッファに入りきらない分を少しずつ循環させることで、同じ系列を何十周もするのを防ぐ。"""
+        with self.lock:
+            if self.model is None or self.corpus is None or k <= 0 or not len(self.corpus):
+                return 0
+            n = 0
+            for ids, lf, kind in self.corpus.sample(k, self.nprng):
+                if len(ids) >= 4:
+                    self.pool.add(ids, loss_from=int(lf), kind=str(kind))
+                    n += 1
+            return n
 
     def add_copy_example(self, keyword: str, sentence: str, neighbors: str | None = None) -> None:
         """RAG の「文脈から抜き出す」練習: 文脈 (その文 + 周辺) を与え、キーワードについて聞かれたらその文を答える。"""
@@ -453,6 +473,8 @@ class NeuralLM:
             if self.model is None or self.tok is None:
                 return
             try:
+                if self.corpus is not None:
+                    self.corpus.save()
                 self.pool.save(self.pool_path)      # 再生バッファごと持ち越す (再開しても混ざり具合を失わない)
             except Exception as e:
                 log.warning("再生バッファの保存に失敗: %s", e)
@@ -535,6 +557,8 @@ class NeuralLM:
             "trained_tokens": self.trained_tokens,
             "pool": len(self.pool),
             "pool_tokens": self.pool.total_tokens,
+            "corpus_seqs": len(self.corpus) if self.corpus else 0,
+            "corpus_tokens": self.corpus.tokens if self.corpus else 0,
             "holdout": len(self._holdout), "holdout_recent": len(self._holdout_recent), "recent_ppl": self.recent_ppl,
             "last_loss": round(self.last_loss, 3) if self.last_loss is not None else None,
             "holdout_ppl": self.holdout_ppl,

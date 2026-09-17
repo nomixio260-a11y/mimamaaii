@@ -145,7 +145,8 @@ class Brain:
         # 再生バッファはメモリ 1 MB あたり 100 系列 (1 GB で約 10 万系列 ≒ 37 MB)
         self.neural = NeuralLM(self.cfg.data_dir, size=size, seed=self.cfg.seed or 0,
                                dropout=self.cfg.neural_dropout,
-                               pool_capacity=max(30000, int(self.cfg.memory_mb) * 100))  # Transformer LM (numpy)
+                               pool_capacity=max(30000, int(self.cfg.memory_mb) * 100),
+                               corpus_tokens=max(8_000_000, int(self.cfg.memory_mb) * 40_000))  # Transformer LM (numpy)
         self.last_self_eval: dict | None = None
         self.dialog_holdout: list = []             # 評価用に固定した会話 (比較できるように)
         self._followup = False                     # 直前の発話が指示語・情報量の乏しい問いか
@@ -491,6 +492,8 @@ class Brain:
             item = self._neural_pending_dialog.popleft()
             u, b, ctx, w = item[:4]
             nl.add_dialog(u, b, ctx, weight=w, history=item[4] if len(item) > 4 else None)
+        # ディスクのコーパスから少しずつ戻す: バッファに入りきらない過去の文も巡回して学ぶ
+        nl.refresh_from_corpus(max(64, nl.pool.capacity // 100))
         # 文脈からの抽出練習: 最近の知識文をキーワード付きで (RAG で「検索文を使う」ことを学ぶ)
         self.feed_copy_examples(self.kb.random_docs(min(60, len(self.kb)), self.rng))
         n = 0
@@ -527,7 +530,8 @@ class Brain:
                     for item in list(self.dialogs.pairs)[-int(room * 0.4):]:
                         u, b, _, w = item[:4]
                         nl.add_dialog(u, b, weight=w, history=item[4] if len(item) > 4 else None)
-                    log.info("再生バッファを補充: %d 系列 (容量 %d)", len(nl.pool), nl.pool.capacity)
+                    nl.refresh_from_corpus(int(room * 0.5))     # ディスクに貯めた過去の文も戻す
+                    log.info("再生バッファを補充: %d 系列 (容量 %d, コーパス %d 系列)", len(nl.pool), nl.pool.capacity, len(nl.corpus or []))
             self._feed_neural()
         t0 = time.perf_counter()
         r = None

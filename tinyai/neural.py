@@ -840,6 +840,118 @@ class SequencePool:
         return len(self.items)
 
 
+class TokenCorpus:
+    """学習トークンをディスクに貯める追記型のコーパス (環状バッファ)。
+
+    再生バッファは RAM の大きさで頭打ちになり、知識ベースもメモリ上限で古い文書から捨てられる。
+    そのため「これまでに読んだ文」の大半は二度と学習に使われず、手持ちのトークンを何十周もすることになる
+    (実測 1.86 トークン/パラメータ。目安は 20)。トークン列そのものは int32 で 1 トークン 4 バイトしかないので、
+    ディスクに環状に書き溜めておけば、RAM を増やさずに何千万トークンでも回せる。
+
+    ファイルは 2 つ: corpus.bin (int32 の環状バッファ) と corpus.idx.npz (系列ごとの開始位置と長さ)。
+    書き込みが末尾に届いたら先頭へ戻り、上書きされた範囲の古い系列を索引から落とす。"""
+
+    def __init__(self, path, max_tokens: int = 16_000_000):
+        self.path = Path(path)
+        self.idx_path = Path(str(path) + ".idx.npz")
+        self.max_tokens = int(max_tokens)
+        self.offs: list[int] = []
+        self.lens: list[int] = []
+        self.meta: list[tuple[int, str]] = []     # 系列ごとの (loss_from, 種類)
+        self.head = 0
+        self.written = 0            # これまでに書いたトークンの総数 (周回数の把握用)
+        self._mm = None
+        self.load()
+
+    def _open(self, create: bool = True):
+        if self._mm is not None:
+            return self._mm
+        if not self.path.exists():
+            if not create:
+                return None
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "wb") as f:      # 疎ファイルとして確保 (実際に使った分だけ場所を取る)
+                f.truncate(self.max_tokens * 4)
+        self._mm = np.memmap(self.path, dtype=np.int32, mode="r+", shape=(self.max_tokens,))
+        return self._mm
+
+    def append(self, ids, loss_from: int = 0, kind: str = "text") -> bool:
+        """系列を 1 本書き足す。末尾に入らなければ先頭に戻る。"""
+        n = len(ids)
+        if n < 3 or n > self.max_tokens // 4:
+            return False
+        mm = self._open()
+        if mm is None:
+            return False
+        if self.head + n > self.max_tokens:
+            self.head = 0
+        start, end = self.head, self.head + n
+        while self.offs and self.offs[0] < end and self.offs[0] + self.lens[0] > start:
+            self.offs.pop(0)                      # 上書きされる古い系列を索引から落とす
+            self.lens.pop(0)
+            self.meta.pop(0)
+        mm[start:end] = np.asarray(ids, dtype=np.int32)
+        self.offs.append(start)
+        self.lens.append(n)
+        self.meta.append((int(loss_from), str(kind)))
+        self.head = end
+        self.written += n
+        return True
+
+    def sample(self, k: int, rng=None) -> list[tuple]:
+        """無作為に k 本取り出す (memmap から必要な範囲だけ読む)。返すのは (ids, loss_from, 種類)。"""
+        if not self.offs:
+            return []
+        mm = self._open(create=False)
+        if mm is None:
+            return []
+        rng = rng or np.random.default_rng()
+        pick = rng.choice(len(self.offs), size=min(k, len(self.offs)), replace=False)
+        out = []
+        for i in pick:
+            i = int(i)
+            ids = np.array(mm[self.offs[i] : self.offs[i] + self.lens[i]], dtype=np.int32)
+            lf, kind = self.meta[i] if i < len(self.meta) else (0, "text")
+            out.append((ids, lf, kind))
+        return out
+
+    def save(self) -> None:
+        if not self.offs:
+            return
+        tmp = Path(str(self.idx_path) + ".tmp.npz")
+        np.savez(tmp, offs=np.array(self.offs, dtype=np.int64), lens=np.array(self.lens, dtype=np.int32),
+                 loss_from=np.array([m[0] for m in self.meta], dtype=np.int32),
+                 kinds=np.array([m[1] for m in self.meta]),
+                 meta=np.array([self.head, self.max_tokens, self.written], dtype=np.int64))
+        os.replace(tmp, self.idx_path)
+        if self._mm is not None:
+            self._mm.flush()
+
+    def load(self) -> int:
+        if not self.idx_path.exists():
+            return 0
+        try:
+            z = np.load(self.idx_path)
+            self.offs = [int(x) for x in z["offs"]]
+            self.lens = [int(x) for x in z["lens"]]
+            lf = z["loss_from"] if "loss_from" in z.files else np.zeros(len(self.offs), dtype=np.int32)
+            kinds = z["kinds"] if "kinds" in z.files else np.array(["text"] * len(self.offs))
+            self.meta = [(int(lf[i]), str(kinds[i])) for i in range(len(self.offs))]
+            self.head, saved_max, self.written = (int(x) for x in z["meta"])
+            if saved_max != self.max_tokens:       # 容量が変わったら索引は捨てて貯め直す
+                self.offs, self.lens, self.meta, self.head = [], [], [], 0
+        except Exception:
+            self.offs, self.lens, self.meta, self.head = [], [], [], 0
+        return len(self.offs)
+
+    @property
+    def tokens(self) -> int:
+        return int(sum(self.lens))
+
+    def __len__(self) -> int:
+        return len(self.offs)
+
+
 def lr_at(step: int, base_lr: float, warmup: int, total: int, min_ratio: float = 0.1, schedule: str = "wsd") -> float:
     """学習率。既定は WSD (warmup-stable-decay): ウォームアップの後は一定に保つ。
     終わりの無い継続学習ではコサイン減衰は「いつ終わるか」を決め打ちする必要があり、
