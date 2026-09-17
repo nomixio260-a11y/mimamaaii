@@ -2045,5 +2045,23 @@ class DialogBpcTest(unittest.TestCase):
                                        1 - r["dialog_bpc"] / r["dialog_bpc_unigram"], places=2)
 
 
+class TermOveruseTest(unittest.TestCase):
+    """同じ語を持ち出しすぎる候補を落とす (自己矛盾した応答の抑制)。"""
+
+    def test_detects_overuse(self):
+        from tinyai.brain import Brain
+        bad = "犬と猫はどちらも犬よりも大きく、犬は猫と犬を飼うことができます。犬の世話は犬に向いています。"
+        self.assertGreaterEqual(Brain._term_overuse(bad), 1.0)
+        for good in ("犬と猫はどちらも人気のあるペットです。性格や世話の手間が違うので、生活に合う方を選ぶとよいでしょう。",
+                     "富士山は静岡県と山梨県にまたがる日本最高峰の火山で、標高は3776メートルです。",
+                     "機械学習とは、データから規則を見つける技術です。統計や最適化の考え方を使います。"):
+            self.assertEqual(Brain._term_overuse(good), 0.0)
+
+    def test_short_replies_are_not_penalised(self):
+        from tinyai.brain import Brain
+        self.assertEqual(Brain._term_overuse("はい、そうです。"), 0.0)
+        self.assertEqual(Brain._term_overuse("犬です。"), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

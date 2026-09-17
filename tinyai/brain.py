@@ -25,7 +25,10 @@ import random
 import re
 import threading
 import time
+import re as _re
 from collections import Counter, deque
+
+_CONTENT_RE = _re.compile(r"[一-鿿㐀-䶿]+|[゠-ヿ]{2,}")  # 漢字の連続、カタカナ 2 文字以上
 from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 from typing import Iterable
@@ -365,6 +368,21 @@ class Brain:
         by_gram = 1.0 - len(set(grams)) / len(grams) if len(grams) >= 6 else 0.0
         return max(by_phrase, by_gram)
 
+    @staticmethod
+    def _term_overuse(text: str) -> float:
+        """同じ語の使いすぎ (0〜1)。「犬と猫はどちらも犬よりも大きく、犬は猫と…」のように、
+        小さなモデルは短い応答の中で同じ名詞を何度も持ち出し、結果として矛盾したことを言う。
+        繰り返しの割合 (句・文字 3-gram) では捉えられないので、語の頻度で別に測る。"""
+        words = _CONTENT_RE.findall(text)             # 漢字・カタカナの連続 = 内容語のだいたいの単位
+        if len(words) < 5:
+            return 0.0
+        top = Counter(words).most_common(1)[0][1]
+        share = top / len(words)
+        # 同じ語が 4 回以上、かつ内容語の 1/4 以上を占めるとき「使いすぎ」とみなす
+        if top < 4 or share < 0.25:
+            return 0.0
+        return min(1.0, (top - 3) / 3)
+
     def recent_turns(self, k: int = 2) -> list[tuple[str, str]]:
         """直近のやり取りを (発話, 応答) の組で返す (会話のキャッチボール用)。"""
         pairs: list[tuple[str, str]] = []
@@ -436,13 +454,17 @@ class Brain:
             if rep_ratio > 0.5:                    # 同じ句の繰り返しだらけの候補は捨てる
                 thought["scores"].append((c[:60], None))
                 continue
+            overuse = self._term_overuse(c)        # 同じ語を何度も持ち出す候補も落とす
+            if overuse >= 1.0:
+                thought["scores"].append((c[:60], None))
+                continue
             # 検索が弱い (雑談・指示語) 時は接地率より自然さを見る: 検索文の寄せ集めを選ばないため
             if weak:
                 sc = fluency / 3.0 + min(len(c), 40) * 0.01 + grounded * 0.3
             else:
                 sc = grounded + fluency / 5.0
             sc += 0.3 if c.endswith(("。", "！", "？", ".", "!", "?")) else 0.0
-            sc -= rep_ratio * 0.5
+            sc -= rep_ratio * 0.5 + overuse * 0.4
             thought["scores"].append((c[:60], round(sc, 3)))
             if sc > best_s:
                 best, best_s = c, sc
