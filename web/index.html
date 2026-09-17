@@ -235,11 +235,28 @@ details.about p { margin: 6px 0; }
     try {
       const w = new Worker('worker.js');
       w.onmessage = (ev) => { const p = pending.get(ev.data.id); if (!p) return; pending.delete(ev.data.id); ev.data.ok ? p.resolve(ev.data.result) : p.reject(new Error(ev.data.error)); };
-      w.onerror = (e) => { console.warn('worker error', e.message); };
+      w.onerror = (e) => { console.warn('worker error', e && e.message); state.workerBroken = true; };
       state.worker = w;
     } catch (e) { state.worker = null; }
   }
   function loadScript(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); }
+  // Worker が使えない配信環境でも動くように: 応答が無ければメインスレッドへ切り替える
+  async function initEngine(payload) {
+    if (state.worker) {
+      try {
+        return await Promise.race([
+          call(payload),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('worker timeout')), 25000)),
+        ]);
+      } catch (e) {
+        console.warn('Worker を使えないのでメインスレッドで動かします:', e.message);
+        try { state.worker.terminate(); } catch (e2) { /* 無視 */ }
+        state.worker = null; pending.clear();
+      }
+    }
+    if (!window.TinyAI) await loadScript('engine.js');
+    return await call(payload);
+  }
 
   // ---------------------------------------------------------- 保存 (IndexedDB, この端末だけ)
   function openDb() {
@@ -506,7 +523,7 @@ details.about p { margin: 6px 0; }
       startWorker();
       if (!state.worker) await loadScript('engine.js');
       const snapshot = await dbGet('snapshot');
-      const r = await call({ op: 'init', meta, bin, vocab, kb, snapshot: snapshot || null });
+      const r = await initEngine({ op: 'init', meta, bin, vocab, kb, snapshot: snapshot || null });
       if (snapshot && snapshot.events) { state.events = snapshot.events; renderEvents(); }
       if (r.tokens) state.vocab = r.tokens;
       renderSummary(r.summary);
