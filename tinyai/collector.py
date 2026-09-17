@@ -349,6 +349,14 @@ class HuggingFaceDatasets(Source):
             a = clean_field(row.get("output") or row.get("response"))
             if q and a:
                 pairs.append((f"{q}\n{inp}" if inp else q, a))
+        elif fmt == "qa_text":   # answer が {"text": ...} の形 (人手で書かれた日本語の回答など)
+            q = clean_field(row.get("question") or row.get("title"))
+            a = row.get("answer")
+            if isinstance(a, dict):
+                a = a.get("text") or a.get("value") or ""
+            a = clean_field(a)
+            if q and a:
+                pairs.append((q, a))
         elif fmt == "qa":
             q = clean_field(row.get("question") or row.get("title"))
             a = (row.get("answer") or row.get("answers") or "").strip() if isinstance(row.get("answer") or row.get("answers"), str) else ""

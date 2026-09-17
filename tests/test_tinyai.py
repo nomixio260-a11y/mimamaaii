@@ -2063,5 +2063,19 @@ class TermOveruseTest(unittest.TestCase):
         self.assertEqual(Brain._term_overuse("犬です。"), 0.0)
 
 
+class QaTextFormatTest(unittest.TestCase):
+    """answer が {"text": ...} の形のデータセットを読む (人手で書かれた日本語の回答)。"""
+
+    def test_reads_nested_answer(self):
+        from tinyai.collector import HuggingFaceDatasets
+        row = {"question": "経済産業省の役割は?", "answer": {"text": "経済および産業の発展に関する行政を所管しています。"}}
+        pairs = HuggingFaceDatasets._pairs_from_row(row, "qa_text")
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0][0], "経済産業省の役割は?")
+        self.assertTrue(pairs[0][1].startswith("経済および産業"))
+        self.assertEqual(HuggingFaceDatasets._pairs_from_row({"question": "問", "answer": {"text": ""}}, "qa_text"), [])
+        self.assertEqual(HuggingFaceDatasets._pairs_from_row({"question": "問", "answer": "答えです。"}, "qa_text")[0][1], "答えです。")
+
+
 if __name__ == "__main__":
     unittest.main()
