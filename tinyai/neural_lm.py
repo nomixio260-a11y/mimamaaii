@@ -59,6 +59,7 @@ class NeuralLM:
         self.loss_hist: list[float] = []
         self.ppl_hist: list[float] = []      # 取り置き ppl の推移 (成長の判断に使う)
         self.grown = 0
+        self.widened = 0
         self.vocab_added = 0
         self.online_steps = 0
         self.vocab_size = vocab_size
@@ -127,33 +128,53 @@ class NeuralLM:
     def seq_text(self, text: str) -> list[int]:
         return [BOS] + self.tok.encode(text, max_tokens=self.model.T - 2) + [EOS]
 
-    def seq_dialog(self, user: str, bot: str, context: str | None = None) -> list[int]:
+    def _history_ids(self, history, budget: int) -> list[int]:
+        """直前の会話 (新しいものを優先) を <usr> 発話 <bot> 応答 … の形で budget トークン以内に詰める。"""
+        out: list[int] = []
+        for u, b in reversed(list(history or [])):
+            if not u or not b:
+                continue
+            turn = [USR] + self.tok.encode(u, max_tokens=budget // 3) + [BOT] + self.tok.encode(b, max_tokens=budget // 2)
+            if len(out) + len(turn) > budget:
+                break
+            out = turn + out          # 古い順に並べ直す
+        return out
+
+    def seq_dialog(self, user: str, bot: str, context: str | None = None, history=None) -> list[int]:
+        """会話系列。history があれば直前のやり取りを含める (人間のようにキャッチボールを学ぶ)。
+        <bos> [<ctx> 検索文] [<usr> 過去発話 <bot> 過去応答]… <usr> 今の発話 <bot> 応答 <eos>"""
         T = self.model.T
-        ctx_ids = self.tok.encode(context, max_tokens=T // 2) if context else []
+        ctx_ids = self.tok.encode(context, max_tokens=T // 3) if context else []
         u = self.tok.encode(user, max_tokens=T // 4)
-        room = T - len(ctx_ids) - len(u) - 5
+        hist = self._history_ids(history, max(0, T // 3)) if history else []
+        room = T - len(ctx_ids) - len(hist) - len(u) - 5
+        if room < 8 and hist:                       # 入りきらなければ過去を削る
+            hist = hist[-max(0, T // 6):]
+            room = T - len(ctx_ids) - len(hist) - len(u) - 5
         b = self.tok.encode(bot, max_tokens=max(8, room))
         seq = [BOS]
         if ctx_ids:
             seq += [CTX] + ctx_ids
-        return seq + [USR] + u + [BOT] + b + [EOS]
+        return seq + hist + [USR] + u + [BOT] + b + [EOS]
 
     @staticmethod
     def loss_from(seq: list[int]) -> int:
-        """会話系列で本来の重みで学習し始める位置 (<bot> の次 = 応答の最初のトークン)。"""
-        try:
-            return seq.index(BOT) + 1
-        except ValueError:
-            return 0
+        """会話系列で本来の重みで学習し始める位置 (最後の <bot> の次 = 今回の応答の先頭)。
+        過去のやり取りは文脈なのでプロンプト側の弱い重みで学ぶ。"""
+        for i in range(len(seq) - 1, -1, -1):
+            if seq[i] == BOT:
+                return i + 1
+        return 0
 
-    def prompt_dialog(self, user: str, context: str | None = None) -> list[int]:
+    def prompt_dialog(self, user: str, context: str | None = None, history=None) -> list[int]:
         T = self.model.T
-        ctx_ids = self.tok.encode(context, max_tokens=T // 2) if context else []
+        ctx_ids = self.tok.encode(context, max_tokens=T // 3) if context else []
         u = self.tok.encode(user, max_tokens=T // 4)
+        hist = self._history_ids(history, max(0, T // 3)) if history else []
         seq = [BOS]
         if ctx_ids:
             seq += [CTX] + ctx_ids
-        return seq + [USR] + u + [BOT]
+        return seq + hist + [USR] + u + [BOT]
 
     # ------------------------------------------------------------ データ供給
     def add_text(self, text: str) -> None:
@@ -167,10 +188,10 @@ class NeuralLM:
         else:
             self.pool.add(ids, kind="text")
 
-    def add_dialog(self, user: str, bot: str, context: str | None = None, weight: float = 1.0) -> None:
+    def add_dialog(self, user: str, bot: str, context: str | None = None, weight: float = 1.0, history=None) -> None:
         if self.model is None:
             return
-        ids = self.seq_dialog(user, bot, context)
+        ids = self.seq_dialog(user, bot, context, history=history)
         if weight < 0:      # 選好データの「選ばれなかった応答」: unlikelihood で出しにくくする
             self.pool.add(ids, weight, loss_from=self.loss_from(ids), kind="dialog")
             return
@@ -218,13 +239,13 @@ class NeuralLM:
             self._parallel = None
 
     # ------------------------------------------------------------ リアルタイム学習 (1 ターンごと)
-    def learn_turn(self, user: str, bot: str, context: str | None = None, weight: float = 1.0, steps: int = 2) -> dict | None:
+    def learn_turn(self, user: str, bot: str, context: str | None = None, weight: float = 1.0, steps: int = 2, history=None) -> dict | None:
         """今の対話を即座に学習する。weight > 0 は正例、< 0 は unlikelihood (その答えを出しにくくする)。
         その系列 + 再生バッファからの少量を混ぜて数ステップ更新 (忘却を防ぐ)。"""
         with self.lock:
             if self.model is None:
                 return None
-            ids = self.seq_dialog(user, bot, context)
+            ids = self.seq_dialog(user, bot, context, history=history)
             lf = self.loss_from(ids)
             self.pool.add(ids, weight, loss_from=lf)
             T = self.model.T
@@ -256,7 +277,9 @@ class NeuralLM:
         with self.lock:
             if self.model is None or not memory_ok:
                 return False
-            if self.model.L >= neural.MAX_LAYERS.get(self.size, 6):
+            max_layers = neural.MAX_LAYERS.get(self.size, 6)
+            max_ff = neural.PRESETS.get(self.size, {}).get("ff", self.model.ff) * 3
+            if self.model.L >= max_layers and self.model.ff >= max_ff:
                 return False
             h = self.loss_hist
             if len(h) < 20:
@@ -267,10 +290,15 @@ class NeuralLM:
                 return False
             if before - recent < 0.02 and recent > 1.5:  # 改善が止まり、まだ十分に低くない
                 self.stop_parallel()  # パラメータの形が変わるので並列ワーカーは作り直す (次の train_some で再開)
-                self.model.grow_layer()
+                if self.model.L < max_layers:
+                    self.model.grow_layer()
+                    log.info("ニューラル LM: 層を追加 -> %d 層 (%d params)", self.model.L, self.model.n_params())
+                else:
+                    self.model.grow_width()   # 層が上限なら幅を広げる (どちらも関数を保つ)
+                    self.widened += 1
+                    log.info("ニューラル LM: 中間次元を拡張 -> ff=%d (%d params)", self.model.ff, self.model.n_params())
                 self.grown += 1
                 self.loss_hist = []
-                log.info("ニューラル LM: 層を追加 -> %d 層 (%d params)", self.model.L, self.model.n_params())
                 return True
             return False
 
@@ -399,19 +427,20 @@ class NeuralLM:
         with self.model.use_ema():
             return self.model.logprob(self.seq_text(text))
 
-    def chat(self, user: str, context: str | None = None, n: int = 2, max_new: int = 48, temperature: float = 0.7) -> list[str]:
-        """RAG 形式で応答候補を n 本生成。"""
+    def chat(self, user: str, context: str | None = None, n: int = 2, max_new: int = 48, temperature: float = 0.7, history=None, copy_bonus: float | None = None) -> list[str]:
+        """RAG 形式で応答候補を n 本生成。history があれば直前のやり取りを踏まえて答える。"""
         with self.lock:
             if self.model is None:
                 return []
-            prompt = self.prompt_dialog(user, context)
+            prompt = self.prompt_dialog(user, context, history=history)
             out = []
             dec = self.decode
             # 文脈に出てくるトークンを少し出やすくする (検索した文を実際に使わせる)
             copy_ids = self.tok.encode(context, max_tokens=self.model.T) if context else None
+            bonus = dec.get("copy_bonus", 0.0) if copy_bonus is None else copy_bonus
             with self.model.use_ema():
                 gens = self.model.generate_batch(prompt, n=n, max_new=max_new, temperature=dec["temperature"], top_p=dec["top_p"], repetition_penalty=dec["repetition_penalty"], rng=self.nprng,
-                                                 copy_ids=copy_ids, copy_bonus=dec.get("copy_bonus", 0.0))
+                                                 copy_ids=copy_ids, copy_bonus=bonus)
             for ids in gens:
                 text = self.tok.decode(ids).strip()
                 if len(text) >= 2:
@@ -446,6 +475,8 @@ class NeuralLM:
             "ready": self.ready,
             "layers": self.model.L if self.model else 0,
             "grown_layers": self.grown,
+            "widened": self.widened,
+            "ff": self.model.ff if self.model else 0,
             "vocab_added": self.vocab_added,
             "online_steps": self.online_steps,
             "decode": dict(self.decode),

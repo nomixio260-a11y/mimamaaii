@@ -705,8 +705,11 @@ class DialogTest(unittest.TestCase):
     def test_hf_row_parsing(self):
         from tinyai.collector import HuggingFaceDatasets
         conv = {"conversations": [{"from": "human", "value": "こんにちは"}, {"from": "gpt", "value": "こんにちは！"}, {"from": "human", "value": "元気？"}, {"from": "gpt", "value": "元気です"}]}
-        # 複数ターンは直前の応答を文脈にする
-        self.assertEqual(HuggingFaceDatasets._pairs_from_row(conv, "conversations"), [("こんにちは", "こんにちは！"), ("元気？", "元気です", "こんにちは！")])
+        # 多ターン: 2 ターン目以降は「これまでのやり取り」を history として運ぶ
+        pairs = HuggingFaceDatasets._pairs_from_row(conv, "conversations")
+        self.assertEqual(pairs[0], ("こんにちは", "こんにちは！"))
+        self.assertEqual(pairs[1][:2], ("元気？", "元気です"))
+        self.assertEqual(pairs[1][4], [("こんにちは", "こんにちは！")])
         squad = {"question": "富士山の高さは？", "context": "富士山は日本一高い山である。標高は3776メートルで、静岡県と山梨県にまたがる。", "answers": {"text": ["3776メートル"], "answer_start": [17]}}
         (q, a, ctx), = HuggingFaceDatasets._pairs_from_row(squad, "squad")
         self.assertEqual((q, a), ("富士山の高さは？", "3776メートル。"))
@@ -1138,7 +1141,7 @@ class RealtimeLearningTest(unittest.TestCase):
             b.neural_step(steps=2, budget_seconds=0.5)
             from tinyai.collector import Batch
             b.learn_batch(Batch("t", "stream", [], "pref", 0.1, dialogs=[("本題は？", "良い答えです。"), ("本題は？", "悪い答えです。", None, -1.0)]))
-            neg = [w for _, _, _, w in b._neural_pending_dialog if w < 0]
+            neg = [item[3] for item in b._neural_pending_dialog if item[3] < 0]
             self.assertTrue(neg, "負例が学習待ち行列に入る")
             before = len(b.neural.pool)
             b._feed_neural()
@@ -1166,6 +1169,36 @@ class RealtimeLearningTest(unittest.TestCase):
                 primary = col.languages[0]
                 w = {f"{s_.name}:{s_.lang}": col._h(f"{s_.name}:{s_.lang}").score * s_.weight * (1.0 if s_.lang == primary else 0.4) for s_ in col.streams}
                 self.assertGreater(sum(v for k, v in w.items() if k.endswith(":ja")), sum(v for k, v in w.items() if k.endswith(":en")) * 1.2)
+
+    def test_multi_turn_memory(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        from tinyai.bpe import BOT, USR
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.learn_text("\n".join(f"文 {i} は多ターン会話のテストであり、番号 {i} を説明する。" for i in range(10, 160)), "https://x/mt")
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
+            b.neural_step(steps=2, budget_seconds=0.5)
+            nl = b.neural
+            hist = [("こんにちは", "こんにちは、何でも聞いてください。"), ("天気は？", "今日は晴れです。")]
+            p_hist = nl.prompt_dialog("じゃあ明日は？", None, history=hist)
+            p_plain = nl.prompt_dialog("じゃあ明日は？", None)
+            self.assertGreater(len(p_hist), len(p_plain))     # 履歴が入っている
+            self.assertGreaterEqual(p_hist.count(USR), 2)
+            self.assertEqual(p_hist[-1], BOT)                 # 生成は応答から始まる
+            seq = nl.seq_dialog("じゃあ明日は？", "明日は雨です。", None, history=hist)
+            lf = nl.loss_from(seq)
+            self.assertEqual(seq[lf - 1], BOT)                # 最後の <bot> の次から学ぶ
+            self.assertNotIn(BOT, seq[lf:])                   # 応答部に過去のやり取りは含まれない
+            # Brain: 会話が続くと履歴が渡される
+            b.reply("こんにちは")
+            b.reply("元気ですか")
+            turns = b.recent_turns(2)
+            self.assertTrue(turns and turns[-1][0] == "元気ですか")
 
 
 if __name__ == "__main__":

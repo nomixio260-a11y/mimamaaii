@@ -336,6 +336,18 @@ class Brain:
                     hosts.append(h)
         return f"{reply.text}（出典: {', '.join(hosts[:2])}）" if hosts else reply.text
 
+    def recent_turns(self, k: int = 2) -> list[tuple[str, str]]:
+        """直近のやり取りを (発話, 応答) の組で返す (会話のキャッチボール用)。"""
+        pairs: list[tuple[str, str]] = []
+        pending = None
+        for who, txt in self.history:
+            if who == "user":
+                pending = txt
+            elif pending:
+                pairs.append((pending, txt))
+                pending = None
+        return pairs[-k:]
+
     def _neural_reply(self, text: str, hits, fallback: Reply, strict: bool = True) -> Reply | None:
         """検索した文を文脈にして Transformer で応答を生成 (RAG)。「考える」= 2 段階:
           1. 下書き: 検索文脈で候補を生成
@@ -345,9 +357,15 @@ class Brain:
         strict=False: ニューラル専用モード。明らかに壊れた文だけ捨てる。過程は self.last_thought に残す (UI / API 用)。"""
         ctx_docs = [d for c, d in hits[:3] if c >= self.params.answer_threshold * 0.5]
         context = " ".join(d.text for d in ctx_docs)[:240] or None
+        history = self.recent_turns(2)
+        # 検索が弱い時は文脈への寄せを緩める (雑談まで検索文を写すと会話にならない)
+        best_score = hits[0][0] if hits else 0.0
+        base_bonus = self.neural.decode.get("copy_bonus", 0.0)
+        bonus = base_bonus if best_score >= self.params.answer_threshold else base_bonus * 0.3
         n = 4 if not strict else 3
-        cands = self.neural.chat(text, context, n=n)
-        thought = {"query": text, "context": [d.text[:80] for d in ctx_docs], "draft": list(cands), "rethink": [], "context2": [], "scores": []}
+        cands = self.neural.chat(text, context, n=n, history=history, copy_bonus=bonus)
+        thought = {"query": text, "context": [d.text[:80] for d in ctx_docs], "draft": list(cands), "rethink": [], "context2": [], "scores": [],
+                   "history": [u for u, _ in history], "copy_bonus": round(bonus, 2), "retrieval_score": round(float(best_score), 3)}
         # 2. 読み直し: 下書きに出てきた句で再検索 (質問だけでは引けなかった文が見つかる)
         if self.cfg.neural_rethink and cands:
             extra_terms = [p for c in cands[:2] for p in phrases(c) if is_phrase(p) and p not in text][:4]
@@ -357,7 +375,7 @@ class Brain:
                 if new_docs:
                     ctx_docs = (ctx_docs + new_docs)[:4]
                     context2 = " ".join(d.text for d in ctx_docs)[:240]
-                    more = self.neural.chat(text, context2, n=max(2, n - 1))
+                    more = self.neural.chat(text, context2, n=max(2, n - 1), history=history, copy_bonus=bonus)
                     thought["rethink"], thought["context2"] = list(more), [d.text[:80] for d in new_docs]
                     cands = cands + more
                     context = context2
@@ -444,8 +462,9 @@ class Brain:
         while self._neural_pending_text:
             nl.add_text(self._neural_pending_text.popleft())
         while self._neural_pending_dialog:
-            u, b, ctx, w = self._neural_pending_dialog.popleft()
-            nl.add_dialog(u, b, ctx, weight=w)
+            item = self._neural_pending_dialog.popleft()
+            u, b, ctx, w = item[:4]
+            nl.add_dialog(u, b, ctx, weight=w, history=item[4] if len(item) > 4 else None)
         # 文脈からの抽出練習: 最近の知識文をキーワード付きで (RAG で「検索文を使う」ことを学ぶ)
         self.feed_copy_examples(self.kb.random_docs(min(60, len(self.kb)), self.rng))
         n = 0
@@ -598,11 +617,12 @@ class Brain:
                 n_d = 0
                 for item in batch.dialogs:
                     q, a = item[0], item[1]
-                    ctx = item[2] if len(item) > 2 else None    # (発話, 応答, 文脈) = 読解データは文脈付き (RAG の練習)
-                    w = item[3] if len(item) > 3 else 1.0       # w < 0 = 選好データの不採用応答 (unlikelihood)
+                    ctx = item[2] if len(item) > 2 else None     # 読解データは文脈付き (RAG の練習)
+                    w = item[3] if len(item) > 3 else 1.0        # w < 0 = 選好データの不採用応答 (unlikelihood)
+                    hist = item[4] if len(item) > 4 else None    # 多ターン会話: これまでのやり取り
                     if self.dialogs.add(q, a, source=batch.source or "web", weight=w):
                         n_d += 1
-                        self._neural_pending_dialog.append((q, a, ctx, w))
+                        self._neural_pending_dialog.append((q, a, ctx, w, hist))
                 self.stats["dialogs_collected"] += n_d
         with self.lock:
             if batch.kind == "topic":
@@ -880,7 +900,7 @@ class Brain:
                     if self.cfg.online_learning and self.neural.model is not None:
                         # リアルタイム学習: このターンで即座に勾配更新 (数十〜数百 ms)
                         t0 = time.perf_counter()
-                        self.neural.learn_turn(text, reply.text, ctx_now, weight=1.0, steps=1)
+                        self.neural.learn_turn(text, reply.text, ctx_now, weight=1.0, steps=1, history=self.recent_turns(2))
                         self.timers["online"] += time.perf_counter() - t0
                         self.stats["online_turns"] += 1
                     else:

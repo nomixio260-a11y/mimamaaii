@@ -331,14 +331,16 @@ class HuggingFaceDatasets(Source):
         if fmt == "conversations":
             conv = row.get("conversations") or row.get("messages") or []
             prev = None
+            turns: list[tuple[str, str]] = []      # これまでのやり取り (多ターンの学習用)
             for m in conv:
                 role = (m.get("from") or m.get("role") or "").lower()
                 val = (m.get("value") or m.get("content") or "").strip()
                 if role in ("human", "user", "prompter"):
                     prev = val
                 elif role in ("gpt", "assistant", "bot") and prev:
-                    last_bot = pairs[-1][1] if pairs else None
-                    pairs.append((prev, val, last_bot[:200]) if last_bot else (prev, val))
+                    # (発話, 応答, 文脈なし, 重み 1.0, これまでのやり取り) — 会話の流れごと学ぶ
+                    pairs.append((prev, val, None, 1.0, list(turns[-2:])) if turns else (prev, val))
+                    turns.append((prev, val))
                     prev = None
         elif fmt == "instruction":
             q = (row.get("instruction") or "").strip()

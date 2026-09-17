@@ -187,6 +187,7 @@ details.about p { margin: 6px 0; }
 
     <section class="panel think" aria-label="思考">
       <h2>いま何を考えたか <span class="hint" id="thinkTime"></span></h2>
+      <div class="sec" id="memSec" hidden><h3>0. 覚えている直前のやり取り <span class="n">これを踏まえて答えます</span></h3><div id="memList"></div></div>
       <div class="sec"><h3>1. 思い出した知識 <span class="n" id="hitN"></span></h3><div id="hits" class="empty">まだ会話がありません。</div>
         <div id="rethink" hidden><h3 style="margin-top:8px">1b. 下書きを手掛かりに読み直した知識 <span class="n">下書きの語で再検索 → 文脈を広げてもう一度生成</span></h3><div id="rethinkHits"></div></div></div>
       <div class="sec"><h3>2. 読んだプロンプト <span class="n">色の濃さ = 応答生成中に注意を向けた強さ (最終層平均)</span></h3><div id="prompt" class="tokens empty">–</div></div>
@@ -300,7 +301,7 @@ details.about p { margin: 6px 0; }
   function renderSummary(s) {
     if (!s) return; state.summary = s; const m = state.meta; const st = s.stats;
     $('mParams').textContent = (s.params / 1e6).toFixed(2) + 'M';
-    $('mArch').textContent = `d=${s.d} ${s.heads}ヘッド 文脈${s.ctx} FF${s.ff}`;
+    $('mArch').textContent = `d=${s.d} ${s.heads}ヘッド 文脈${s.ctx} FF${s.ff}${m.widened ? ' (幅+' + m.widened + ')' : ''}`;
     $('mLayers').textContent = `${s.layers} / ${fmt(s.vocab)}`;
     $('mVocabAdded').textContent = `語彙追加 +${fmt((m.vocab_added || 0) + (st.vocabAdded || 0))} 層追加 +${fmt(m.grown_layers || 0)}`;
     $('mPre').textContent = fmt(s.pretrainStep) + ' step';
@@ -413,7 +414,17 @@ details.about p { margin: 6px 0; }
 
   function renderThinking(r) {
     state.last = r;
-    $('thinkTime').textContent = `${r.ms} ms で ${r.candidates.length} 候補`;
+    $('thinkTime').textContent = `${r.ms} ms で ${r.candidates.length} 候補 · 文脈への寄せ ${r.copyBonus ?? '–'}`;
+    const MS = $('memSec'); MS.hidden = !(r.history && r.history.length);
+    if (!MS.hidden) {
+      const ML = $('memList'); ML.innerHTML = '';
+      for (const [u, b] of r.history) {
+        const el = document.createElement('div'); el.className = 'hit';
+        el.innerHTML = '<div class="bar"><i style="width:100%"></i></div><div></div>';
+        el.lastChild.textContent = `あなた: ${u} / AI: ${b}`;
+        ML.appendChild(el);
+      }
+    }
     $('hitN').textContent = `${r.hits.length} 件`;
     const hits = $('hits'); hits.innerHTML = ''; hits.className = r.hits.length ? '' : 'empty';
     if (!r.hits.length) hits.textContent = '関連する知識は見つからず、モデルの記憶だけで答えました。';

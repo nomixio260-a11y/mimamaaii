@@ -168,6 +168,31 @@ class TinyTransformer:
         self.cos, self.sin = _rope_tables(new_T, self.d // self.h, self.dtype)
         return self.T
 
+    def grow_width(self, extra: int | None = None) -> int:
+        """MLP の中間次元を広げる (Net2WiderNet)。既存の単位を複製し、出て行く重み w2 を半分ずつに
+        分けると出力が変わらない。複製した側に小さな雑音を入れて対称性を崩し、以後は別々に学習される。
+        層を増やしきった後の容量の増やし方 (深さではなく幅を足す)。"""
+        extra = extra or max(64, self.ff // 4)
+        rng = np.random.default_rng(self.step + 23)
+        d, ff = self.d, self.ff
+        pick = rng.integers(0, ff, size=extra)          # 複製する単位
+        for i in range(self.L):
+            w1, wg, w2 = self.p[f"l{i}.w1"], self.p[f"l{i}.wg"], self.p[f"l{i}.w2"]
+            noise1 = (rng.standard_normal((d, extra)) * 0.01 * float(np.abs(w1).mean())).astype(self.dtype)
+            noise_g = (rng.standard_normal((d, extra)) * 0.01 * float(np.abs(wg).mean())).astype(self.dtype)
+            new_w1 = np.concatenate([w1, w1[:, pick] + noise1], axis=1)
+            new_wg = np.concatenate([wg, wg[:, pick] + noise_g], axis=1)
+            new_w2 = np.concatenate([w2, w2[pick] * 0.5], axis=0)
+            new_w2[pick] *= 0.5                          # 元の側も半分に (合計は変わらない = 関数を保つ)
+            for key, val in ((f"l{i}.w1", new_w1), (f"l{i}.wg", new_wg), (f"l{i}.w2", new_w2)):
+                self.p[key] = val
+                self.m[key] = np.zeros_like(val)
+                self.v[key] = np.zeros_like(val)
+                if self.ema is not None:
+                    self.ema[key] = val.copy()
+        self.ff = ff + extra
+        return self.ff
+
     def add_tokens(self, n: int) -> int:
         """語彙を n 語増やす (新しい埋め込みは既存の平均 + 小さな乱数)。トークナイザ側と同期して呼ぶ。"""
         if n <= 0:

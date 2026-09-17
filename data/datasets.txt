@@ -16,3 +16,5 @@ shi3z/ja_conv_wikipedia_orion14B_100K	default	train	conversations
 llm-jp/hh-rlhf-12k-ja	default	train	preference
 Aratako/Synthetic-JP-EN-Coding-Dataset-801k	default	train	conversations
 kunishou/hh-rlhf-49k-ja	default	train	instruction
+Aratako/Magpie-Tanuki-8B-97k	default	train	conversations
+llm-jp/oasst2-33k-en	default	train	conversations

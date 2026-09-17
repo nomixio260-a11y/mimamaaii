@@ -553,34 +553,55 @@
       this.history = []; // [user, bot]
       this._fb = [0, 0]; this._fbBest = 0.5; this._trial = null;
     }
-    seqDialog(user, bot, context) {
+    // 直前のやり取りを <usr> 発話 <bot> 応答 … の形で budget トークン以内に詰める (新しいものを優先)
+    historyIds(history, budget) {
+      let out = [];
+      const hist = (history || []).slice();
+      for (let i = hist.length - 1; i >= 0; i--) {
+        const [u, b] = hist[i];
+        if (!u || !b) continue;
+        const turn = [USR].concat(this.tok.encode(u, Math.floor(budget / 3)), [BOT], this.tok.encode(b, Math.floor(budget / 2)));
+        if (out.length + turn.length > budget) break;
+        out = turn.concat(out);
+      }
+      return out;
+    }
+    seqDialog(user, bot, context, history) {
       const T = this.model.T;
-      const c = context ? this.tok.encode(context, T >> 1) : [];
+      const c = context ? this.tok.encode(context, Math.floor(T / 3)) : [];
       const u = this.tok.encode(user, T >> 2);
-      const room = T - c.length - u.length - 5;
+      let hist = history && history.length ? this.historyIds(history, Math.floor(T / 3)) : [];
+      let room = T - c.length - hist.length - u.length - 5;
+      if (room < 8 && hist.length) { hist = hist.slice(-Math.floor(T / 6)); room = T - c.length - hist.length - u.length - 5; }
       const b = this.tok.encode(bot, Math.max(8, room));
       let seq = [BOS]; if (c.length) seq = seq.concat([CTX], c);
-      return seq.concat([USR], u, [BOT], b, [EOS]);
+      return seq.concat(hist, [USR], u, [BOT], b, [EOS]);
     }
-    promptDialog(user, context) {
+    promptDialog(user, context, history) {
       const T = this.model.T;
-      const c = context ? this.tok.encode(context, T >> 1) : [];
+      const c = context ? this.tok.encode(context, Math.floor(T / 3)) : [];
       const u = this.tok.encode(user, T >> 2);
+      const hist = history && history.length ? this.historyIds(history, Math.floor(T / 3)) : [];
       let seq = [BOS]; if (c.length) seq = seq.concat([CTX], c);
-      return seq.concat([USR], u, [BOT]);
+      return seq.concat(hist, [USR], u, [BOT]);
+    }
+    // 会話系列で学習を始める位置 = 最後の <bot> の次 (過去のやり取りは文脈)
+    lossFrom(seq) {
+      for (let i = seq.length - 1; i >= 0; i--) if (seq[i] === BOT) return i + 1;
+      return 0;
     }
     retrieve(user, k) {
       const hits = this.kb.search(user, k || 3);
       const ctx = hits.map((h) => h.text).join(' ').slice(0, 200);
       return { hits, context: ctx || null };
     }
-    _generateCands(user, context, n, maxNew, pass) {
-      const prompt = this.promptDialog(user, context);
+    _generateCands(user, context, n, maxNew, pass, history, copyBonus) {
+      const prompt = this.promptDialog(user, context, history);
       const copyIds = context ? this.tok.encode(context, this.model.T) : null;
       const cands = [];
       for (let i = 0; i < n; i++) {
         const g = this.model.generate(prompt, { maxNew, temperature: this.decode.temperature, topP: this.decode.top_p, repetitionPenalty: this.decode.repetition_penalty,
-                                                copyIds, copyBonus: this.decode.copy_bonus || 0 });
+                                                copyIds, copyBonus: copyBonus === undefined ? (this.decode.copy_bonus || 0) : copyBonus });
         const text = this.tok.decode(g.tokens).trim();
         // 候補の点数: 平均対数確率 + 長さと文脈との重なりの補正 (接地)
         let overlap = 0;
@@ -595,7 +616,11 @@
       opts = opts || {};
       const n = opts.candidates || 3, t0 = Date.now(), maxNew = opts.maxNew || 48;
       const { hits, context } = this.retrieve(user, 3);
-      let cands = this._generateCands(user, context, n, maxNew, 1);
+      const history = this.history.slice(-2);                 // 直前のやり取りを覚えて答える
+      // 検索が弱い時は文脈への寄せを緩める (雑談で検索文を写すと会話にならない)
+      const strong = hits.length && hits[0].score >= 8;
+      const copyBonus = (this.decode.copy_bonus || 0) * (strong ? 1 : 0.3);
+      let cands = this._generateCands(user, context, n, maxNew, 1, history, copyBonus);
       let rethink = null;
       if (opts.rethink !== false) {
         const draft = cands.slice().sort((a, b) => b.score - a.score)[0];
@@ -603,7 +628,7 @@
           const hits2 = this.kb.search(user + ' ' + draft.text, 4).filter((h) => !hits.some((x) => x.id === h.id)).slice(0, 2);
           if (hits2.length) {
             const context2 = (hits.slice(0, 2).map((h) => h.text).join(' ') + ' ' + hits2.map((h) => h.text).join(' ')).slice(0, 220);
-            const more = this._generateCands(user, context2, Math.max(2, n - 1), maxNew, 2);
+            const more = this._generateCands(user, context2, Math.max(2, n - 1), maxNew, 2, history, copyBonus);
             rethink = { hits: hits2, context: context2, candidates: more.length };
             cands = cands.concat(more);
           }
@@ -613,14 +638,16 @@
       const best = cands.find((c) => c.text.length >= 2) || cands[0];
       const ctxUsed = best.pass === 2 && rethink ? rethink.context : context;
       this.history.push([user, best.text]);
+      if (this.history.length > 20) this.history.shift();
       this.stats.turns += 1;
-      return { text: best.text, hits, context: ctxUsed, rethink, prompt: best.prompt, promptPieces: best.prompt.map((i) => this.tok.piece(i)), candidates: cands, best, ms: Date.now() - t0 };
+      return { text: best.text, hits, context: ctxUsed, rethink, history, copyBonus: Math.round(copyBonus * 100) / 100,
+               prompt: best.prompt, promptPieces: best.prompt.map((i) => this.tok.piece(i)), candidates: cands, best, ms: Date.now() - t0 };
     }
     // 常時学習: 会話の合間に再生バッファの会話か知識文を 1 系列だけ学ぶ (数百 ms)。忘却を防ぎつつ少しずつ賢くなる
     idleStep() {
       const useDialog = this.replay.length && Math.random() < 0.5;
       let seq, lf = 0, kind;
-      if (useDialog) { const [u, b] = this.replay[Math.floor(Math.random() * this.replay.length)]; seq = this.seqDialog(u, b, null); lf = seq.indexOf(BOT) + 1; kind = 'dialog'; }
+      if (useDialog) { const [u, b] = this.replay[Math.floor(Math.random() * this.replay.length)]; seq = this.seqDialog(u, b, null); lf = this.lossFrom(seq); kind = 'dialog'; }
       else if (this.kb.docs.length) { const t = this.kb.docs[Math.floor(Math.random() * this.kb.docs.length)]; seq = [BOS].concat(this.tok.encode(t, this.model.T - 2), [EOS]); kind = 'text'; }
       else return null;
       if (seq.length < 4) return null;
@@ -629,17 +656,17 @@
       return Object.assign(r, { kind });
     }
     // 1 ターンを即座に学習 (weight > 0: 正例、< 0: unlikelihood)。再生バッファから 1 本混ぜて忘却を防ぐ
-    learnTurn(user, bot, context, weight, steps) {
+    learnTurn(user, bot, context, weight, steps, history) {
       weight = weight === undefined ? 1 : weight; steps = steps || 1;
-      const seq = this.seqDialog(user, bot, context);
-      const lf = seq.indexOf(BOT) + 1;
+      const seq = this.seqDialog(user, bot, context, history || this.history.slice(-3, -1));
+      const lf = this.lossFrom(seq);
       let last = null;
       for (let s = 0; s < steps; s++) {
         last = this._trainSeq(seq, lf, weight);
         if (this.replay.length && weight > 0) {
           const [ru, rb] = this.replay[Math.floor(Math.random() * this.replay.length)];
           const rs = this.seqDialog(ru, rb, null);
-          this._trainSeq(rs, rs.indexOf(BOT) + 1, 0.5);
+          this._trainSeq(rs, this.lossFrom(rs), 0.5);
         }
       }
       if (weight > 0) { this.replay.push([user, bot]); if (this.replay.length > 600) this.replay.shift(); }
