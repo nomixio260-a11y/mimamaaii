@@ -519,8 +519,9 @@ class Brain:
                     # 初期化直後・再起動直後: 知識文と会話から学習データを積み直す
                     for d in self.kb.random_docs(min(3000, len(self.kb)), self.rng):
                         nl.add_text(d.text)
-                    for u, b, _, w in list(self.dialogs.pairs)[-3000:]:
-                        nl.add_dialog(u, b, weight=w)
+                    for item in list(self.dialogs.pairs)[-3000:]:
+                        u, b, _, w = item[:4]
+                        nl.add_dialog(u, b, weight=w, history=item[4] if len(item) > 4 else None)
             self._feed_neural()
         t0 = time.perf_counter()
         r = None
@@ -561,9 +562,9 @@ class Brain:
         if not self.dialog_holdout and len(self.dialogs) >= n_dialogs * 2:
             rng = random.Random(12345)
             # 文学作品の会話 (文脈が無いと予測しようがない台詞) は評価から外す
-            cand = [(u, b) for u, b, src, w in list(self.dialogs.pairs) if w > 0 and 10 <= len(b) <= 200 and not src.startswith("aozora")]
+            cand = [(u, b) for u, b, src, w, *_ in list(self.dialogs.pairs) if w > 0 and 10 <= len(b) <= 200 and not src.startswith("aozora")]
             self.dialog_holdout = rng.sample(cand, min(n_dialogs, len(cand)))
-        pairs = self.dialog_holdout or [(u, b) for u, b, _, w in list(self.dialogs.pairs)[-2000:] if w > 0][-n_dialogs:]
+        pairs = self.dialog_holdout or [(u, b) for u, b, _, w, *_ in list(self.dialogs.pairs)[-2000:] if w > 0][-n_dialogs:]
         if pairs:
             ppls = []
             with nl.lock, nl._infer():
@@ -643,7 +644,7 @@ class Brain:
                     ctx = item[2] if len(item) > 2 else None     # 読解データは文脈付き (RAG の練習)
                     w = item[3] if len(item) > 3 else 1.0        # w < 0 = 選好データの不採用応答 (unlikelihood)
                     hist = item[4] if len(item) > 4 else None    # 多ターン会話: これまでのやり取り
-                    if self.dialogs.add(q, a, source=batch.source or "web", weight=w):
+                    if self.dialogs.add(q, a, source=batch.source or "web", weight=w, history=hist):
                         n_d += 1
                         self._neural_pending_dialog.append((q, a, ctx, w, hist))
                 self.stats["dialogs_collected"] += n_d
@@ -920,7 +921,7 @@ class Brain:
             self.last_mode = reply.mode
             self.cache_lm.push(self.lm.ids(tokenize(reply.text))[:60])
             if reply.mode in ("fact", "recall", "summary", "neural") and reply.confidence >= 0.6:
-                if self.dialogs.add(text, reply.text, source="chat"):
+                if self.dialogs.add(text, reply.text, source="chat", history=self.recent_turns(2)):
                     ctx_now = self._context_for(reply.doc_ids)
                     if self.cfg.online_learning and self.neural.model is not None:
                         # リアルタイム学習: このターンで即座に勾配更新 (数十〜数百 ms)
@@ -1671,7 +1672,7 @@ class Brain:
                 "semantic": self.semantic.stats(),
                 "suffix": self.suffix.stats(),
                 "reranker": {"samples": self.reranker.samples, "w": {k: round(v, 2) for k, v in self.reranker.w.items()}},
-                "dialogs": {"pairs": len(self.dialogs), "by_source": self.dialogs.by_source()},
+                "dialogs": {"pairs": len(self.dialogs), "with_history": self.dialogs.with_history(), "by_source": self.dialogs.by_source()},
                 "profile": dict(self.agent.profile),
                 "neural": (self.neural.ensure_model({}) and self.neural.stats()) if (self.neural.available and self.neural.model is None and self.neural.path.exists()) else self.neural.stats(),
                 "interest": sorted(self.interest.items(), key=lambda x: -x[1])[:8],

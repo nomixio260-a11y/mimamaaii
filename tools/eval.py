@@ -290,7 +290,7 @@ def _neural_metrics(b: Brain, hold_sents: list[str], verbose: bool = False, swee
                     rethink += 1
             out["think_rethink_rate"] = round(rethink / max(m, 1), 3)
         # 会話としての予測力 (応答部だけの ppl): 文の ppl とは別に測る
-        pairs = b.dialog_holdout or [(u, bb) for u, bb, _, w in list(b.dialogs.pairs)[-2000:] if w > 0][-60:]
+        pairs = b.dialog_holdout or [(u, bb) for u, bb, _, w, *_ in list(b.dialogs.pairs)[-2000:] if w > 0][-60:]
         ppls = []
         for u, bb in pairs:
             ids = nl.seq_dialog(u, bb)

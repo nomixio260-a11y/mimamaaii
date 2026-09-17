@@ -20,10 +20,15 @@ _QUOTE_RE = re.compile(r"「([^「」]{2,80})」")
 
 class DialogStore:
     def __init__(self, capacity: int = 20000):
-        self.pairs: deque = deque(maxlen=capacity)   # (user, bot, source, weight)
+        # (user, bot, source, weight, history)。history は直前までのやり取り ((発話, 応答), ...)。
+        # 多ターンの会話データは「その場で 1 回学ぶ」だけでは身に付かないので、履歴ごと保存して
+        # 再生バッファに何度も流す (会話のキャッチボールを学ぶのはこの履歴つきの系列だけ)。
+        self.pairs: deque = deque(maxlen=capacity)
         self.seen: set[int] = set()
 
     MAX_BOT = 220      # 小さなモデルは長い応答を覚えきれない: 先頭の数文に切り詰めて学ぶ
+    MAX_HISTORY = 2    # 保存する過去のやり取りの数
+    MAX_HISTORY_CHARS = 120   # 過去のやり取りは短く持つ (記憶量を抑える)
 
     @staticmethod
     def _shorten(text: str, limit: int) -> str:
@@ -38,7 +43,19 @@ class DialogStore:
                 best = i
         return cut[: best + 1].strip() if best >= 20 else text[:limit].rstrip()
 
-    def add(self, user: str, bot: str, source: str = "chat", weight: float = 1.0) -> bool:
+    def _trim_history(self, history) -> tuple:
+        """過去のやり取りを (発話, 応答) の組に整えて短く切り詰める。"""
+        out = []
+        for item in list(history or [])[-self.MAX_HISTORY:]:
+            if not item or len(item) < 2:
+                continue
+            u, b = (str(item[0] or "").strip(), str(item[1] or "").strip())
+            if len(u) < 1 and len(b) < 1:
+                continue
+            out.append((self._shorten(u, self.MAX_HISTORY_CHARS), self._shorten(b, self.MAX_HISTORY_CHARS)))
+        return tuple(out)
+
+    def add(self, user: str, bot: str, source: str = "chat", weight: float = 1.0, history=None) -> bool:
         user, bot = user.strip(), bot.strip()
         if len(bot) > self.MAX_BOT:
             bot = self._shorten(bot, self.MAX_BOT)
@@ -54,13 +71,13 @@ class DialogStore:
         if len(self.seen) > 60000:
             self.seen.clear()
         self.seen.add(h)
-        self.pairs.append((user, bot, source[:60], weight))
+        self.pairs.append((user, bot, source[:60], weight, self._trim_history(history)))
         return True
 
     def add_many(self, pairs, source: str, weight: float = 1.0) -> int:
         return sum(1 for u, b in pairs if self.add(u, b, source, weight))
 
-    def sample(self, n: int, rng: random.Random | None = None) -> list[tuple[str, str, str, float]]:
+    def sample(self, n: int, rng: random.Random | None = None) -> list[tuple]:
         rng = rng or random
         if not self.pairs:
             return []
@@ -69,9 +86,13 @@ class DialogStore:
     def __len__(self) -> int:
         return len(self.pairs)
 
+    def with_history(self) -> int:
+        """履歴つきで保存されている会話の数 (多ターン学習がどれだけできるかの指標)。"""
+        return sum(1 for item in self.pairs if len(item) > 4 and item[4])
+
     def by_source(self) -> dict[str, int]:
         out: dict[str, int] = {}
-        for _, _, s, _ in self.pairs:
+        for _, _, s, _, *_rest in self.pairs:
             out[s] = out.get(s, 0) + 1
         return out
 
@@ -81,8 +102,9 @@ class DialogStore:
     @classmethod
     def from_state(cls, items, capacity: int = 20000) -> "DialogStore":
         ds = cls(capacity)
-        for u, b, s, w in items:
-            ds.add(u, b, s, w)
+        for item in items:
+            u, b, s, w = item[:4]
+            ds.add(u, b, s, w, history=item[4] if len(item) > 4 else None)
         return ds
 
 

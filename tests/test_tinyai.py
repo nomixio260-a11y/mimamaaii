@@ -1153,7 +1153,7 @@ class RealtimeLearningTest(unittest.TestCase):
         d = DialogStore()
         long_bot = "最初の文です。" + "続きの説明がここに入ります。" * 30
         self.assertTrue(d.add("質問", long_bot))
-        _, bot, _, _ = d.pairs[-1]
+        _, bot, _, _, *_rest = d.pairs[-1]
         self.assertLessEqual(len(bot), DialogStore.MAX_BOT + 40)
         self.assertTrue(bot.endswith("。"))          # 途中で切れた文は残さない
         self.assertTrue(d.add("問い", "短い答え。"))
@@ -1303,6 +1303,53 @@ class DecodeQualityTest(unittest.TestCase):
             nl2.ensure_model()
             self.assertEqual(nl2.decode["copy_bonus"], 1.0)       # 見直した項目は既定値から
             self.assertEqual(nl2.decode["temperature"], 0.55)     # それ以外は保存値のまま
+
+
+class DialogHistoryTest(unittest.TestCase):
+    """会話の履歴を保存し、再生バッファに履歴つきで戻せること (会話のキャッチボールの学習)。"""
+
+    def test_history_is_stored_and_trimmed(self):
+        from tinyai.dialog import DialogStore
+        d = DialogStore(10)
+        hist = [("最初の質問", "最初の答え"), ("次の質問", "次の答え"), ("直前の質問", "直前の答え")]
+        self.assertTrue(d.add("それで?", "続きはこうです。", source="chat", history=hist))
+        item = d.pairs[-1]
+        self.assertEqual(len(item), 5)
+        self.assertEqual(len(item[4]), DialogStore.MAX_HISTORY)      # 直近 2 組だけ持つ
+        self.assertEqual(item[4][-1][0], "直前の質問")               # 新しい方を残す
+        self.assertEqual(d.with_history(), 1)
+        self.assertTrue(d.add("履歴なし", "普通の返事"))
+        self.assertEqual(d.with_history(), 1)
+        long_hist = [("あ" * 400, "い" * 400)]
+        d.add("長い履歴", "返事", history=long_hist)
+        self.assertLessEqual(len(d.pairs[-1][4][0][0]), DialogStore.MAX_HISTORY_CHARS)
+
+    def test_history_survives_save_and_restore(self):
+        from tinyai.dialog import DialogStore
+        d = DialogStore(10)
+        d.add("それで?", "続きはこうです。", history=[("宇宙の話", "宇宙は広いです。")])
+        d.add("履歴なし", "普通の返事")
+        restored = DialogStore.from_state(d.state(), 10)
+        self.assertEqual(restored.with_history(), 1)
+        self.assertEqual(restored.pairs[0][4][0][0], "宇宙の話")
+        old_style = [("質問", "答え", "web", 1.0)]                   # 旧形式 (4 要素) も読める
+        self.assertEqual(len(DialogStore.from_state(old_style, 10)), 1)
+
+    def test_replay_keeps_history(self):
+        """保存済みの会話から再生バッファを積み直す時、履歴つきの系列になる。"""
+        from tinyai.dialog import DialogStore
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+            from tinyai.neural_lm import NeuralLM
+            nl = NeuralLM(Path(tmp), size="small")
+            nl.min_sentences, nl.min_chars = 4, 40
+            nl.ensure_model(["こんにちは。今日はいい天気です。散歩に行きましょう。%d" % i for i in range(60)])
+            d = DialogStore(10)
+            d.add("それで?", "続きはこうです。", history=[("宇宙の話", "宇宙は広いです。")])
+            plain = len(nl.seq_dialog("それで?", "続きはこうです。"))
+            item = d.pairs[-1]
+            with_hist = len(nl.seq_dialog(item[0], item[1], history=item[4]))
+            self.assertGreater(with_hist, plain)                     # 履歴の分だけ長い系列になる
 
 
 if __name__ == "__main__":

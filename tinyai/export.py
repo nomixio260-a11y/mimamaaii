@@ -165,7 +165,7 @@ def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1
         total += len(t)
         if len(docs) >= max_docs or total >= max_chars:
             break
-    pairs = [[u, b] for u, b, _, w in list(brain.dialogs.pairs)[-replay * 3 :] if w > 0 and len(b) <= 200][-replay:]
+    pairs = [[u, b] for u, b, _, w, *_ in list(brain.dialogs.pairs)[-replay * 3 :] if w > 0 and len(b) <= 200][-replay:]
     kb = {"docs": docs, "replay": pairs}
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "kb.json").write_text(json.dumps(kb, ensure_ascii=False), encoding="utf-8")
@@ -175,7 +175,7 @@ def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1
         "grown_layers": nl.grown, "widened": getattr(nl, "widened", 0), "vocab_added": nl.vocab_added, "online_steps": nl.online_steps, "decode": nl.decode,
         "last_loss": stats.get("last_loss"), "loss_hist": [round(x, 3) for x in nl.loss_hist[-100:]],
         "kb_docs": len(brain.kb), "facts": brain.facts.count,
-        "dialogs": len(brain.dialogs), "exported_docs": len(docs), "dialogs_by_source": brain.dialogs.by_source(),
+        "dialogs": len(brain.dialogs), "dialogs_with_history": brain.dialogs.with_history(), "exported_docs": len(docs), "dialogs_by_source": brain.dialogs.by_source(),
         "stats": {k: v for k, v in brain.stats.items() if isinstance(v, (int, float))},
     }
     if logs:

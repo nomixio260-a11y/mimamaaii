@@ -213,7 +213,7 @@ def cmd_train(args) -> int:
     t_fill = time.time()
     for d in docs[: args.pool_texts]:
         nl.add_text(d.text)
-    for u, b, _, w in list(brain.dialogs.pairs):
+    for u, b, _, w, *_rest in list(brain.dialogs.pairs):
         nl.add_dialog(u, b, weight=w)
     # 写し取り練習は検索を伴うので数を絞る (残りは学習中に _feed_neural が少しずつ足す)
     n_copy = brain.feed_copy_examples(docs[: args.pool_copy])
