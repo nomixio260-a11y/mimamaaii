@@ -1524,6 +1524,20 @@ class GrowthTest(unittest.TestCase):
             per_param = cost / max(nl.model.n_params(), 1)
             self.assertLess(per_param, 64)        # 1 パラメータあたり数十バイトの範囲に収まる
 
+    def test_growth_has_a_cooldown(self):
+        """一度成長したら、しばらくは次の成長を待つ (増やす→悪化→また増やす の悪循環を避ける)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            need = nl.TOKENS_PER_PARAM * nl.model.n_params()
+            self.assertTrue(nl.maybe_grow(True, data_tokens=need + 1))     # 1 回目は成長する
+            layers = nl.model.L
+            nl.loss_hist = [3.0] * 10 + [2.999] * 10
+            self.assertFalse(nl.maybe_grow(True, data_tokens=need * 10))   # 直後は成長しない
+            self.assertEqual(nl.model.L, layers)
+            nl.model.step = nl._last_grow_step + nl.GROW_COOLDOWN          # 十分に回した後なら成長する
+            self.assertTrue(nl.maybe_grow(True, data_tokens=need * 10))
+            self.assertEqual(nl.model.L, layers + 1)
+
     def test_grows_when_data_outgrows_capacity(self):
         """損失が下がり続けていても、データ量が容量に対して多すぎれば先回りして大きくする。"""
         with tempfile.TemporaryDirectory() as tmp:

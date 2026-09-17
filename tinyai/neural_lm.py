@@ -99,6 +99,7 @@ class NeuralLM:
         self._holdout_recent: deque = deque(maxlen=150)  # 最近の文から入れ替わる取り置き (今の分布での汎化)
         self.recent_ppl: float | None = None
         self.recent_hist: list[float] = []           # 入れ替わる取り置き ppl の推移 (成長の判断に使う)
+        self._last_grow_step = 0                     # 直近で成長したステップ (連続した成長を避ける)
         self._last_save = 0.0
         self.batch = neural.PRESETS[self.size]["batch"] if self.available else 8
         self.lr = neural.PRESETS[self.size]["lr"] if self.available else 5e-4
@@ -134,6 +135,7 @@ class NeuralLM:
                         saved.pop(k, None)
                 self.decode.update({k: v for k, v in saved.items() if k in self.decode})
                 self.grown = int(meta.get("grown", 0))
+                self._last_grow_step = int(meta.get("last_grow_step", 0))
                 self.vocab_added = int(meta.get("vocab_added", 0))
                 self.online_steps = int(meta.get("online_steps", 0))
                 self.batch = neural.PRESETS.get(self.size, {}).get("batch", self.batch)
@@ -351,6 +353,7 @@ class NeuralLM:
             return {"loss": last, "weight": weight}
 
         # ------------------------------------------------------------ 進化 (成長・語彙・復号)
+    GROW_COOLDOWN = 800          # 成長してから次の成長までに最低限回すステップ数
     TOKENS_PER_PARAM = 20        # Chinchilla 則の目安 (一から学習する場合の計算最適)
     TOKENS_PER_PARAM_SOFT = 5    # 継続学習でデータが増え続ける場合の、容量不足を疑い始める線
 
@@ -370,6 +373,10 @@ class NeuralLM:
         どちらの場合も「今の分布での取り置き ppl が悪化していない」ことを条件にする。"""
         with self.lock:
             if self.model is None or not memory_ok:
+                return False
+            # 成長の直後は、増えた容量を使えるようになるまで時間がかかる。間を置かずに続けて増やすと
+            # 「増やす → 一時的に悪化 → 悪化を見てまた増やす」の悪循環になる (実測: 12 分で 3 層増えた)。
+            if self.grown and self.model.step - self._last_grow_step < self.GROW_COOLDOWN:
                 return False
             max_layers = neural.MAX_LAYERS.get(self.size, 6)
             max_ff = neural.PRESETS.get(self.size, {}).get("ff", self.model.ff) * 3
@@ -405,6 +412,7 @@ class NeuralLM:
                     self.widened += 1
                     log.info("ニューラル LM: 中間次元を拡張 -> ff=%d (%d params)", self.model.ff, self.model.n_params())
                 self.grown += 1
+                self._last_grow_step = self.model.step
                 if data_rich and not plateau:
                     log.info("データ量が容量を超えたので成長 (%.1fM トークン / %.1fM パラメータ)",
                              data_tokens / 1e6, self.model.n_params() / 1e6)
@@ -535,7 +543,7 @@ class NeuralLM:
             except Exception as e:
                 log.warning("再生バッファの保存に失敗: %s", e)
             self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300], "holdout_recent": [list(x) for x in self._holdout_recent],
-                                                       "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
+                                                       "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "last_grow_step": self._last_grow_step, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
             self._last_save = time.time()
 
     def _infer(self):
