@@ -549,13 +549,20 @@ class TinyTransformer:
 
     # ------------------------------------------------------------ 保存
     def save(self, path: Path, tokenizer: SubwordTokenizer, meta: dict | None = None) -> None:
+        """一時ファイルに書いてから置き換える (書き込み途中のファイルを他のプロセスが読まないように)。"""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path, **{f"p.{k}": v for k, v in self.p.items()}, **{f"m.{k}": v for k, v in self.m.items()}, **{f"v.{k}": v for k, v in self.v.items()},
+        tmp = Path(str(path) + ".tmp.npz")
+        np.savez_compressed(tmp, **{f"p.{k}": v for k, v in self.p.items()}, **{f"m.{k}": v for k, v in self.m.items()}, **{f"v.{k}": v for k, v in self.v.items()},
                             **({f"e.{k}": v for k, v in self.ema.items()} if self.ema is not None else {}),
                             step=np.array(self.step), shape=np.array([self.V, self.d, self.h, self.L, self.T, self.ff]), dropout=np.array(self.dropout))
-        tokenizer.save(Path(str(path) + ".vocab.json"))
-        Path(str(path) + ".meta.json").write_text(json.dumps(meta or {}, ensure_ascii=False), encoding="utf-8")
+        vocab_tmp = Path(str(path) + ".vocab.json.tmp")
+        meta_tmp = Path(str(path) + ".meta.json.tmp")
+        tokenizer.save(vocab_tmp)
+        meta_tmp.write_text(json.dumps(meta or {}, ensure_ascii=False), encoding="utf-8")
+        os.replace(vocab_tmp, Path(str(path) + ".vocab.json"))
+        os.replace(meta_tmp, Path(str(path) + ".meta.json"))
+        os.replace(tmp, path)     # 最後にモデル本体を置き換える
 
     @classmethod
     def load(cls, path: Path) -> tuple["TinyTransformer", SubwordTokenizer, dict]:
