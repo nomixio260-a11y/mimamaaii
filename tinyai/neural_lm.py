@@ -116,6 +116,7 @@ class NeuralLM:
         self._pregrow_dialog: float | None = None    # 成長直前の対話 ppl
         self.dialog_hist: list[float] = []           # 対話 ppl の推移 (成長の判断に使う)
         self._grow_block: str | None = None          # 直近に成長を見送った理由 (ログに 1 度だけ出す)
+        self.growth_records: list[dict] = []         # 成長の前後で品質がどう動いたか (成長が効いたかの記録)
         self.lr_scale = 1.0                          # 学習率の調整倍率 (不安定な時に下げる)
         self._last_damp_step = 0
         self._pregrow_path = self.data_dir / "neural.pregrow.npz"
@@ -161,6 +162,7 @@ class NeuralLM:
                 self.dialog_hist = self._single_scale([float(x) for x in meta.get("dialog_hist", [])])
                 self.recent_hist = [float(x) for x in meta.get("recent_hist", [])]
                 self.recent_bpc_hist = [float(x) for x in meta.get("recent_bpc_hist", [])]
+                self.growth_records = [dict(x) for x in meta.get("growth_records", [])]
                 self._last_damp_step = int(meta.get("last_damp_step", 0))
                 self.vocab_added = int(meta.get("vocab_added", 0))
                 self.online_steps = int(meta.get("online_steps", 0))
@@ -544,14 +546,23 @@ class NeuralLM:
                 except Exception as e:
                     log.warning("成長前の重みの保存に失敗: %s", e)
                 if self.model.L < max_layers:
+                    kind = "layer"
                     self.model.grow_layer()
                     log.info("ニューラル LM: 層を追加 -> %d 層 (%d params)", self.model.L, self.model.n_params())
                 else:
+                    kind = "width"
                     self.model.grow_width()   # 層が上限なら幅を広げる (どちらも関数を保つ)
                     self.widened += 1
                     log.info("ニューラル LM: 中間次元を拡張 -> ff=%d (%d params)", self.model.ff, self.model.n_params())
                 self.grown += 1
                 self._last_grow_step = self.model.step
+                # 「増やしたら良くなったのか」を後から言えるように、前の値を残す
+                self.growth_records.append({
+                    "step": self.model.step, "kind": kind,
+                    "layers": self.model.L, "ff": self.model.ff, "params": self.model.n_params(),
+                    "bpc_before": self.recent_bpc, "dialog_before": self.dialog_hist[-1] if self.dialog_hist else None,
+                })
+                del self.growth_records[:-20]
                 self._pregrow_ppl = self.recent_bpc or self.recent_ppl or self.holdout_ppl
                 self._pregrow_dialog = self.dialog_hist[-1] if self.dialog_hist else None
                 if data_rich and not plateau:
@@ -648,6 +659,22 @@ class NeuralLM:
 
     GROW_ROLLBACK_RATIO = 1.4    # 成長前より ppl がこの倍率を超えて悪ければ、成長を取り消す
 
+    def _record_growth_outcome(self, now: float | None) -> None:
+        """成長から GROW_COOLDOWN ステップ後の品質を記録して残す。
+
+        取り消すほど悪くない成長でも「効いたのか」は別の話で、記録が無いと次の判断ができない。"""
+        if not self.growth_records or self.growth_records[-1].get("bpc_after") is not None:
+            return
+        rec = self.growth_records[-1]
+        rec["bpc_after"] = now
+        rec["dialog_after"] = self.dialog_hist[-1] if self.dialog_hist else None
+        b0, b1 = rec.get("bpc_before"), rec.get("bpc_after")
+        d0, d1 = rec.get("dialog_before"), rec.get("dialog_after")
+        log.info("成長の結果 (%d step 後): 平文 %s -> %s、会話 %s -> %s",
+                 self.GROW_COOLDOWN,
+                 f"{b0:.3f}" if b0 else "-", f"{b1:.3f}" if b1 else "-",
+                 f"{d0:.1f}" if d0 else "-", f"{d1:.1f}" if d1 else "-")
+
     def check_growth(self) -> bool:
         """成長の結果を確かめ、明らかに裏目なら成長前の重みに戻す。
 
@@ -663,6 +690,7 @@ class NeuralLM:
             bad_text = now is not None and now > self._pregrow_ppl * self.GROW_ROLLBACK_RATIO
             bad_dialog = (self._pregrow_dialog is not None and self.dialog_hist
                           and self.dialog_hist[-1] > self._pregrow_dialog * self.GROW_ROLLBACK_RATIO)
+            self._record_growth_outcome(now)
             if not bad_text and not bad_dialog:
                 self._pregrow_ppl = self._pregrow_dialog = None   # 問題なし。以後は判定しない
                 return False
@@ -744,7 +772,7 @@ class NeuralLM:
                 log.warning("再生バッファの保存に失敗: %s", e)
             self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300], "holdout_recent": [list(x) for x in self._holdout_recent],
                                                        "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "last_grow_step": self._last_grow_step, "lr_scale": self.lr_scale,
-                                                       "dialog_hist": self.dialog_hist[-20:], "recent_hist": self.recent_hist[-20:], "recent_bpc_hist": self.recent_bpc_hist[-20:],
+                                                       "dialog_hist": self.dialog_hist[-20:], "recent_hist": self.recent_hist[-20:], "recent_bpc_hist": self.recent_bpc_hist[-20:], "growth_records": self.growth_records[-20:],
                                                        "last_damp_step": self._last_damp_step, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
             self._last_save = time.time()
 

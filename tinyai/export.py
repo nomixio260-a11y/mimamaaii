@@ -215,6 +215,7 @@ def export_brain(brain, out_dir: Path, max_docs: int = 12000, max_chars: int = 1
     stats = nl.stats()
     extra = {
         "size": nl.size, "trained_tokens": nl.trained_tokens, "holdout_ppl": nl.holdout_ppl, "ngram_ppl": nl.ngram_ppl,
+        "growth_records": getattr(nl, "growth_records", [])[-10:],   # 成長の前後で品質がどう動いたか
         "grown_layers": nl.grown, "widened": getattr(nl, "widened", 0), "vocab_added": nl.vocab_added, "online_steps": nl.online_steps, "decode": getattr(nl, "decode_stable", None) or nl.decode,
         "last_loss": stats.get("last_loss"), "loss_hist": [round(x, 3) for x in nl.loss_hist[-100:]],
         "kb_docs": len(brain.kb), "facts": brain.facts.count,

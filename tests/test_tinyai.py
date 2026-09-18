@@ -2493,3 +2493,33 @@ class VocabInvariantGrowthTest(unittest.TestCase):
         seqs = [[2, 9, 10, 11, 3], [2, 12, 13, 3]]
         nats, ntok = nn.holdout_nats(m, seqs)
         self.assertAlmostEqual(nn.perplexity(m, seqs), _m.exp(nats / ntok), places=6)
+
+
+class GrowthRecordTest(unittest.TestCase):
+    """成長の前後の品質を記録して、効いたかどうかを後から言えるようにする。"""
+
+    def test_record_is_filled_after_cooldown(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="small")
+            nl.min_sentences, nl.min_chars = 10, 100
+            texts = ["サンプル文 %d は学習用の文章です。内容は番号 %d の説明です。" % (i, i) for i in range(60)]
+            self.assertTrue(nl.ensure_model(texts))
+            nl.loss_hist = [2.0] * 20                      # 停滞している
+            nl.recent_bpc, nl.recent_bpc_hist = 4.0, [4.0, 4.0, 4.0, 4.0]
+            nl.dialog_hist = [50.0, 50.0, 50.0, 50.0]
+            self.assertTrue(nl.maybe_grow(memory_ok=True, data_tokens=10 ** 9))
+            rec = nl.growth_records[-1]
+            self.assertIn(rec["kind"], ("layer", "width"))
+            self.assertEqual(rec["bpc_before"], 4.0)
+            self.assertIsNone(rec.get("bpc_after"))
+            nl.model.step += nl.GROW_COOLDOWN + 1           # 馴染ませ期間が過ぎた
+            nl.recent_bpc = 3.8                             # 良くなった (取り消しはしない)
+            self.assertFalse(nl.check_growth())
+            self.assertEqual(nl.growth_records[-1]["bpc_after"], 3.8)
