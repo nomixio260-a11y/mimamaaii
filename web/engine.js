@@ -615,6 +615,12 @@
       if (body.indexOf(key) >= 0) return true;
       return key.split('・').some((part) => part.length >= 2 && body.indexOf(part) >= 0);
     }
+    // 挨拶・お礼・気持ちの話・話題語の無い発話は雑談。知識文を渡すと書き写してしまうので文脈を使わない
+    static isChatty(text) {
+      const low = (text || '').trim().toLowerCase();
+      if (/こんにちは|こんばんは|おはよう|やあ|ありがとう|ありがと|よろしく|おやすみ|またね|さようなら|元気|疲れ|つかれ|眠い|ねむい|しんどい|つらい|辛い|悲し|嬉し|うれし|楽し|たのし|寂し|さびし|不安|心配|けんか|喧嘩|失恋|落ち込|hello|thanks|thank you|good morning|good night/.test(low)) return true;
+      return Engine.keyRuns(text).length === 0;
+    }
     // 検索は点数が高くても見当違いのことがある (「カレーの作り方」に爆発装置の作り方が返る)。
     // 質問の語に触れている文を前に出し、どれも触れていなければ文脈として使わない。
     retrieve(user, k) {
@@ -659,14 +665,16 @@
     reply(user, opts) {
       opts = opts || {};
       const n = opts.candidates || 3, t0 = Date.now(), maxNew = opts.maxNew || 48;
-      const { hits, context, keys, offTopic } = this.retrieve(user, 3);
+      const chatty = Engine.isChatty(user);
+      let { hits, context, keys, offTopic } = this.retrieve(user, 3);
+      if (chatty) context = null;              // 雑談に知識文を渡すと、その文をなぞった返事になる
       const history = this.history.slice(-2);                 // 直前のやり取りを覚えて答える
       // 検索が弱い時は文脈への寄せを緩める (雑談で検索文を写すと会話にならない)
-      const strong = !offTopic && hits.length && hits[0].score >= 8;
-      const copyBonus = (this.decode.copy_bonus || 0) * (strong ? 1 : 0.3);
+      const strong = !chatty && !offTopic && hits.length && hits[0].score >= 8;
+      const copyBonus = chatty ? 0 : (this.decode.copy_bonus || 0) * (strong ? 1 : 0.3);
       let cands = this._generateCands(user, context, n, maxNew, 1, history, copyBonus);
       let rethink = null;
-      if (opts.rethink !== false) {
+      if (opts.rethink !== false && !chatty) {     // 雑談で「読み直し」をすると、また知識文が入ってくる
         const draft = cands.slice().sort((a, b) => b.score - a.score)[0];
         if (draft && draft.text.length >= 4) {
           const hits2 = this.kb.search(user + ' ' + draft.text, 4).filter((h) => !hits.some((x) => x.id === h.id)).slice(0, 2);
@@ -686,12 +694,12 @@
       // 知っている文が 1 つも無い話題は、作文せず知らないと言う。候補が話題の語を含むかどうかは見ない
       // (質問の語をそのまま写した候補が「答えている」ように見えてしまうため)。
       // 3 文字以上の語の時だけ言う (「元気ですか」に「知りません」と言い出さないため)。
-      const unknown = offTopic && topic.length >= 3;
+      const unknown = offTopic && !chatty && topic.length >= 3;   // 雑談に「知りません」は返さない
       const text = unknown ? `「${topic}」はまだ学んでいません。教えてもらえれば覚えます。` : best.text;
       this.history.push([user, text]);
       if (this.history.length > 20) this.history.shift();
       this.stats.turns += 1;
-      return { text, hits, context: ctxUsed, rethink, history, copyBonus: Math.round(copyBonus * 100) / 100, offTopic, unknown, keys,
+      return { text, hits, context: ctxUsed, rethink, history, copyBonus: Math.round(copyBonus * 100) / 100, offTopic, unknown, keys, chatty,
                prompt: best.prompt, promptPieces: best.prompt.map((i) => this.tok.piece(i)), candidates: cands, best, ms: Date.now() - t0 };
     }
     // 常時学習: 会話の合間に再生バッファの会話か知識文を 1 系列だけ学ぶ (数百 ms)。忘却を防ぎつつ少しずつ賢くなる

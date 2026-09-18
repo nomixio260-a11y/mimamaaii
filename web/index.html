@@ -496,7 +496,12 @@ details.about p { margin: 6px 0; }
     $('hitN').textContent = `${r.hits.length} 件`;
     const hits = $('hits'); hits.innerHTML = ''; hits.className = r.hits.length ? '' : 'empty';
     if (!r.hits.length) hits.textContent = '関連する知識は見つからず、モデルの記憶だけで答えました。';
-    if (r.offTopic) {
+    if (r.chatty) {
+      const note = document.createElement('div'); note.className = 'empty';
+      note.textContent = '雑談として扱いました。知識文は渡さず、モデルの記憶だけで返事を書いています。';
+      hits.appendChild(note);
+    }
+    if (r.offTopic && !r.chatty) {
       const note = document.createElement('div'); note.className = 'empty';
       note.textContent = `検索結果はどれも「${(r.keys || []).join('・')}」に触れていないので、文脈として使いませんでした。`;
       hits.appendChild(note);

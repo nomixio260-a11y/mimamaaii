@@ -538,7 +538,8 @@ class Brain:
         thought = {"query": text, "context": [d.text[:80] for d in ctx_docs], "draft": list(cands), "rethink": [], "context2": [], "scores": [],
                    "history": [u for u, _ in history], "copy_bonus": round(bonus, 2), "retrieval_score": round(float(best_score), 3)}
         # 2. 読み直し: 下書きに出てきた句で再検索 (質問だけでは引けなかった文が見つかる)
-        if self.cfg.neural_rethink and cands:
+        # 雑談では読み直しをしない。せっかく文脈を外しても、ここで知識文が戻ってきてしまう
+        if self.cfg.neural_rethink and cands and not chatty:
             extra_terms = [p for c in cands[:2] for p in phrases(c) if is_phrase(p) and p not in text][:4]
             if extra_terms:
                 hits2 = self._search(text + " " + " ".join(extra_terms))
