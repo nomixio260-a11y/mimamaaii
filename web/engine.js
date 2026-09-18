@@ -581,11 +581,21 @@
       const c = context ? this.tok.encode(context, Math.floor(T / 3)) : [];
       const u = this.tok.encode(user, T >> 2);
       let hist = history && history.length ? this.historyIds(history, Math.floor(T / 3)) : [];
-      let room = T - c.length - hist.length - u.length - 5;
-      if (room < 8 && hist.length) { hist = hist.slice(-Math.floor(T / 6)); room = T - c.length - hist.length - u.length - 5; }
-      const b = this.tok.encode(bot, Math.max(8, room));
-      let seq = [BOS]; if (c.length) seq = seq.concat([CTX], c);
-      return seq.concat(hist, [USR], u, [BOT], b, [EOS]);
+      let ctx = c;
+      // 応答の場所を先に確保する。文脈と履歴で埋めると応答が数十トークンに切られ、
+      // 「短く答えて止める」ことを学んでしまう
+      const floor = T >> 1;
+      let room = T - ctx.length - hist.length - u.length - 5;
+      if (room < floor && hist.length) { hist = hist.slice(-Math.floor(T / 6)); room = T - ctx.length - hist.length - u.length - 5; }
+      if (room < floor && ctx.length) { ctx = ctx.slice(0, Math.floor(T / 5)); room = T - ctx.length - hist.length - u.length - 5; }
+      const cap = Math.max(8, room);
+      const full = this.tok.encode(bot, cap + 1);
+      const truncated = full.length > cap;
+      const b = full.slice(0, cap);
+      let seq = [BOS]; if (ctx.length) seq = seq.concat([CTX], ctx);
+      seq = seq.concat(hist, [USR], u, [BOT], b);
+      // 途中で切った応答に <eos> を付けると「ここで終わってよい」と教えることになる
+      return truncated ? seq : seq.concat([EOS]);
     }
     promptDialog(user, context, history) {
       const T = this.model.T;
