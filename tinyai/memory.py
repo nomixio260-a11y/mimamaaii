@@ -85,6 +85,32 @@ class MemoryGuard:
         return rss_bytes() / self.soft if self.soft else 0.0
 
     @staticmethod
+    def available_bytes() -> int:
+        """OS が今すぐ渡せるメモリ (bytes)。読めなければ 0 (= 不明)。"""
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0
+
+    def can_afford(self, extra: int, margin: float = 4.0) -> bool:
+        """恒久的に増える分 (モデルの成長) を許してよいか。
+
+        ソフト上限に対する圧力で判断すると、データ側 (知識ベース・再生バッファ) が上限いっぱいまで
+        使うのが普通なので、圧力はほぼ常に 1 に近く、**モデルは永久に成長できない**
+        (実測: RSS 2248 MB / ソフト 1740 MB = 圧力 1.29 で、7 MB の拡張が拒否されていた)。
+        データは刈り込めば縮む。判断すべきは「増える分が実メモリに収まるか」だけ。"""
+        if extra <= 0:
+            return True
+        avail = self.available_bytes()
+        if not avail:                        # 読めない環境ではソフト上限で判断する (従来どおり)
+            return rss_bytes() + extra < self.limit
+        return extra * margin < avail
+
+    @staticmethod
     def collect() -> None:
         gc.collect()
 

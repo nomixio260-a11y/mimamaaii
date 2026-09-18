@@ -2387,3 +2387,19 @@ class FreshHoldoutPersistenceTest(unittest.TestCase):
             b2.load()
             self.assertEqual(b2._fresh_holdout_step, 1234)
             self.assertEqual([tuple(x) for x in b2._fresh_holdout], b._fresh_holdout)
+
+
+class GrowthMemoryGateTest(unittest.TestCase):
+    """モデルの成長は、データが上限いっぱいでも許す (増える分が実メモリに収まるかで判断)。"""
+
+    def test_growth_allowed_under_data_pressure(self):
+        g = MemoryGuard(limit_mb=64, hard=False)
+        self.assertGreater(g.pressure(), 0.95)          # データで上限を超えている状況
+        self.assertTrue(g.can_afford(7 * 1024 * 1024))  # 7 MB の拡張は通る
+        self.assertFalse(g.can_afford(10 ** 13))        # 現実離れした要求は通さない
+        self.assertTrue(g.can_afford(0))
+
+    def test_falls_back_to_limit_without_meminfo(self):
+        g = MemoryGuard(limit_mb=64, hard=False)
+        g.available_bytes = staticmethod(lambda: 0)     # /proc/meminfo が読めない環境
+        self.assertFalse(g.can_afford(10 ** 13))
