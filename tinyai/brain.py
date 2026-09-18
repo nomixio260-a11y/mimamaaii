@@ -155,6 +155,7 @@ class Brain:
                                corpus_tokens=max(8_000_000, int(self.cfg.memory_mb) * 200_000))  # Transformer LM (numpy)
         self.last_self_eval: dict | None = None
         self.dialog_holdout: list = []             # 評価用に固定した会話 (比較できるように)
+        self._last_growth_check = 0                # 最後に成長・語彙を点検したステップ
         self._fresh_holdout: list = []             # 最近の会話から採った取り置き (一定期間は固定して比べる)
         self._fresh_holdout_step = 0
         self._followup = False                     # 直前の発話が指示語・情報量の乏しい問いか
@@ -692,7 +693,12 @@ class Brain:
         if r:
             self.stats["neural_steps"] += r["steps"]
             self.timers["neural"] += time.perf_counter() - t0
-            if nl.model.step % 200 < steps:
+            # 200 ステップごとに点検する。以前は `step % 200 < steps` で見ていたが、1 回の
+            # neural_step は 60 秒ぶん (数百ステップ) 進めてから 1 度だけ判定するので、
+            # 剰余が 10 未満に落ちる確率は 5% しかなく、成長の点検はほとんど回っていなかった
+            # (実測: 640 ステップ進んでも一度も判定されなかった)。経過量で判定する。
+            if nl.model.step - self._last_growth_check >= 200:
+                self._last_growth_check = nl.model.step
                 ngram = self.lm.perplexity(self.holdout) if self.holdout else None
                 nl.evaluate(ngram)
                 # 進化: 損失が停滞したら層を追加、新語が増えていれば語彙を拡張

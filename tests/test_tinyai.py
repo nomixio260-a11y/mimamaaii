@@ -2425,3 +2425,32 @@ class GrowthReasonTest(unittest.TestCase):
             self.assertIn("メモリ", nl._grow_block)
             self.assertFalse(nl.maybe_grow(memory_ok=True))      # 損失の履歴が足りない
             self.assertIn("損失の履歴", nl._grow_block)
+
+
+class GrowthCheckCadenceTest(unittest.TestCase):
+    """成長の点検は「経過ステップ」で回す (剰余で見ると、ほとんど回らない)。"""
+
+    def test_check_runs_after_200_steps(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
+            b.learn_text("\n".join("サンプル文 %d は学習用の文章です。内容は番号 %d の説明です。" % (i, i)
+                                    for i in range(10, 120)), "https://x/nn")
+            for i in range(40):
+                b.dialogs.add("質問 %d は何ですか" % i, "答え %d はこうです。理由も添えて説明します。" % i)
+            if b.neural_step(budget_seconds=0.2, steps=2) is None:
+                self.skipTest("ニューラル LM が動いていない")
+            self.assertEqual(b._last_growth_check, 0)          # 200 step 未満では点検しない
+            b.neural.model.step += 400                          # 200 を超えたら点検する
+            b.neural_step(budget_seconds=0.05, steps=2)
+            checked = b._last_growth_check
+            self.assertGreaterEqual(checked, 400)
+            b.neural.model.step += 150                          # 次は 200 進むまで回らない
+            b.neural_step(budget_seconds=0.05, steps=2)
+            self.assertEqual(b._last_growth_check, checked)
