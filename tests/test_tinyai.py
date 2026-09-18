@@ -2372,3 +2372,18 @@ class MixedScaleHistoryTest(unittest.TestCase):
         same = [49.6, 50.1, 48.9, 51.0]
         self.assertEqual(NeuralLM._single_scale(same), same)
         self.assertEqual(NeuralLM._single_scale([]), [])
+
+
+class FreshHoldoutPersistenceTest(unittest.TestCase):
+    """入れ替わる取り置きは再起動をまたいで同じものを使う (物差しを動かさない)。"""
+
+    def test_holdout_survives_save_and_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b._fresh_holdout = [("質問 1 は何ですか", "答えはこうです。"), ("質問 2 は何ですか", "こちらの答えです。")]
+            b._fresh_holdout_step = 1234
+            b.save()
+            b2 = make_brain(tmp)
+            b2.load()
+            self.assertEqual(b2._fresh_holdout_step, 1234)
+            self.assertEqual([tuple(x) for x in b2._fresh_holdout], b._fresh_holdout)

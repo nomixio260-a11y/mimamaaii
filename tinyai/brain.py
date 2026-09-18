@@ -1846,6 +1846,9 @@ class Brain:
                 "semantic": self.semantic.state(),
                 "reranker": self.reranker.state(),
                 "dialog_holdout": list(self.dialog_holdout), "dialogs": self.dialogs.state(),
+                # 入れ替わる取り置きも保存する。10 分ごとに再開する運用では、これが消えるたびに
+                # 物差しが変わり、同じモデルの評価値が動いてしまう (実測: 再開直後に 0.506 → 0.446)。
+                "fresh_holdout": [list(x) for x in self._fresh_holdout], "fresh_holdout_step": self._fresh_holdout_step,
                 "agent": self.agent.state(),
                 "params": asdict(self.params),
                 "generation": self.generation,
@@ -1909,6 +1912,8 @@ class Brain:
             self.semantic = SemanticSpace.from_state(state["semantic"]) if "semantic" in state else SemanticSpace()
             self.reranker = Reranker.from_state(state.get("reranker", {}))
             self.dialog_holdout = [tuple(x) for x in state.get("dialog_holdout", [])]
+            self._fresh_holdout = [tuple(x) for x in state.get("fresh_holdout", [])]
+            self._fresh_holdout_step = int(state.get("fresh_holdout_step", 0))
             self.dialogs = DialogStore.from_state(state.get("dialogs", []), self.cfg.max_dialogs)
             self.agent.load_state(state.get("agent", {}))
             self._semantic_queue = deque(maxlen=50000)
