@@ -156,6 +156,7 @@ class Brain:
         self.last_self_eval: dict | None = None
         self.dialog_holdout: list = []             # 評価用に固定した会話 (比較できるように)
         self._last_growth_check = 0                # 最後に成長・語彙を点検したステップ
+        self._fresh_shift = 0.0                    # 取り置きを入れ替えた時の段差の累積 (値を連続させる)
         self._fresh_holdout: list = []             # 最近の会話から採った取り置き (一定期間は固定して比べる)
         self._fresh_holdout_step = 0
         self._followup = False                     # 直前の発話が指示語・情報量の乏しい問いか
@@ -729,6 +730,36 @@ class Brain:
                 nl.save()
         return r
 
+    def _dialog_gain(self, pairs, with_bpc: bool = False):
+        """会話の取り置きに対する「文字あたりの予測の良さ」。
+
+        返すのは削減率 (0 = 文字の出現頻度だけを知っている状態、1 = 完全予測)。
+        with_bpc=True なら (削減率, 1 文字あたりビット数) を返す。"""
+        nl = self.neural
+        if nl.model is None or len(pairs) < 5:
+            return None
+        nats = chars = 0.0
+        with nl.lock, nl._infer():
+            for u, bb in pairs:
+                ids = nl.seq_dialog(u, bb)
+                st = nl.loss_from(ids)
+                seq = ids[max(0, st - 1):]
+                if len(seq) < 3:
+                    continue
+                nats += -nl.model.logprob(seq) * (len(seq) - 1)
+                chars += len(bb)
+        if not chars:
+            return None
+        from collections import Counter as _C
+        cnt = _C("".join(bb for _, bb in pairs))
+        tot = sum(cnt.values())
+        uni = -sum(n / tot * math.log2(n / tot) for n in cnt.values()) if tot else 0.0
+        if not uni:
+            return None
+        bpc = nats / chars / math.log(2)
+        gain = 1 - bpc / uni
+        return (gain, bpc) if with_bpc else gain
+
     def self_evaluate(self, n_docs: int = 24, n_dialogs: int = 40) -> dict:
         """学習中に自分で品質を測る (自動評価)。取り置き文の ppl だけでなく、
         会話としての ppl と RAG 忠実性 (文脈の句をどれだけ使うか) を測り、学習ログに残す。"""
@@ -801,30 +832,27 @@ class Brain:
             cand = [(u, bb) for u, bb, src, w, *_ in list(self.dialogs.pairs)[-4000:]
                     if w > 0 and 10 <= len(bb) <= 200 and not src.startswith("aozora")]
             if len(cand) >= 20:
-                self._fresh_holdout = random.Random(step_now).sample(cand, min(n_dialogs * 2, len(cand)))
-                self._fresh_holdout_step = step_now
+                fresh = random.Random(step_now).sample(cand, min(n_dialogs * 2, len(cand)))
+                # 取り置きを入れ替える瞬間に、**同じモデルで**新旧の両方を測り、その差を覚えておく。
+                # これをしないと、入れ替えのたびに値が跳ねて前後が比べられない
+                # (実測: 0.507 → 0.441。モデルは何も変わっていないのに 0.066 動いた)。
+                if self._fresh_holdout:
+                    old_g = self._dialog_gain(self._fresh_holdout)
+                    new_g = self._dialog_gain(fresh)
+                    if old_g is not None and new_g is not None:
+                        self._fresh_shift += old_g - new_g
+                self._fresh_holdout, self._fresh_holdout_step = fresh, step_now
         recent_pairs = list(self._fresh_holdout)
         if len(recent_pairs) >= 20:
-            nats2 = chars2 = 0.0
-            with nl.lock, nl._infer():
-                for u, bb in recent_pairs:
-                    ids = nl.seq_dialog(u, bb)
-                    st = nl.loss_from(ids)
-                    seq = ids[max(0, st - 1):]
-                    if len(seq) < 3:
-                        continue
-                    nats2 += -nl.model.logprob(seq) * (len(seq) - 1)
-                    chars2 += len(bb)
-            if chars2:
-                from collections import Counter as _C2
-                c2 = _C2("".join(bb for _, bb in recent_pairs))
-                t2 = sum(c2.values())
-                uni2 = -sum(n / t2 * math.log2(n / t2) for n in c2.values())
-                out["dialog_bpc_fresh"] = round(nats2 / chars2 / math.log(2), 4)
-                if uni2:
-                    out["dialog_gain_fresh"] = round(1 - out["dialog_bpc_fresh"] / uni2, 3)
-                    # 規則には「基準からの削減率」を使う: 語彙が変わっても、取り置きの中身が変わっても比較できる
-                    dialog_metric = (1 - out["dialog_gain_fresh"]) * 100
+            measured = self._dialog_gain(recent_pairs, with_bpc=True)
+            if measured is not None:
+                gain, bpc = measured
+                out["dialog_bpc_fresh"] = round(bpc, 4)
+                out["dialog_gain_fresh"] = round(gain, 3)
+                # 入れ替えの差を足し戻した値。UI と規則はこちらを使う (取り置きが変わっても連続する)
+                out["dialog_gain_fresh_adj"] = round(gain + self._fresh_shift, 3)
+                # 規則には「基準からの削減率」を使う: 語彙が変わっても、取り置きの中身が変わっても比較できる
+                dialog_metric = (1 - out["dialog_gain_fresh_adj"]) * 100
 
         if dialog_metric is not None:
             nl.note_dialog_ppl(dialog_metric)
@@ -1855,6 +1883,7 @@ class Brain:
                 # 入れ替わる取り置きも保存する。10 分ごとに再開する運用では、これが消えるたびに
                 # 物差しが変わり、同じモデルの評価値が動いてしまう (実測: 再開直後に 0.506 → 0.446)。
                 "fresh_holdout": [list(x) for x in self._fresh_holdout], "fresh_holdout_step": self._fresh_holdout_step,
+                "fresh_shift": self._fresh_shift,
                 "agent": self.agent.state(),
                 "params": asdict(self.params),
                 "generation": self.generation,
@@ -1920,6 +1949,7 @@ class Brain:
             self.dialog_holdout = [tuple(x) for x in state.get("dialog_holdout", [])]
             self._fresh_holdout = [tuple(x) for x in state.get("fresh_holdout", [])]
             self._fresh_holdout_step = int(state.get("fresh_holdout_step", 0))
+            self._fresh_shift = float(state.get("fresh_shift", 0.0))
             self.dialogs = DialogStore.from_state(state.get("dialogs", []), self.cfg.max_dialogs)
             self.agent.load_state(state.get("agent", {}))
             self._semantic_queue = deque(maxlen=50000)

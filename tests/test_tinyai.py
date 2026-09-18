@@ -2573,3 +2573,40 @@ class WidthAwareLrTest(unittest.TestCase):
             self.assertLess(nl._depth_lr(), before)
             self.assertAlmostEqual(nl._depth_lr(),
                                    nl.lr * nl.lr_scale * (4 / nl.model.L) ** 0.5 * (512 / nl.model.ff) ** 0.5, places=9)
+
+
+class HoldoutSwapCalibrationTest(unittest.TestCase):
+    """取り置きを入れ替えても、報告する値が段差で跳ねない。"""
+
+    def test_shift_is_measured_at_swap(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
+            b.learn_text("\n".join("サンプル文 %d は学習用の文章です。内容は番号 %d の説明です。" % (i, i)
+                                    for i in range(10, 200)), "https://x/nn")
+            for i in range(120):
+                b.dialogs.add("質問 %d は何ですか" % i,
+                              "番号 %d の説明です。もとになる考え方は単純で、順番に見ていけば分かります。" % i)
+            b.neural_step(budget_seconds=0.3)
+            r = b.self_evaluate(n_docs=4, n_dialogs=12)
+            if "dialog_gain_fresh" not in r:
+                self.skipTest("会話の評価ができない")
+            self.assertIn("dialog_gain_fresh_adj", r)
+            self.assertAlmostEqual(r["dialog_gain_fresh_adj"], r["dialog_gain_fresh"], places=3)  # 初回は段差なし
+            raw_before, adj_before = r["dialog_gain_fresh"], r["dialog_gain_fresh_adj"]
+            b.neural.model.step += 2000                      # 取り置きの入れ替え時期にする
+            for i in range(120, 240):                        # 中身の違う会話を足す
+                b.dialogs.add("別の話題 %d について" % i,
+                              "こちらは長さも語彙も違う文章で、川の流れや山の景色のような別の話題を含みます。%d" % i)
+            r2 = b.self_evaluate(n_docs=4, n_dialogs=12)
+            if "dialog_gain_fresh" not in r2:
+                self.skipTest("会話の評価ができない")
+            jump_raw = abs(r2["dialog_gain_fresh"] - raw_before)
+            jump_adj = abs(r2["dialog_gain_fresh_adj"] - adj_before)
+            self.assertLessEqual(jump_adj, jump_raw + 1e-6)  # 補正した方が跳ねない

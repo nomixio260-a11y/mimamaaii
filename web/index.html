@@ -316,7 +316,8 @@ details.about p { margin: 6px 0; }
       ? `${(corpusTok / s.params).toFixed(1)} トークン/パラメータ (目安 20)` : `知識文 ${fmt(m.kb_docs || 0)} 文`;
     // 会話の予測力: 文字の出現頻度だけを知っている状態から何 % 予測を詰められたか
     const ev = (m.eval_log || []).slice(-1)[0] || {};
-    const gain = ev.dialog_gain_fresh != null ? ev.dialog_gain_fresh : ev.dialog_bpc_gain;
+    // 取り置きを入れ替えた時の段差を補正した値を優先する (入れ替えのたびに跳ねると比べられない)
+    const gain = ev.dialog_gain_fresh_adj != null ? ev.dialog_gain_fresh_adj : (ev.dialog_gain_fresh != null ? ev.dialog_gain_fresh : ev.dialog_bpc_gain);
     const bpc = ev.dialog_bpc_fresh != null ? ev.dialog_bpc_fresh : ev.dialog_bpc;
     $('mGain').textContent = gain != null ? (gain * 100).toFixed(1) + '%' : '–';
     $('mBpc').textContent = bpc != null ? `${bpc.toFixed(2)} ビット/文字 (低いほど良い)` : '低いほど文を予測できる';
@@ -429,10 +430,10 @@ details.about p { margin: 6px 0; }
     };
     if (pvals.length) line((r) => (useBpc ? (r.dialog_bpc_fresh != null ? r.dialog_bpc_fresh : r.dialog_bpc) : r.dialog_ppl), yp, getCss('--heat'));
     line((r) => r.rag_grounded, yg, getCss('--accent'));
-    line((r) => (r.dialog_gain_fresh != null ? r.dialog_gain_fresh : r.dialog_bpc_gain), yg, getCss('--ink2'));
+    line((r) => (r.dialog_gain_fresh_adj != null ? r.dialog_gain_fresh_adj : (r.dialog_gain_fresh != null ? r.dialog_gain_fresh : r.dialog_bpc_gain)), yg, getCss('--ink2'));
     const last = log[log.length - 1];
     c.fillStyle = getCss('--ink3'); c.fillText('step ' + fmt(log[0].step), pad.l, H - 3);
-    const gain = last.dialog_gain_fresh != null ? last.dialog_gain_fresh : last.dialog_bpc_gain;
+    const gain = last.dialog_gain_fresh_adj != null ? last.dialog_gain_fresh_adj : (last.dialog_gain_fresh != null ? last.dialog_gain_fresh : last.dialog_bpc_gain);
     const bpc = last.dialog_bpc_fresh != null ? last.dialog_bpc_fresh : last.dialog_bpc;
     $('qualityLast').textContent = `忠実性 ${last.rag_grounded != null ? last.rag_grounded.toFixed(2) : '–'}`
       + (gain != null ? ` · 会話の予測力 ${(gain * 100).toFixed(1)}%` : '')
