@@ -210,15 +210,25 @@ class NeuralLM:
         ctx_ids = self.tok.encode(context, max_tokens=T // 3) if context else []
         u = self.tok.encode(user, max_tokens=T // 4)
         hist = self._history_ids(history, max(0, T // 3)) if history else []
+        # 応答の場所を先に確保する。文脈と履歴で埋めてしまうと応答が数十トークンに切られ、
+        # 「短く答えて止める」ことを学んでしまう (実測: 生成される応答が常に 44 文字前後だった)
+        floor = T // 2
         room = T - len(ctx_ids) - len(hist) - len(u) - 5
-        if room < 8 and hist:                       # 入りきらなければ過去を削る
-            hist = hist[-max(0, T // 6):]
+        if room < floor:
+            hist = hist[-max(0, T // 6):] if hist else hist
             room = T - len(ctx_ids) - len(hist) - len(u) - 5
-        b = self.tok.encode(bot, max_tokens=max(8, room))
+        if room < floor and ctx_ids:
+            ctx_ids = ctx_ids[: max(0, T // 5)]
+            room = T - len(ctx_ids) - len(hist) - len(u) - 5
+        full = self.tok.encode(bot, max_tokens=max(8, room) + 1)
+        truncated = len(full) > max(8, room)
+        b = full[: max(8, room)]
         seq = [BOS]
         if ctx_ids:
             seq += [CTX] + ctx_ids
-        return seq + hist + [USR] + u + [BOT] + b + [EOS]
+        seq = seq + hist + [USR] + u + [BOT] + b
+        # 途中で切った応答に <eos> を付けると「ここで終わってよい」と教えることになる。切れた時は付けない
+        return seq + ([EOS] if not truncated else [])
 
     @staticmethod
     def loss_from(seq: list[int]) -> int:

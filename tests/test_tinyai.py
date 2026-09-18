@@ -2727,3 +2727,48 @@ class B64SplitTest(unittest.TestCase):
             joined = "".join((out / name).read_text(encoding="utf-8") for name in meta["b64_parts"])
             self.assertEqual(base64.b64decode(joined), (out / "model.bin").read_bytes())
             self.assertEqual((out / "model.b64.txt").read_text(encoding="utf-8"), "")
+
+
+class ReplyRoomTest(unittest.TestCase):
+    """応答の場所を先に確保し、切れた応答には <eos> を付けない。"""
+
+    def _lm(self, tmp):
+        from tinyai.neural_lm import NeuralLM
+        nl = NeuralLM(Path(tmp), size="small")
+        nl.min_sentences, nl.min_chars = 10, 100
+        texts = ["サンプル文 %d は学習用の文章です。番号 %d の説明をもう少し続けます。" % (i, i) for i in range(60)]
+        assert nl.ensure_model(texts)
+        return nl
+
+    def test_long_reply_keeps_room_and_drops_eos(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        from tinyai.bpe import EOS
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            T = nl.model.T
+            long_bot = "これはとても長い応答です。" * 40
+            ctx = "文脈の文章です。" * 40
+            hist = [("前の発話", "前の応答" * 10)]
+            seq = nl.seq_dialog("質問は何ですか", long_bot, context=ctx, history=hist)
+            self.assertLessEqual(len(seq), T)
+            start = nl.loss_from(seq)
+            self.assertGreaterEqual(len(seq) - start, T // 3)   # 応答の場所が確保されている
+            self.assertNotEqual(seq[-1], EOS)                   # 切れた応答には <eos> を付けない
+
+    def test_short_reply_keeps_eos(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        from tinyai.bpe import EOS
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            seq = nl.seq_dialog("質問は何ですか", "短い応答です。")
+            self.assertEqual(seq[-1], EOS)
