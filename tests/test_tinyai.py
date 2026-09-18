@@ -2698,3 +2698,32 @@ class WikiQaFormatTest(unittest.TestCase):
     def test_missing_fields_are_skipped(self):
         from tinyai.collector import HuggingFaceDatasets
         self.assertEqual(HuggingFaceDatasets._pairs_from_row({"query": "問いだけ"}, "wikiqa"), [])
+
+
+class B64SplitTest(unittest.TestCase):
+    """大きい重みは base64 を分割して書き出す (配信先の 1 ファイル上限に収める)。"""
+
+    def test_parts_reconstruct_the_original(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        import base64
+        from tinyai import export as ex
+        from tinyai.bpe import SubwordTokenizer
+        with tempfile.TemporaryDirectory() as tmp:
+            tok = SubwordTokenizer.train(["サンプルの文章です。こんにちは、元気ですか。元気だよ。ありがとう。" * 20], size=300)
+            model = nn.TinyTransformer(len(tok), 32, 2, 1, 96, ff=64)
+            out = Path(tmp) / "dist"
+            saved = ex.B64_PART_CHARS
+            try:
+                ex.B64_PART_CHARS = 1000                      # 必ず分割される小さい上限にする
+                meta = ex.export_model(model, tok, out)
+            finally:
+                ex.B64_PART_CHARS = saved
+            self.assertGreater(len(meta["b64_parts"]), 1)
+            joined = "".join((out / name).read_text(encoding="utf-8") for name in meta["b64_parts"])
+            self.assertEqual(base64.b64decode(joined), (out / "model.bin").read_bytes())
+            self.assertEqual((out / "model.b64.txt").read_text(encoding="utf-8"), "")

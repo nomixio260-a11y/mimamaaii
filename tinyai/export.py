@@ -20,6 +20,9 @@ from .bpe import BOS, BOT, USR
 from .textquality import strip_broken
 
 
+B64_PART_CHARS = 10_000_000      # base64 1 ファイルの上限 (配信先の 16 MB 制限に収める)
+
+
 def quantize_rows(w):
     np = neural.np
     w = np.asarray(w, dtype=np.float32)
@@ -66,11 +69,23 @@ def export_model(model: "neural.TinyTransformer", tok, out_dir: Path, meta_extra
         offset += len(b)
     raw = b"".join(blobs)
     (out_dir / "model.bin").write_bytes(raw)
-    # 静的ホスティング先によっては .bin を配信できないので base64 テキストも置く (ページ側が自動で選ぶ)
-    (out_dir / "model.b64.txt").write_text(base64.b64encode(raw).decode("ascii"), encoding="utf-8")
+    # 静的ホスティング先によっては .bin を配信できないので base64 テキストも置く (ページ側が自動で選ぶ)。
+    # 1 ファイルの上限がある配信先 (16 MB) を超えないよう、大きい時は分割する。
+    # base64 は元の 4/3 倍になるので、12 MB の重みで既に 16 MB を超える。
+    b64 = base64.b64encode(raw).decode("ascii")
+    parts = []
+    if len(b64) <= B64_PART_CHARS:
+        (out_dir / "model.b64.txt").write_text(b64, encoding="utf-8")
+    else:
+        for i in range(0, len(b64), B64_PART_CHARS):
+            name = f"model.b64.{len(parts):03d}.txt"
+            (out_dir / name).write_text(b64[i : i + B64_PART_CHARS], encoding="utf-8")
+            parts.append(name)
+        (out_dir / "model.b64.txt").write_text("", encoding="utf-8")   # 古いページが誤って読まないように空にする
     meta = {
         "V": model.V, "d": model.d, "heads": model.h, "layers": model.L, "ctx": model.T, "ff": model.ff,
         "params": model.n_params(), "step": model.step, "bytes": offset, "tensors": tensors, "ema": src is not model.p,
+        "b64_parts": parts,
     }
     meta.update(meta_extra or {})
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")

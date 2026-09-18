@@ -626,11 +626,16 @@ details.about p { margin: 6px 0; }
     for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); got += value.length; onProgress(got / total); }
     const out = new Uint8Array(got); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; } return out.buffer;
   }
-  // 重み: model.bin をそのまま、置けない配信先では model.b64.txt (base64) を読む
-  async function fetchWeights(onProgress) {
+  // 重み: model.bin をそのまま、置けない配信先では base64 のテキストを読む。
+  // 大きいモデルは 1 ファイルの上限 (16 MB) を超えるので、meta.b64_parts があれば分割ぶんを順に読む
+  async function fetchWeights(meta, onProgress) {
     try { return await fetchProgress('model.bin', onProgress); } catch (e) { /* 次へ */ }
-    const buf = await fetchProgress('model.b64.txt', (f) => onProgress(f * 0.8));
-    const text = new TextDecoder().decode(new Uint8Array(buf)).replace(/\s+/g, '');
+    const names = (meta && meta.b64_parts && meta.b64_parts.length) ? meta.b64_parts : ['model.b64.txt'];
+    let text = '';
+    for (let i = 0; i < names.length; i++) {
+      const buf = await fetchProgress(names[i], (f) => onProgress((i + f * 0.9) / names.length * 0.9));
+      text += new TextDecoder().decode(new Uint8Array(buf)).replace(/\s+/g, '');
+    }
     const bin = atob(text); const u8 = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
     onProgress(1);
@@ -641,7 +646,7 @@ details.about p { margin: 6px 0; }
       const [meta, vocab, kb] = await Promise.all([fetch('meta.json').then((r) => r.json()), fetch('vocab.json').then((r) => r.json()), fetch('kb.json').then((r) => r.json())]);
       state.meta = meta; state.vocab = vocab.filter((t) => SPECIALS.indexOf(t) < 0);
       $('loadText').textContent = `重み ${(meta.bytes / 1e6).toFixed(1)} MB (int8) を取得中`;
-      const bin = await fetchWeights((f) => { $('loadBar').style.width = Math.round(f * 100) + '%'; });
+      const bin = await fetchWeights(meta, (f) => { $('loadBar').style.width = Math.round(f * 100) + '%'; });
       $('loadText').textContent = '重みを float32 に展開しています';
       drawServer($('preChart'), meta.train_log || []);
       drawQuality($('qChart'), meta.eval_log || []);
