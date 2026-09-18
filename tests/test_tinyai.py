@@ -2842,3 +2842,12 @@ class SourceHealthPersistenceTest(unittest.TestCase):
             (Path(tmp) / "source_health.json").write_text("壊れた", encoding="utf-8")
             col = Collector(None, Path(tmp))
             self.assertEqual(col.health, {})
+
+
+class SourceWeightTest(unittest.TestCase):
+    """英語の文学は薄く混ぜる (1 回の収穫が大きいので重みで抑える)。"""
+
+    def test_gutenberg_is_lighter_than_japanese_literature(self):
+        from tinyai.collector import Aozora, Gutenberg, WikipediaRandom
+        self.assertLess(Gutenberg.weight, Aozora.weight)
+        self.assertLess(Gutenberg.weight, WikipediaRandom.weight)

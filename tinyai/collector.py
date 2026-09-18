@@ -520,10 +520,14 @@ class StackExchange(Source):
 
 
 class Gutenberg(Source):
-    """Project Gutenberg: 英語の公有文学。ランダムな ID の平文を読む (無い ID は飛ばす)。"""
+    """Project Gutenberg: 英語の公有文学。ランダムな ID の平文を読む (無い ID は飛ばす)。
+
+    重みが小さいのは、1 回で取れる量が桁違いに多いから。実測 (今日の収集ログ) では
+    155 回の取得で 21.9 万文と、日本語の全供給源を合わせたのに匹敵する量の**英語**が入っていた。
+    日本語で話す相手としての質を上げたいので、英語の文学は薄く混ぜる程度に留める。"""
     name = "gutenberg"
     kind = "stream"
-    weight = 0.3
+    weight = 0.08
 
     def stream(self):
         if self.lang != "en":
