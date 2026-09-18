@@ -652,7 +652,7 @@ class Brain:
             n += 1
         return n
 
-    def _rebuild_dialog_sequences(self, limit: int = 20000) -> int:
+    def _rebuild_dialog_sequences(self, limit: int = 60000) -> int:
         """会話系列の作り方を直した時に、手持ちの会話を作り直して再生バッファへ入れ直す。
 
         再生バッファとコーパスの中身は「作った時の作り方」で固まっているので、作り方を直しても
