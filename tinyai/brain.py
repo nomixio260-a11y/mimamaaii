@@ -42,6 +42,7 @@ from .agent import Agent, apply_format, strip_format
 from .dialog import DialogStore
 from .lm import NGramLM, CacheLM, EOS
 from .memory import MemoryGuard, MB
+from .neural_lm import SEQ_VERSION as neural_lm_SEQ_VERSION
 from .neural_lm import NeuralLM
 from .reranker import Reranker
 from .semantic import SemanticSpace
@@ -651,9 +652,30 @@ class Brain:
             n += 1
         return n
 
+    def _rebuild_dialog_sequences(self, limit: int = 20000) -> int:
+        """会話系列の作り方を直した時に、手持ちの会話を作り直して再生バッファへ入れ直す。
+
+        再生バッファとコーパスの中身は「作った時の作り方」で固まっているので、作り方を直しても
+        古い系列を学び続けてしまう (今回は、切り詰めた応答に <eos> が付いた系列が 40 万件あった)。"""
+        nl = self.neural
+        if nl.model is None or nl.seq_version >= neural_lm_SEQ_VERSION:
+            return 0
+        n = 0
+        for item in list(self.dialogs.pairs)[-limit:]:
+            u, b, _src, w = item[:4]
+            if w <= 0:
+                continue
+            nl.add_dialog(u, b, weight=w, history=item[4] if len(item) > 4 else None)
+            n += 1
+        nl.seq_version = neural_lm_SEQ_VERSION
+        if n:
+            log.info("会話系列を作り直しました: %d 件 (作り方の版 %d)", n, neural_lm_SEQ_VERSION)
+        return n
+
     def _feed_neural(self, max_qa_docs: int = 60) -> None:
         """再生バッファへ: 平文、会話 (文脈付き)、事実からの合成 QA。"""
         nl = self.neural
+        self._rebuild_dialog_sequences()
         while self._neural_pending_text:
             nl.add_text(self._neural_pending_text.popleft())
         while self._neural_pending_dialog:

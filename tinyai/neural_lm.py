@@ -30,6 +30,9 @@ log = logging.getLogger("tinyai.neural")
 # 復号パラメータの既定値の世代。上げると、古いチェックポイントが持っている値のうち
 # 研究で見直した項目 (現在は copy_bonus) を捨てて新しい既定値から再開する。
 DECODE_VERSION = 3
+# 会話系列の作り方の版。上げると、次回の起動時に手持ちの会話を作り直して再生バッファに入れ直す
+# (古い系列は切り詰めた応答に <eos> が付いており、「短く終わる」癖を教え続けてしまうため)
+SEQ_VERSION = 2
 
 # 本文を指す言い回し (読解データ由来。文脈なしで学ぶと雑談にも出てくる)
 _PASSAGE_RE = re.compile(r"文章(に|では|から|によ)|文中|この記事(に|では)|上記の|与えられた文|本文(に|では)|記載されてい")
@@ -114,6 +117,7 @@ class NeuralLM:
         self._last_grow_step = 0                     # 直近で成長したステップ (連続した成長を避ける)
         self._pregrow_ppl: float | None = None       # 成長直前の ppl (成長が裏目に出ていないかの判定用)
         self._pregrow_dialog: float | None = None    # 成長直前の対話 ppl
+        self.seq_version = 0                         # 読み込んだチェックポイントの会話系列の版
         self.dialog_hist: list[float] = []           # 対話 ppl の推移 (成長の判断に使う)
         self._grow_block: str | None = None          # 直近に成長を見送った理由 (ログに 1 度だけ出す)
         self.growth_records: list[dict] = []         # 成長の前後で品質がどう動いたか (成長が効いたかの記録)
@@ -163,6 +167,7 @@ class NeuralLM:
                 self.recent_hist = [float(x) for x in meta.get("recent_hist", [])]
                 self.recent_bpc_hist = [float(x) for x in meta.get("recent_bpc_hist", [])]
                 self.growth_records = [dict(x) for x in meta.get("growth_records", [])]
+                self.seq_version = int(meta.get("seq_version", 0))
                 self._pregrow_ppl = meta.get("pregrow_ppl")
                 self._pregrow_dialog = meta.get("pregrow_dialog")
                 self._last_damp_step = int(meta.get("last_damp_step", 0))
@@ -791,7 +796,7 @@ class NeuralLM:
                 log.warning("再生バッファの保存に失敗: %s", e)
             self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300], "holdout_recent": [list(x) for x in self._holdout_recent],
                                                        "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "last_grow_step": self._last_grow_step, "lr_scale": self.lr_scale,
-                                                       "dialog_hist": self.dialog_hist[-20:], "recent_hist": self.recent_hist[-20:], "recent_bpc_hist": self.recent_bpc_hist[-20:], "growth_records": self.growth_records[-20:],
+                                                       "dialog_hist": self.dialog_hist[-20:], "recent_hist": self.recent_hist[-20:], "recent_bpc_hist": self.recent_bpc_hist[-20:], "growth_records": self.growth_records[-20:], "seq_version": SEQ_VERSION,
                                                        # 成長直前の品質も保存する。これが消えると「成長が裏目なら戻す」判定が
                                                        # 再起動のたびに取り消され、安全網が一度も働かない
                                                        "pregrow_ppl": self._pregrow_ppl, "pregrow_dialog": self._pregrow_dialog,

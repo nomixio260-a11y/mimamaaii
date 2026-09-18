@@ -2772,3 +2772,28 @@ class ReplyRoomTest(unittest.TestCase):
             nl = self._lm(tmp)
             seq = nl.seq_dialog("質問は何ですか", "短い応答です。")
             self.assertEqual(seq[-1], EOS)
+
+
+class SeqRebuildTest(unittest.TestCase):
+    """会話系列の作り方を直したら、手持ちの会話を作り直して入れ直す。"""
+
+    def test_rebuild_runs_once(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        from tinyai.neural_lm import SEQ_VERSION
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
+            b.learn_text("\n".join("サンプル文 %d は学習用の文章です。番号 %d の説明を続けます。" % (i, i)
+                                    for i in range(10, 120)), "https://x/nn")
+            for i in range(30):
+                b.dialogs.add("質問 %d は何ですか" % i,
+                              "番号 %d の説明です。もとになる考え方は単純で、順番に見ていけば分かります。" % i)
+            if b.neural_step(budget_seconds=0.2) is None:
+                self.skipTest("ニューラル LM が動いていない")
+            self.assertEqual(b.neural.seq_version, SEQ_VERSION)     # 一度走ったら版を進める
+            self.assertEqual(b._rebuild_dialog_sequences(), 0)      # 二度目は走らない
