@@ -2851,3 +2851,50 @@ class SourceWeightTest(unittest.TestCase):
         from tinyai.collector import Aozora, Gutenberg, WikipediaRandom
         self.assertLess(Gutenberg.weight, Aozora.weight)
         self.assertLess(Gutenberg.weight, WikipediaRandom.weight)
+
+
+class GrowthPatienceTest(unittest.TestCase):
+    """前回の成長が実っていない間は、次の成長を待つ。"""
+
+    def _lm(self, tmp):
+        from tinyai.neural_lm import NeuralLM
+        nl = NeuralLM(Path(tmp), size="small")
+        nl.min_sentences, nl.min_chars = 10, 100
+        texts = ["サンプル文 %d は学習用の文章です。番号 %d の説明を続けます。" % (i, i) for i in range(60)]
+        assert nl.ensure_model(texts)
+        nl.loss_hist = [2.0] * 20
+        nl.recent_bpc, nl.recent_bpc_hist = 4.0, [4.0] * 4
+        nl.dialog_hist = [50.0] * 4
+        nl.grown = 1
+        return nl
+
+    def test_waits_longer_after_a_bad_growth(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.growth_records = [{"step": 0, "kind": "layer", "bpc_before": 3.0, "bpc_after": 3.6}]  # 悪化した成長
+            nl._last_grow_step = 0
+            nl.model.step = nl.GROW_COOLDOWN + 10          # 通常の間隔は過ぎている
+            self.assertFalse(nl.maybe_grow(memory_ok=True, data_tokens=10 ** 9))
+            self.assertIn("成長の間隔", nl._grow_block)
+            nl.model.step = nl.GROW_COOLDOWN * 2 + 10      # 倍の間隔を過ぎたら通る
+            self.assertTrue(nl.maybe_grow(memory_ok=True, data_tokens=10 ** 9))
+
+    def test_good_growth_keeps_the_normal_interval(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = self._lm(tmp)
+            nl.growth_records = [{"step": 0, "kind": "layer", "bpc_before": 3.0, "bpc_after": 2.9}]  # 良くなった成長
+            nl._last_grow_step = 0
+            nl.model.step = nl.GROW_COOLDOWN + 10
+            self.assertTrue(nl.maybe_grow(memory_ok=True, data_tokens=10 ** 9))

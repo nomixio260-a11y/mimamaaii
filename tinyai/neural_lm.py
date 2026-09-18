@@ -530,8 +530,15 @@ class NeuralLM:
                 return self._no_grow("メモリに余裕がない")
             # 成長の直後は、増えた容量を使えるようになるまで時間がかかる。間を置かずに続けて増やすと
             # 「増やす → 一時的に悪化 → 悪化を見てまた増やす」の悪循環になる (実測: 12 分で 3 層増えた)。
-            if self.grown and self.model.step - self._last_grow_step < self.GROW_COOLDOWN:
-                return self._no_grow(f"成長の間隔 (あと {self.GROW_COOLDOWN - (self.model.step - self._last_grow_step)} step)")
+            # 前回の成長が実って**いない**間は、次の成長を待つ。容量を増やすほど 1 ステップは重くなるので、
+            # 使いこなせていないうちに増やすと「重いだけで賢くならない」状態になる
+            # (実測: 10 層に増やした 2000 ステップ後、平文が 2.958 → 3.602 bit/字 と悪化していた)。
+            cooldown = self.GROW_COOLDOWN
+            last = self.growth_records[-1] if self.growth_records else None
+            if last and last.get("bpc_after") and last.get("bpc_before") and last["bpc_after"] > last["bpc_before"] * 1.05:
+                cooldown *= 2
+            if self.grown and self.model.step - self._last_grow_step < cooldown:
+                return self._no_grow(f"成長の間隔 (あと {cooldown - (self.model.step - self._last_grow_step)} step)")
             max_layers = neural.MAX_LAYERS.get(self.size, 6)
             max_ff = neural.PRESETS.get(self.size, {}).get("ff", self.model.ff) * 3
             if self.model.L >= max_layers and self.model.ff >= max_ff:
