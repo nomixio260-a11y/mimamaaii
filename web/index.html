@@ -160,6 +160,10 @@ details.about p { margin: 6px 0; }
       <div class="chartbox"><h3>この端末での学習 <span id="onLossLast"></span></h3><canvas id="onChart" height="104"></canvas>
         <div class="legend"><span><i style="background:var(--accent)"></i>会話・常時学習の損失</span></div></div>
     </div>
+    <div class="collectbox" id="growthBox" hidden>
+      <h3>大きくなった時に何が起きたか <span id="growthSum"></span></h3>
+      <div class="collectrow" id="growthRow"></div>
+    </div>
     <div class="collectbox" id="collectBox" hidden>
       <h3>サーバーが読んで学んだもの <span id="collectSum"></span></h3>
       <div class="collectrow" id="collectRow"></div>
@@ -440,6 +444,27 @@ details.about p { margin: 6px 0; }
       + (bpc != null ? ` · ${bpc.toFixed(2)} ビット/文字` : '');
   }
   // サーバーが読んで学んだもの (収集の記録)
+  // 成長の前後で品質がどう動いたか。「大きくすれば良くなる」とは限らないので、結果を隠さず出す
+  function renderGrowth(meta) {
+    const rows = (meta.growth_records || []).filter((r) => r.bpc_before != null);
+    const box = $('growthBox'); box.hidden = !rows.length;
+    if (!rows.length) return;
+    $('growthSum').textContent = `${rows.length} 回ぶん (${meta.grown_layers || 0} 層追加 / 幅の拡張 ${meta.widened || 0} 回)`;
+    const row = $('growthRow'); row.innerHTML = '';
+    for (const r of rows.slice().reverse()) {
+      const el = document.createElement('div');
+      const better = r.bpc_after != null && r.bpc_after < r.bpc_before;   // ビット/文字は低いほど良い
+      el.className = 'chip' + (better ? ' dlg' : '');
+      const b = document.createElement('b');
+      b.textContent = `${r.kind === 'layer' ? r.layers + ' 層' : 'ff ' + r.ff} · ${fmt(Math.round((r.params || 0) / 1e4) / 100)}M`;
+      const sp = document.createElement('span');
+      sp.textContent = r.bpc_after == null
+        ? `step ${fmt(r.step)} · 判定待ち (${r.bpc_before.toFixed(2)} bit/字)`
+        : `step ${fmt(r.step)} · ${r.bpc_before.toFixed(2)} → ${r.bpc_after.toFixed(2)} bit/字 ${better ? '改善' : '悪化'}`;
+      el.append(b, sp); row.appendChild(el);
+    }
+  }
+
   function renderCollect(meta) {
     const rows = meta.collect_log || [];
     const box = $('collectBox'); box.hidden = !rows.length;
@@ -616,6 +641,7 @@ details.about p { margin: 6px 0; }
       drawServer($('preChart'), meta.train_log || []);
       drawQuality($('qChart'), meta.eval_log || []);
       renderCollect(meta);
+      renderGrowth(meta);
       startWorker();
       if (!state.worker) await loadScript('engine.js');
       const snapshot = await dbGet('snapshot');
