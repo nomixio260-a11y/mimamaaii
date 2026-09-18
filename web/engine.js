@@ -555,7 +555,7 @@
       this.model = new Model(meta, bin);
       this.kb = new Retriever(kb && kb.docs);
       this.replay = (kb && kb.replay) ? kb.replay.slice() : [];
-      this.decode = Object.assign({ temperature: 0.7, top_p: 0.9, repetition_penalty: 1.3, copy_bonus: 1.0, no_repeat_ngram: 3, min_new: 6 }, meta.decode || {});
+      this.decode = Object.assign({ temperature: 0.7, top_p: 0.9, repetition_penalty: 1.3, copy_bonus: 1.0, no_repeat_ngram: 3, min_new: 6, temp_spread: 0.25 }, meta.decode || {});
       if ((meta.decode_version || 0) < 1) this.decode.copy_bonus = 1.0;   // 古い書き出しの復号設定は既定値に戻す
       if (this.decode.copy_bonus === undefined) this.decode.copy_bonus = 1.0;
       this.lr = 3e-4;
@@ -637,8 +637,13 @@
       const prompt = this.promptDialog(user, context, history);
       const copyIds = context ? this.tok.encode(context, this.model.T) : null;
       const cands = [];
+      // 候補ごとに温度を変える: 同じ温度で n 本引くと、分布が尖っている時にほとんど同じ文が並ぶ。
+      // 低い温度の候補は堅実に、高い温度の候補は思い切った言い回しになり、選ぶ幅が広がる。
+      const spread = this.decode.temp_spread || 0;
+      const temps = [];
+      for (let i = 0; i < n; i++) temps.push(this.decode.temperature * (n > 1 && spread ? (1 - spread) + (2 * spread * i) / (n - 1) : 1));
       for (let i = 0; i < n; i++) {
-        const g = this.model.generate(prompt, { maxNew, temperature: this.decode.temperature, topP: this.decode.top_p, repetitionPenalty: this.decode.repetition_penalty,
+        const g = this.model.generate(prompt, { maxNew, temperature: temps[i], topP: this.decode.top_p, repetitionPenalty: this.decode.repetition_penalty,
                                                 noRepeatNgram: this.decode.no_repeat_ngram || 0, minNew: Math.min(this.decode.min_new || 0, Math.max(1, maxNew >> 2)),
                                                 copyIds, copyBonus: copyBonus === undefined ? (this.decode.copy_bonus || 0) : copyBonus });
         const text = this.tok.decode(g.tokens).trim();
