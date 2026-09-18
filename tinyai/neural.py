@@ -1010,7 +1010,11 @@ def train_steps(model: TinyTransformer, pool: SequencePool, steps: int, batch: i
     return {"steps": steps, "loss": sum(losses[-10:]) / max(len(losses[-10:]), 1), "first_loss": losses[0], "tokens_per_s": round(steps * batch * model.T / max(dt, 1e-9)), "seconds": round(dt, 1)}
 
 
-def perplexity(model: TinyTransformer, seqs: list[list[int]]) -> float:
+def holdout_nats(model: TinyTransformer, seqs: list[list[int]]) -> tuple[float, int]:
+    """取り置きの負の対数尤度 (nat) の合計と、予測したトークン数。
+
+    ppl と「1 文字あたりのビット数」の両方をここから作る。語彙を増やすと 1 トークンが担う文字数が
+    増えるので、per-token の ppl は機械的に上がる。文字あたりで見れば語彙の変更をまたいで比べられる。"""
     lp = 0.0
     n = 0
     for s in seqs:
@@ -1022,4 +1026,9 @@ def perplexity(model: TinyTransformer, seqs: list[list[int]]) -> float:
         tgt = np.array(s[1:])
         lp += float(l[np.arange(len(tgt)), tgt].sum())
         n += len(tgt)
-    return math.exp(-lp / max(n, 1))
+    return -lp, n
+
+
+def perplexity(model: TinyTransformer, seqs: list[list[int]]) -> float:
+    nats, n = holdout_nats(model, seqs)
+    return math.exp(nats / max(n, 1))

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import random
 import re
 import threading
@@ -107,7 +108,9 @@ class NeuralLM:
         self._holdout: list[list[int]] = []          # 初期に固定した取り置き (忘却の検出用)
         self._holdout_recent: deque = deque(maxlen=150)  # 最近の文から入れ替わる取り置き (今の分布での汎化)
         self.recent_ppl: float | None = None
-        self.recent_hist: list[float] = []           # 入れ替わる取り置き ppl の推移 (成長の判断に使う)
+        self.recent_hist: list[float] = []           # 入れ替わる取り置き ppl の推移 (表示用)
+        self.recent_bpc: float | None = None         # 同じ取り置きの 1 文字あたりビット数
+        self.recent_bpc_hist: list[float] = []       # 成長の判断はこちらを使う (語彙を増やしても比べられる)
         self._last_grow_step = 0                     # 直近で成長したステップ (連続した成長を避ける)
         self._pregrow_ppl: float | None = None       # 成長直前の ppl (成長が裏目に出ていないかの判定用)
         self._pregrow_dialog: float | None = None    # 成長直前の対話 ppl
@@ -157,6 +160,7 @@ class NeuralLM:
                 # 「続けて悪化したら学習率を下げる」ような規則が一度も発火しない
                 self.dialog_hist = self._single_scale([float(x) for x in meta.get("dialog_hist", [])])
                 self.recent_hist = [float(x) for x in meta.get("recent_hist", [])]
+                self.recent_bpc_hist = [float(x) for x in meta.get("recent_bpc_hist", [])]
                 self._last_damp_step = int(meta.get("last_damp_step", 0))
                 self.vocab_added = int(meta.get("vocab_added", 0))
                 self.online_steps = int(meta.get("online_steps", 0))
@@ -513,7 +517,7 @@ class NeuralLM:
             # 取り置き ppl が悪化し続けている = 過学習なので、容量を増やしても意味がない。
             # 判断には「入れ替わる取り置き」を使う: 固定の取り置きは学習データから外れた古い文を含むので、
             # 忘却による悪化と過学習による悪化を区別できない (忘却なら容量を増やす方が効く)。
-            ph = self.recent_hist if len(self.recent_hist) >= 4 else self.ppl_hist
+            ph = self.recent_bpc_hist if len(self.recent_bpc_hist) >= 4 else (self.recent_hist if len(self.recent_hist) >= 4 else self.ppl_hist)
             worse = sum(ph[-2:]) / 2 / max(sum(ph[-4:-2]) / 2, 1e-9) if len(ph) >= 4 else 1.0
             if worse > 1.25:        # 急激に悪化している = 学習が不安定。容量の問題ではない
                 return self._no_grow(f"取り置き ppl が急に悪化 (x{worse:.2f})")
@@ -536,7 +540,7 @@ class NeuralLM:
                 try:
                     # 成長は元に戻せない操作なので、直前の重みを取っておく。
                     # 成長が裏目に出た時 (実測: 3 層追加で対話 ppl 75 → 118) に戻せるようにする。
-                    self.model.save(self._pregrow_path, self.tok, meta={"step": self.model.step, "ppl": self.recent_ppl})
+                    self.model.save(self._pregrow_path, self.tok, meta={"step": self.model.step, "ppl": self.recent_ppl, "bpc": self.recent_bpc})
                 except Exception as e:
                     log.warning("成長前の重みの保存に失敗: %s", e)
                 if self.model.L < max_layers:
@@ -548,7 +552,7 @@ class NeuralLM:
                     log.info("ニューラル LM: 中間次元を拡張 -> ff=%d (%d params)", self.model.ff, self.model.n_params())
                 self.grown += 1
                 self._last_grow_step = self.model.step
-                self._pregrow_ppl = self.recent_ppl or self.holdout_ppl
+                self._pregrow_ppl = self.recent_bpc or self.recent_ppl or self.holdout_ppl
                 self._pregrow_dialog = self.dialog_hist[-1] if self.dialog_hist else None
                 if data_rich and not plateau:
                     log.info("データ量が容量を超えたので成長 (%.1fM トークン / %.1fM パラメータ)",
@@ -655,7 +659,7 @@ class NeuralLM:
             since = self.model.step - self._last_grow_step
             if since < self.GROW_COOLDOWN:            # まだ馴染ませている途中
                 return False
-            now = self.recent_ppl or self.holdout_ppl
+            now = self.recent_bpc or self.recent_ppl or self.holdout_ppl   # 成長前と同じ尺度で比べる
             bad_text = now is not None and now > self._pregrow_ppl * self.GROW_ROLLBACK_RATIO
             bad_dialog = (self._pregrow_dialog is not None and self.dialog_hist
                           and self.dialog_hist[-1] > self._pregrow_dialog * self.GROW_ROLLBACK_RATIO)
@@ -675,7 +679,7 @@ class NeuralLM:
                 self.grown = max(0, self.grown - 1)
                 self._last_grow_step = self.model.step
                 self._pregrow_ppl = self._pregrow_dialog = None
-                self.recent_hist, self.ppl_hist, self.loss_hist = [], [], []
+                self.recent_hist, self.ppl_hist, self.loss_hist, self.recent_bpc_hist = [], [], [], []
                 return True
             except Exception as e:
                 log.warning("成長の取り消しに失敗: %s", e)
@@ -705,11 +709,21 @@ class NeuralLM:
             if len(self.ppl_hist) > 100:
                 del self.ppl_hist[:50]
             if len(self._holdout_recent) >= 30:
+                seqs = list(self._holdout_recent)
                 with self._infer():
-                    self.recent_ppl = round(neural.perplexity(self.model, list(self._holdout_recent)), 2)
+                    nats, ntok = neural.holdout_nats(self.model, seqs)
+                self.recent_ppl = round(math.exp(nats / max(ntok, 1)), 2)
                 self.recent_hist.append(self.recent_ppl)
                 if len(self.recent_hist) > 100:
                     del self.recent_hist[:50]
+                # 語彙を増やすと per-token の ppl は機械的に上がる。成長の判断は文字あたりで見る
+                # (実測: 語彙 +300 で ppl が 1.52 倍になり、「悪化した」と誤判定して成長が止まっていた)。
+                chars = sum(len(self.tok.decode([int(t) for t in sq[1:]])) for sq in seqs) if self.tok else 0
+                if chars:
+                    self.recent_bpc = round(nats / chars / math.log(2), 4)
+                    self.recent_bpc_hist.append(self.recent_bpc)
+                    if len(self.recent_bpc_hist) > 100:
+                        del self.recent_bpc_hist[:50]
             self.ngram_ppl = ngram_ppl
             if self.holdout_ppl is not None:
                 if ngram_ppl is not None:
@@ -730,7 +744,7 @@ class NeuralLM:
                 log.warning("再生バッファの保存に失敗: %s", e)
             self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300], "holdout_recent": [list(x) for x in self._holdout_recent],
                                                        "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "last_grow_step": self._last_grow_step, "lr_scale": self.lr_scale,
-                                                       "dialog_hist": self.dialog_hist[-20:], "recent_hist": self.recent_hist[-20:],
+                                                       "dialog_hist": self.dialog_hist[-20:], "recent_hist": self.recent_hist[-20:], "recent_bpc_hist": self.recent_bpc_hist[-20:],
                                                        "last_damp_step": self._last_damp_step, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
             self._last_save = time.time()
 

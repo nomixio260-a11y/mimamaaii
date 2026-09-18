@@ -2454,3 +2454,42 @@ class GrowthCheckCadenceTest(unittest.TestCase):
             b.neural.model.step += 150                          # 次は 200 進むまで回らない
             b.neural_step(budget_seconds=0.05, steps=2)
             self.assertEqual(b._last_growth_check, checked)
+
+
+class VocabInvariantGrowthTest(unittest.TestCase):
+    """成長の判断は語彙の変更をまたいで比べられる尺度 (1 文字あたりビット数) で行う。"""
+
+    def test_bpc_history_is_used_and_recorded(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="small")
+            nl.min_sentences, nl.min_chars = 10, 100
+            texts = ["サンプル文 %d は学習用の文章です。内容は番号 %d の説明です。" % (i, i) for i in range(60)]
+            self.assertTrue(nl.ensure_model(texts))
+            for t in texts:                                    # 固定の取り置きと入れ替わる取り置きを直接埋める
+                nl._holdout.append(nl.seq_text(t))
+                nl._holdout_recent.append(nl.seq_text(t))
+            nl.evaluate()
+            self.assertIsNotNone(nl.recent_bpc)
+            self.assertGreater(nl.recent_bpc, 0)
+            self.assertLess(nl.recent_bpc, 20)                 # 1 文字 20 ビットは超えない
+            self.assertTrue(nl.recent_bpc_hist)
+
+    def test_perplexity_matches_nats(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        import math as _m
+        m = nn.TinyTransformer(40, 32, 2, 1, 16, ff=64)
+        seqs = [[2, 9, 10, 11, 3], [2, 12, 13, 3]]
+        nats, ntok = nn.holdout_nats(m, seqs)
+        self.assertAlmostEqual(nn.perplexity(m, seqs), _m.exp(nats / ntok), places=6)
