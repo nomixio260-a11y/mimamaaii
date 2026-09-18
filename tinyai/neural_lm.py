@@ -163,6 +163,8 @@ class NeuralLM:
                 self.recent_hist = [float(x) for x in meta.get("recent_hist", [])]
                 self.recent_bpc_hist = [float(x) for x in meta.get("recent_bpc_hist", [])]
                 self.growth_records = [dict(x) for x in meta.get("growth_records", [])]
+                self._pregrow_ppl = meta.get("pregrow_ppl")
+                self._pregrow_dialog = meta.get("pregrow_dialog")
                 self._last_damp_step = int(meta.get("last_damp_step", 0))
                 self.vocab_added = int(meta.get("vocab_added", 0))
                 self.online_steps = int(meta.get("online_steps", 0))
@@ -773,6 +775,9 @@ class NeuralLM:
             self.model.save(self.path, self.tok, meta={"trained_tokens": self.trained_tokens, "holdout_ppl": self.holdout_ppl, "ready": self.ready, "size": self.size, "holdout": self._holdout[:300], "holdout_recent": [list(x) for x in self._holdout_recent],
                                                        "decode": self.decode, "decode_version": DECODE_VERSION, "grown": self.grown, "last_grow_step": self._last_grow_step, "lr_scale": self.lr_scale,
                                                        "dialog_hist": self.dialog_hist[-20:], "recent_hist": self.recent_hist[-20:], "recent_bpc_hist": self.recent_bpc_hist[-20:], "growth_records": self.growth_records[-20:],
+                                                       # 成長直前の品質も保存する。これが消えると「成長が裏目なら戻す」判定が
+                                                       # 再起動のたびに取り消され、安全網が一度も働かない
+                                                       "pregrow_ppl": self._pregrow_ppl, "pregrow_dialog": self._pregrow_dialog,
                                                        "last_damp_step": self._last_damp_step, "vocab_added": self.vocab_added, "online_steps": self.online_steps})
             self._last_save = time.time()
 

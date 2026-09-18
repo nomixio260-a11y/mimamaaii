@@ -2523,3 +2523,28 @@ class GrowthRecordTest(unittest.TestCase):
             nl.recent_bpc = 3.8                             # 良くなった (取り消しはしない)
             self.assertFalse(nl.check_growth())
             self.assertEqual(nl.growth_records[-1]["bpc_after"], 3.8)
+
+
+class PregrowStatePersistenceTest(unittest.TestCase):
+    """成長直前の品質は保存する (再起動で「裏目なら戻す」判定が消えないように)。"""
+
+    def test_pregrow_values_survive_restart(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="small")
+            nl.min_sentences, nl.min_chars = 10, 100
+            texts = ["サンプル文 %d は学習用の文章です。内容は番号 %d の説明です。" % (i, i) for i in range(60)]
+            self.assertTrue(nl.ensure_model(texts))
+            nl._pregrow_ppl, nl._pregrow_dialog, nl.grown = 4.2, 51.0, 3
+            nl.save()
+            nl2 = NeuralLM(Path(tmp), size="small")
+            self.assertTrue(nl2.ensure_model())
+            self.assertEqual(nl2._pregrow_ppl, 4.2)
+            self.assertEqual(nl2._pregrow_dialog, 51.0)
+            self.assertEqual(nl2.grown, 3)
