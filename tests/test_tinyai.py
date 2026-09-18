@@ -2678,3 +2678,23 @@ class RagDeterminismTest(unittest.TestCase):
                 self.skipTest("RAG 忠実性を測れない")
             self.assertEqual(r1["rag_grounded"], r2["rag_grounded"])
             self.assertEqual(r1["rag_keyword"], r2["rag_keyword"])
+
+
+class WikiQaFormatTest(unittest.TestCase):
+    """Wikipedia から自動生成された問答 (query/answer/text) を読む。"""
+
+    def test_pairs_with_context(self):
+        from tinyai.collector import HuggingFaceDatasets
+        row = {"query": "「地理学」とは何でしょう？",
+               "answer": "地表の自然・人文にわたる諸現象を解明しようとする学問",
+               "text": "「地理」概念と同様に、「地理学」に対する解釈も多様である。地理学は時代によって概念が変わってきた。"}
+        pairs = HuggingFaceDatasets._pairs_from_row(row, "wikiqa")
+        self.assertEqual(len(pairs), 1)
+        q, a, ctx = pairs[0]
+        self.assertIn("地理学", q)
+        self.assertTrue(a.endswith("。"))                     # 文として終わる形に整える
+        self.assertIn("解釈も多様", ctx)
+
+    def test_missing_fields_are_skipped(self):
+        from tinyai.collector import HuggingFaceDatasets
+        self.assertEqual(HuggingFaceDatasets._pairs_from_row({"query": "問いだけ"}, "wikiqa"), [])

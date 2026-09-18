@@ -304,7 +304,8 @@ class Aozora(Source):
 class HuggingFaceDatasets(Source):
     """Hugging Face datasets-server (公開データセットの行を JSON で返す API) から対話/指示データを読む。
     data/datasets.txt に「dataset<TAB>config<TAB>split<TAB>形式」を書く。形式は
-    conversations (from/value の配列) / instruction (instruction, input, output) / qa (question, answer) / text (text)。"""
+    conversations (from/value の配列) / instruction (instruction, input, output) / qa (question, answer)
+    / qa_text (answer が {"text": ...}) / wikiqa (query, answer, text を文脈に) / squad / preference / text。"""
     name = "hfdatasets"
     kind = "stream"
     weight = 1.5      # 会話・指示・読解データは希少なので少し優先
@@ -365,6 +366,15 @@ class HuggingFaceDatasets(Source):
             a = clean_field(a)
             if q and a:
                 pairs.append((q, a))
+        elif fmt == "wikiqa":
+            # Wikipedia の段落から自動生成された問答 (query / answer / text)。
+            # 段落を文脈として渡すと、本番と同じ「文脈から答えを選ぶ」練習になる
+            q = clean_field(row.get("query") or row.get("question"))
+            a = clean_field(row.get("answer"))
+            ctx = clean_field(row.get("text") or row.get("passage"))[:240]
+            if q and a:
+                a = a if a.endswith(("。", "．", ".", "!", "?", "！", "？")) else a + "。"
+                pairs.append((q, a, ctx) if ctx else (q, a))
         elif fmt == "qa":
             q = clean_field(row.get("question") or row.get("title"))
             a = (row.get("answer") or row.get("answers") or "").strip() if isinstance(row.get("answer") or row.get("answers"), str) else ""
