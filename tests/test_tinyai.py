@@ -2653,3 +2653,28 @@ class ChattyTest(unittest.TestCase):
         for t in ("光合成の仕組みを教えて", "徳川家康はどんな人ですか", "機械学習と統計学の違いは何ですか",
                   "宇宙はどうやって始まったのですか", "富士山の高さは？"):
             self.assertFalse(Brain._chatty(t), t)
+
+
+class RagDeterminismTest(unittest.TestCase):
+    """同じモデル・同じ文なら RAG 忠実性は同じ値になる (生成の乱数も固定する)。"""
+
+    def test_repeated_evaluation_is_stable(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
+            b.learn_text("\n".join("サンプル文 %d は学習用の文章です。番号 %d の説明をもう少し続けます。" % (i, i)
+                                    for i in range(10, 200)), "https://x/nn")
+            if b.neural_step(budget_seconds=0.3) is None:
+                self.skipTest("ニューラル LM が動いていない")
+            r1 = b.self_evaluate(n_docs=4, n_dialogs=8)
+            r2 = b.self_evaluate(n_docs=4, n_dialogs=8)
+            if "rag_grounded" not in r1 or "rag_grounded" not in r2:
+                self.skipTest("RAG 忠実性を測れない")
+            self.assertEqual(r1["rag_grounded"], r2["rag_grounded"])
+            self.assertEqual(r1["rag_keyword"], r2["rag_keyword"])

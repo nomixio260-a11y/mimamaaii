@@ -894,6 +894,12 @@ class Brain:
         if len(rag_pool) < n_docs:                 # 取り置きの文が刈り込まれていたら足す
             rag_pool += list(self.kb.random_docs(min(n_docs * 3, len(self.kb)), self.rng))
         grounded = kw = n = 0
+        # 生成の乱数も固定する。同じ文・同じモデルでも引くたびに文が変われば、測るたびに値が動く
+        saved_rng = getattr(nl, "nprng", None)
+        if saved_rng is not None:
+            from . import neural as _nn
+
+            nl.nprng = _nn.np.random.default_rng(20260918)
         for d in rag_pool:
             if n >= n_docs:
                 break
@@ -911,6 +917,8 @@ class Brain:
             grounded += len(ph & cph) / max(len(ph), 1)
             kw += ks[0] in best
             n += 1
+        if saved_rng is not None:
+            nl.nprng = saved_rng
         if n:
             out["rag_grounded"] = round(grounded / n, 3)
             out["rag_keyword"] = round(kw / n, 3)
