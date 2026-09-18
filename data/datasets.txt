@@ -21,7 +21,7 @@ llm-jp/oasst2-33k-en	default	train	conversations	0.4
 baobab-trees/wikipedia-human-retrieval-ja	default	train	qa_text	1.5
 kunishou/oasst1-chat-44k-ja	default	train	conversations	2.5
 izumi-lab/wikipedia-ja-20230720	default	train	text	3.0
-kunishou/J-ResearchCorpus	default	train	text	2.0
+kunishou/J-ResearchCorpus	default	train	text	0.8
 cl-nagoya/auto-wiki-qa	default	train	wikiqa	1.5
 Aratako/Magpie-Tanuki-8B-annotated-96k	default	train	instruction	0.8
 hpprc/jawiki-paragraphs	default	train	text	1.0
