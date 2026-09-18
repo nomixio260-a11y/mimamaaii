@@ -156,6 +156,8 @@ class Brain:
         self.last_self_eval: dict | None = None
         self.dialog_holdout: list = []             # 評価用に固定した会話 (比較できるように)
         self._last_growth_check = 0                # 最後に成長・語彙を点検したステップ
+        self._rag_docs: list[int] = []             # RAG 忠実性を測る文 (一定期間は同じ文で測る)
+        self._rag_docs_step = 0
         self._fresh_shift = 0.0                    # 取り置きを入れ替えた時の段差の累積 (値を連続させる)
         self._fresh_holdout: list = []             # 最近の会話から採った取り置き (一定期間は固定して比べる)
         self._fresh_holdout_step = 0
@@ -857,9 +859,19 @@ class Brain:
         if dialog_metric is not None:
             nl.note_dialog_ppl(dialog_metric)
 
-        # 3. RAG 忠実性: 知識文を文脈に、その文のキーワードを質問にして、答えが文脈の句をどれだけ含むか
+        # 3. RAG 忠実性: 知識文を文脈に、その文のキーワードを質問にして、答えが文脈の句をどれだけ含むか。
+        # 毎回別の文で測ると値が揺れて比べられない (実測: 同じ時期に 0.785〜0.873)。
+        # 会話の取り置きと同じく、一定期間は同じ文で測る。
+        if not self._rag_docs or step_now - self._rag_docs_step > 5000:
+            picked = [d.id for d in self.kb.random_docs(min(n_docs * 4, len(self.kb)), self.rng)
+                      if 20 <= len(d.text) <= 200]
+            if len(picked) >= n_docs:
+                self._rag_docs, self._rag_docs_step = picked, step_now
+        rag_pool = [self.kb.docs[i] for i in self._rag_docs if i in self.kb.docs]
+        if len(rag_pool) < n_docs:                 # 取り置きの文が刈り込まれていたら足す
+            rag_pool += list(self.kb.random_docs(min(n_docs * 3, len(self.kb)), self.rng))
         grounded = kw = n = 0
-        for d in self.kb.random_docs(min(n_docs * 3, len(self.kb)), self.rng):
+        for d in rag_pool:
             if n >= n_docs:
                 break
             if not (20 <= len(d.text) <= 200):
@@ -1883,7 +1895,7 @@ class Brain:
                 # 入れ替わる取り置きも保存する。10 分ごとに再開する運用では、これが消えるたびに
                 # 物差しが変わり、同じモデルの評価値が動いてしまう (実測: 再開直後に 0.506 → 0.446)。
                 "fresh_holdout": [list(x) for x in self._fresh_holdout], "fresh_holdout_step": self._fresh_holdout_step,
-                "fresh_shift": self._fresh_shift,
+                "fresh_shift": self._fresh_shift, "rag_docs": list(self._rag_docs), "rag_docs_step": self._rag_docs_step,
                 "agent": self.agent.state(),
                 "params": asdict(self.params),
                 "generation": self.generation,
@@ -1950,6 +1962,8 @@ class Brain:
             self._fresh_holdout = [tuple(x) for x in state.get("fresh_holdout", [])]
             self._fresh_holdout_step = int(state.get("fresh_holdout_step", 0))
             self._fresh_shift = float(state.get("fresh_shift", 0.0))
+            self._rag_docs = [int(x) for x in state.get("rag_docs", [])]
+            self._rag_docs_step = int(state.get("rag_docs_step", 0))
             self.dialogs = DialogStore.from_state(state.get("dialogs", []), self.cfg.max_dialogs)
             self.agent.load_state(state.get("agent", {}))
             self._semantic_queue = deque(maxlen=50000)

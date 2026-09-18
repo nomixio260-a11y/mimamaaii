@@ -2610,3 +2610,30 @@ class HoldoutSwapCalibrationTest(unittest.TestCase):
             jump_raw = abs(r2["dialog_gain_fresh"] - raw_before)
             jump_adj = abs(r2["dialog_gain_fresh_adj"] - adj_before)
             self.assertLessEqual(jump_adj, jump_raw + 1e-6)  # 補正した方が跳ねない
+
+
+class RagHoldoutTest(unittest.TestCase):
+    """RAG 忠実性は一定期間は同じ文で測る (毎回別の文だと値が揺れて比べられない)。"""
+
+    def test_same_docs_are_reused(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        with tempfile.TemporaryDirectory() as tmp:
+            b = make_brain(tmp)
+            b.neural.min_sentences, b.neural.min_chars, b.neural.size = 10, 100, "small"
+            b.learn_text("\n".join("サンプル文 %d は学習用の文章です。番号 %d の説明をもう少し続けます。" % (i, i)
+                                    for i in range(10, 200)), "https://x/nn")
+            if b.neural_step(budget_seconds=0.3) is None:
+                self.skipTest("ニューラル LM が動いていない")
+            b.self_evaluate(n_docs=4, n_dialogs=8)
+            first = list(b._rag_docs)
+            self.assertTrue(first)
+            b.self_evaluate(n_docs=4, n_dialogs=8)
+            self.assertEqual(b._rag_docs, first)              # 2 回目も同じ文
+            b.neural.model.step += 6000                        # 期限が来たら入れ替わる
+            b.self_evaluate(n_docs=4, n_dialogs=8)
+            self.assertGreater(b._rag_docs_step, 0)
