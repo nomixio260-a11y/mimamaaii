@@ -115,6 +115,11 @@ def _cjk_ratio(text: str) -> float:
 _GARBLED_RE = re.compile(r"[?？!！][^。！？!?]{2,}|」[^「]*」|\)[^(]*\)|<unk>|[、,]{2}|[。.]{2}")
 _MORE_RE = re.compile(r"^(もっと|詳しく|もっと詳しく|続けて|続き|他には|ほかには|それで|それから|more|tell me more|continue|go on|and\??)[。!！?？]*$", re.I)
 _FOLLOWUP_RE = re.compile(r"^(それ|これ|あれ|そこ|そいつ|彼|彼女|it|that|this|they|he|she)")
+# 雑談の合図: 挨拶・お礼・気持ち・体調。知識文をそのまま返すと会話にならない発話
+_CHAT_RE = re.compile(
+    r"こんにちは|こんばんは|おはよう|やあ|ありがとう|ありがと|よろしく|おやすみ|またね|さようなら"
+    r"|元気|疲れ|つかれ|眠い|ねむい|しんどい|つらい|辛い|悲し|嬉し|うれし|楽し|たのし|寂し|さびし|不安|心配"
+    r"|けんか|喧嘩|失恋|落ち込|むかつ|腹が立|hello|hi\b|thanks|thank you|good morning|good night")
 
 
 def neural_perplexity(nl) -> float:
@@ -462,6 +467,17 @@ class Brain:
                 kept.append((u, b))
         return kept
 
+    @staticmethod
+    def _chatty(text: str) -> bool:
+        """雑談か (= 知識文をそのまま返すべきでない発話か)。
+
+        話題になる語がまったく無い発話、挨拶、気持ちを述べる発話を雑談とみなす。
+        こういう発話に検索の 1 位を返すと、正しい文であっても会話としては噛み合わない。"""
+        low = text.strip().lower()
+        if _CHAT_RE.search(low):
+            return True
+        return not [k for k in keywords(text, limit=3) if is_phrase(k)]
+
     def _unsupported(self, ctx_docs, info) -> bool:
         """根拠の無い作文か (= 「知らない」と答えるべきか)。
 
@@ -502,6 +518,11 @@ class Brain:
         # 無関係な文を写し取るくらいなら、何も見ずに書く方がまだ話が通じる。
         relevance = self._context_relevance(text, ctx_docs)
         if relevance < 0.5:                      # 肝になる語が 1 つも出てこない文脈は使わない
+            ctx_docs = []
+        chatty = self._chatty(text)
+        if chatty:
+            # 雑談に知識文を渡すと、その文を書き写してしまう (実測: 「こんにちは。今日は何を
+            # していましたか」に青空文庫の一節をなぞった応答)。挨拶や気持ちの話は文脈なしで書く。
             ctx_docs = []
         context = " ".join(d.text for d in ctx_docs)[:240] or None
         history = self._relevant_history(text)
@@ -584,6 +605,8 @@ class Brain:
             return None
         self.stats["neural_replies"] += 1
         conf = max(fallback.confidence, 0.6) if context else 0.5
+        # 出典は「その文を使って書いた」時だけ付ける。雑談の返事に出典を付けると、
+        # 引用していない文を引用したことにしてしまう
         return Reply(best, round(conf, 3), "neural", [d.source for d in ctx_docs], [d.id for d in ctx_docs], fallback.learned_topics)
 
     def _context_for(self, doc_ids, max_chars: int = 240) -> str | None:
@@ -1211,9 +1234,15 @@ class Brain:
                     if neural_reply is not None:
                         reply = neural_reply
                 elif self.cfg.neural_first and self.neural.ready and self._guard_note is None:
-                    weak = reply.mode in ("guess", "generate") or (reply.mode == "recall" and reply.confidence < self.cfg.neural_override_conf)
+                    # 雑談には検索文をそのまま返さない。挨拶や気持ちの話に知識文を当てると
+                    # 会話にならない (実測: 「こんにちは。今日は何をしていましたか」に青空文庫の一節、
+                    # 「疲れたときはどうすればいいですか」に論文の一文が返っていた)。
+                    weak = (reply.mode in ("guess", "generate") or self._chatty(text)
+                            or (reply.mode == "recall" and reply.confidence < self.cfg.neural_override_conf))
                     if weak:
-                        neural_reply = self._neural_reply(text, hits, reply)
+                        # 雑談では厳しい検査 (文脈との重なり 0.6 以上など) を外す。あれは知識を答える時の規則で、
+                        # 「こんにちは」に文脈との重なりを求めても意味が無く、生成が全部捨てられてしまう
+                        neural_reply = self._neural_reply(text, hits, reply, strict=not self._chatty(text))
                         if neural_reply is not None:
                             reply = neural_reply
             reply = self._attach_notices(reply, topics, ja)

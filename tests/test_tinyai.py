@@ -2637,3 +2637,19 @@ class RagHoldoutTest(unittest.TestCase):
             b.neural.model.step += 6000                        # 期限が来たら入れ替わる
             b.self_evaluate(n_docs=4, n_dialogs=8)
             self.assertGreater(b._rag_docs_step, 0)
+
+
+class ChattyTest(unittest.TestCase):
+    """雑談には検索文をそのまま返さない (知識の質問とは分ける)。"""
+
+    def test_detects_small_talk(self):
+        from tinyai.brain import Brain
+        for t in ("こんにちは。今日は何をしていましたか", "疲れたときはどうすればいいですか",
+                  "友達とけんかしてしまいました", "ありがとう", "なんだか眠いです"):
+            self.assertTrue(Brain._chatty(t), t)
+
+    def test_knowledge_questions_are_not_small_talk(self):
+        from tinyai.brain import Brain
+        for t in ("光合成の仕組みを教えて", "徳川家康はどんな人ですか", "機械学習と統計学の違いは何ですか",
+                  "宇宙はどうやって始まったのですか", "富士山の高さは？"):
+            self.assertFalse(Brain._chatty(t), t)
