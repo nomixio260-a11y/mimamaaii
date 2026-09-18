@@ -403,15 +403,22 @@ class NeuralLM:
     LR_FLOOR_RATIO = 0.5         # 学習が不安定な時に下げる倍率
 
     def _depth_lr(self) -> float:
-        """層数に応じた学習率。プリセットの学習率は「その層数」で調整した値なので、
-        成長して深くなったらそのままでは大きすぎる (実測: 4 層想定の 6e-4 のまま 9 層まで増やしたら、
-        対話 ppl 75 → 118、接地率 0.95 → 0.83 と崩れた)。深さの平方根に反比例させる
-        (層が増えるほど残差の重なりが深くなり、同じ更新幅でも出力の変化が大きくなるため)。"""
-        base_layers = neural.PRESETS.get(self.size, {}).get("layers", self.model.L if self.model else 4)
+        """大きさに応じた学習率。プリセットの学習率は「その層数・その幅」で調整した値なので、
+        成長して大きくなったらそのままでは大きすぎる (実測: 4 層想定の 6e-4 のまま 9 層まで増やしたら、
+        対話 ppl 75 → 118、接地率 0.95 → 0.83 と崩れた)。深さと幅それぞれの平方根に反比例させる
+        (層が増えるほど残差の重なりが深くなり、幅が広いほど 1 つの出力に足し込む項が増えるため、
+        同じ更新幅でも出力の変化が大きくなる)。"""
+        preset = neural.PRESETS.get(self.size, {})
         lr = self.lr * self.lr_scale
-        if self.model is None or self.model.L <= base_layers:
+        if self.model is None:
             return lr
-        return lr * (base_layers / self.model.L) ** 0.5
+        base_layers = preset.get("layers", self.model.L)
+        base_ff = preset.get("ff", self.model.ff)
+        if self.model.L > base_layers:
+            lr *= (base_layers / self.model.L) ** 0.5
+        if self.model.ff > base_ff:
+            lr *= (base_ff / self.model.ff) ** 0.5
+        return lr
 
     def maybe_damp_lr(self) -> bool:
         """会話の質が続けて落ちていたら学習率を下げる。

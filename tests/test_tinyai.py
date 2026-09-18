@@ -2548,3 +2548,28 @@ class PregrowStatePersistenceTest(unittest.TestCase):
             self.assertEqual(nl2._pregrow_ppl, 4.2)
             self.assertEqual(nl2._pregrow_dialog, 51.0)
             self.assertEqual(nl2.grown, 3)
+
+
+class WidthAwareLrTest(unittest.TestCase):
+    """学習率は深さだけでなく幅にも反比例させる (成長のたびに更新が効きすぎないように)。"""
+
+    def test_width_growth_lowers_lr(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="base")
+            nl.model = nn.TinyTransformer.from_preset(300, "base")
+            base = nl._depth_lr()
+            nl.model.grow_layer()                       # 深くする -> 下がる
+            deeper = nl._depth_lr()
+            self.assertLess(deeper, base)
+            before = nl._depth_lr()
+            nl.model.grow_width()                       # 広げる -> さらに下がる
+            self.assertLess(nl._depth_lr(), before)
+            self.assertAlmostEqual(nl._depth_lr(),
+                                   nl.lr * nl.lr_scale * (4 / nl.model.L) ** 0.5 * (512 / nl.model.ff) ** 0.5, places=9)
