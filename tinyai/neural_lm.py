@@ -112,6 +112,7 @@ class NeuralLM:
         self._pregrow_ppl: float | None = None       # 成長直前の ppl (成長が裏目に出ていないかの判定用)
         self._pregrow_dialog: float | None = None    # 成長直前の対話 ppl
         self.dialog_hist: list[float] = []           # 対話 ppl の推移 (成長の判断に使う)
+        self._grow_block: str | None = None          # 直近に成長を見送った理由 (ログに 1 度だけ出す)
         self.lr_scale = 1.0                          # 学習率の調整倍率 (不安定な時に下げる)
         self._last_damp_step = 0
         self._pregrow_path = self.data_dir / "neural.pregrow.npz"
@@ -468,6 +469,16 @@ class NeuralLM:
             if len(self.dialog_hist) > 60:
                 del self.dialog_hist[:30]
 
+    def _no_grow(self, reason: str) -> bool:
+        """成長しなかった理由を残す (同じ理由は 1 度だけ記録する)。
+
+        「なぜ成長しないのか」を後から追えないと、圧力の判定ミスのような詰まりに何時間も気付けない
+        (実測: メモリの圧力で 7 MB の拡張が拒否され続けていたのに、ログには何も出ていなかった)。"""
+        if reason != self._grow_block:
+            log.info("成長は見送り: %s", reason)
+            self._grow_block = reason
+        return False
+
     def growth_bytes(self) -> int:
         """次の成長で増えるメモリの見積り (重み + Adam の 1 次/2 次 + EMA)。"""
         if self.model is None:
@@ -483,32 +494,34 @@ class NeuralLM:
         2 は Chinchilla 則の考え方で、データが増えたなら先回りして大きくする、という判断。
         どちらの場合も「今の分布での取り置き ppl が悪化していない」ことを条件にする。"""
         with self.lock:
-            if self.model is None or not memory_ok:
-                return False
+            if self.model is None:
+                return self._no_grow("モデルがまだ無い")
+            if not memory_ok:
+                return self._no_grow("メモリに余裕がない")
             # 成長の直後は、増えた容量を使えるようになるまで時間がかかる。間を置かずに続けて増やすと
             # 「増やす → 一時的に悪化 → 悪化を見てまた増やす」の悪循環になる (実測: 12 分で 3 層増えた)。
             if self.grown and self.model.step - self._last_grow_step < self.GROW_COOLDOWN:
-                return False
+                return self._no_grow(f"成長の間隔 (あと {self.GROW_COOLDOWN - (self.model.step - self._last_grow_step)} step)")
             max_layers = neural.MAX_LAYERS.get(self.size, 6)
             max_ff = neural.PRESETS.get(self.size, {}).get("ff", self.model.ff) * 3
             if self.model.L >= max_layers and self.model.ff >= max_ff:
-                return False
+                return self._no_grow(f"上限に到達 (層 {self.model.L}, ff {self.model.ff})")
             h = self.loss_hist
             if len(h) < 20:
-                return False
+                return self._no_grow(f"損失の履歴が足りない ({len(h)}/20)")
             recent, before = sum(h[-10:]) / 10, sum(h[-20:-10]) / 10
             # 取り置き ppl が悪化し続けている = 過学習なので、容量を増やしても意味がない。
             # 判断には「入れ替わる取り置き」を使う: 固定の取り置きは学習データから外れた古い文を含むので、
             # 忘却による悪化と過学習による悪化を区別できない (忘却なら容量を増やす方が効く)。
             ph = self.recent_hist if len(self.recent_hist) >= 4 else self.ppl_hist
             worse = sum(ph[-2:]) / 2 / max(sum(ph[-4:-2]) / 2, 1e-9) if len(ph) >= 4 else 1.0
-            if worse > 1.25:
-                return False        # 急激に悪化している = 学習が不安定。容量の問題ではない
+            if worse > 1.25:        # 急激に悪化している = 学習が不安定。容量の問題ではない
+                return self._no_grow(f"取り置き ppl が急に悪化 (x{worse:.2f})")
             # 平文の指標だけで判断すると、会話の質が落ちているのに成長を続けてしまう
             # (実測: 層 6 → 9 + 中間次元の拡張で、平文の ppl は回復したのに対話 ppl は 75 → 141)。
             dh = self.dialog_hist
             if len(dh) >= 4 and sum(dh[-2:]) / 2 > sum(dh[-4:-2]) / 2 * 1.10:
-                return False
+                return self._no_grow("会話の質が落ちている")
             plateau = before - recent < 0.02 and recent > 1.5     # 改善が止まり、まだ十分に低くない
             n_params = self.model.n_params()
             # データ過多 (強): 計算最適の目安を超えた
@@ -541,8 +554,9 @@ class NeuralLM:
                     log.info("データ量が容量を超えたので成長 (%.1fM トークン / %.1fM パラメータ)",
                              data_tokens / 1e6, self.model.n_params() / 1e6)
                 self.loss_hist = []
+                self._grow_block = None
                 return True
-            return False
+            return self._no_grow(f"条件を満たさない (改善 {before - recent:.3f}, {data_tokens / 1e6:.0f}M トークン)")
 
     def evolve_vocab(self, texts, top: int = 100) -> int:
         """新しいテキストに頻出する未知の単位を語彙に足す (モデルの埋め込みも拡張)。"""

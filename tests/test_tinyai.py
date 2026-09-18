@@ -2403,3 +2403,25 @@ class GrowthMemoryGateTest(unittest.TestCase):
         g = MemoryGuard(limit_mb=64, hard=False)
         g.available_bytes = staticmethod(lambda: 0)     # /proc/meminfo が読めない環境
         self.assertFalse(g.can_afford(10 ** 13))
+
+
+class GrowthReasonTest(unittest.TestCase):
+    """成長を見送った理由がログと状態に残る。"""
+
+    def test_reason_is_recorded(self):
+        try:
+            from tinyai import neural as nn
+        except Exception:
+            self.skipTest("numpy なし")
+        if not nn.available():
+            self.skipTest("numpy なし")
+        from tinyai.neural_lm import NeuralLM
+        with tempfile.TemporaryDirectory() as tmp:
+            nl = NeuralLM(Path(tmp), size="small")
+            nl.min_sentences, nl.min_chars = 10, 100
+            texts = ["サンプル文 %d は学習用の文章です。内容は番号 %d の説明です。" % (i, i) for i in range(40)]
+            self.assertTrue(nl.ensure_model(texts))
+            self.assertFalse(nl.maybe_grow(memory_ok=False))
+            self.assertIn("メモリ", nl._grow_block)
+            self.assertFalse(nl.maybe_grow(memory_ok=True))      # 損失の履歴が足りない
+            self.assertIn("損失の履歴", nl._grow_block)
