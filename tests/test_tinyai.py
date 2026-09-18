@@ -2797,3 +2797,23 @@ class SeqRebuildTest(unittest.TestCase):
                 self.skipTest("ニューラル LM が動いていない")
             self.assertEqual(b.neural.seq_version, SEQ_VERSION)     # 一度走ったら版を進める
             self.assertEqual(b._rebuild_dialog_sequences(), 0)      # 二度目は走らない
+
+
+class DatasetOffsetTest(unittest.TestCase):
+    """読み進めた位置を保存する (再起動のたびに同じ行を読み直さない)。"""
+
+    def test_offsets_round_trip(self):
+        from tinyai.collector import Collector, HuggingFaceDatasets
+        with tempfile.TemporaryDirectory() as tmp:
+            src = HuggingFaceDatasets(Collector(None, Path(tmp)), "ja")
+            src.offsets["ds/default/train"] = 12345
+            src._save_offsets()
+            src2 = HuggingFaceDatasets(Collector(None, Path(tmp)), "ja")
+            self.assertEqual(src2.offsets.get("ds/default/train"), 12345)
+
+    def test_broken_file_is_ignored(self):
+        from tinyai.collector import Collector, HuggingFaceDatasets
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "hf_offsets.json").write_text("{壊れた", encoding="utf-8")
+            src = HuggingFaceDatasets(Collector(None, Path(tmp)), "ja")
+            self.assertEqual(src.offsets, {})

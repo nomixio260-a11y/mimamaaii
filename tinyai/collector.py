@@ -14,6 +14,7 @@ import csv
 import hashlib
 import heapq
 import io
+import json
 import logging
 import queue
 import random
@@ -314,7 +315,15 @@ class HuggingFaceDatasets(Source):
 
     def __init__(self, col, lang="ja"):
         super().__init__(col, lang)
+        # データセットごとの読み進めた位置。保存しないと再起動のたびにランダムな位置から読み直し、
+        # 同じ行を何度も取ってしまう (実測: 収集 16.6 万件に対し、重複を除いて残ったのは 6 万件)
+        self._offsets_path = self.col.data_dir / "hf_offsets.json"
         self.offsets: dict[str, int] = {}
+        try:
+            saved = json.loads(self._offsets_path.read_text(encoding="utf-8"))
+            self.offsets = {k: int(v) for k, v in saved.items() if isinstance(v, (int, float))}
+        except (OSError, ValueError, AttributeError):
+            pass
         self.pages: dict[str, int] = {}     # データセットごとの 1 回に読む行数 (論文のように 1 行が大きいものは小さく)
         self.last_dialogs: list = []
 
@@ -414,6 +423,12 @@ class HuggingFaceDatasets(Source):
                 pairs.append((q, a + ("" if a.endswith(("。", ".")) else "。"), ctx[lo : lo + 240]))
         return pairs
 
+    def _save_offsets(self) -> None:
+        try:
+            self._offsets_path.write_text(json.dumps(self.offsets), encoding="utf-8")
+        except OSError:
+            pass
+
     def stream(self):
         specs = self._specs()
         if not specs:
@@ -443,6 +458,7 @@ class HuggingFaceDatasets(Source):
             self.offsets[key] = 0  # 末尾まで来たら最初から
             return []
         self.offsets[key] = off + len(rows)
+        self._save_offsets()
         pairs = []
         texts = []
         for r in rows:
