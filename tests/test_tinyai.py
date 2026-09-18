@@ -2817,3 +2817,28 @@ class DatasetOffsetTest(unittest.TestCase):
             (Path(tmp) / "hf_offsets.json").write_text("{壊れた", encoding="utf-8")
             src = HuggingFaceDatasets(Collector(None, Path(tmp)), "ja")
             self.assertEqual(src.offsets, {})
+
+
+class SourceHealthPersistenceTest(unittest.TestCase):
+    """供給源の実績を保存する (再起動のたびに未試行へ戻さない)。"""
+
+    def test_health_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            col = Collector(None, Path(tmp))
+            h = col._h("wikipedia:ja")
+            h.record(True, 3.0, 0.5)
+            h.surprise, h.surprise_n = 2.5, 4
+            col.save_health()
+            col2 = Collector(None, Path(tmp))
+            h2 = col2._h("wikipedia:ja")
+            self.assertEqual((h2.tries, h2.ok), (1, 1))
+            self.assertAlmostEqual(h2.gain, 3.0)
+            self.assertAlmostEqual(h2.surprise, 2.5)
+            self.assertEqual(h2.surprise_n, 4)
+            self.assertAlmostEqual(h2.score, h.score, places=6)
+
+    def test_broken_file_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "source_health.json").write_text("壊れた", encoding="utf-8")
+            col = Collector(None, Path(tmp))
+            self.assertEqual(col.health, {})

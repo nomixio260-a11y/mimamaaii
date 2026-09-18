@@ -552,6 +552,10 @@ class Collector:
         self.languages = tuple(languages)
         self.interest = interest or (lambda text: 0.0)
         self.health: dict[str, SourceHealth] = {}
+        # 供給源の実績。保存しないと再起動のたびに「未試行」に戻り、失敗続きの源も実績のある源も
+        # 同じ点数から選び直すことになる (今日のように何度も再起動する運用では学習が積み上がらない)
+        self._health_path = self.data_dir / "source_health.json"
+        self._load_health()
         self.frontier: list[tuple[float, int, str, str, int]] = []
         self._seq = 0
         self.seen: set[bytes] = set()
@@ -582,6 +586,29 @@ class Collector:
             self.sources.setdefault(lang or source.lang, []).append(source)
 
     # ------------------------------------------------------------ 補助
+    def _load_health(self) -> None:
+        try:
+            saved = json.loads(self._health_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for name, row in (saved or {}).items():
+            if not isinstance(row, dict):
+                continue
+            h = SourceHealth()
+            for k in SourceHealth.__slots__:
+                v = row.get(k)
+                if isinstance(v, (int, float)):
+                    setattr(h, k, type(getattr(h, k))(v))
+            self.health[name] = h
+
+    def save_health(self) -> None:
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            self._health_path.write_text(json.dumps({n: {k: getattr(h, k) for k in SourceHealth.__slots__}
+                                                     for n, h in self.health.items()}), encoding="utf-8")
+        except OSError:
+            pass
+
     def _h(self, name: str) -> SourceHealth:
         h = self.health.get(name)
         if h is None:
@@ -609,6 +636,9 @@ class Collector:
         if surprise is not None:
             h.surprise = surprise if h.surprise_n == 0 else 0.8 * h.surprise + 0.2 * surprise
             h.surprise_n += 1
+        self._reports = getattr(self, "_reports", 0) + 1
+        if self._reports % 20 == 0:        # 20 回に 1 度だけ書く (小さい JSON なので十分)
+            self.save_health()
 
     # ------------------------------------------------------------ フロンティア
     def push_links(self, anchors: Iterable[tuple[str, str]], depth: int = 1, base_url: str = "") -> int:
